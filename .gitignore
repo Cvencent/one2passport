@@ -1,0 +1,27 @@
+# Firmware build output and generated dependency checkouts
+firmware/build/
+firmware/build-*/
+firmware/managed_components/
+firmware/sdkconfig.old
+
+# Windows client build output and caches
+windows-client/build/
+windows-client/dist/
+windows-client/**/__pycache__/
+windows-client/**/*.pyc
+
+# Local logs, captures, and credentials
+*.log
+*.pyc
+__pycache__/
+.env
+.env.*
+bridge.json
+nvs_backup*
+*.nvs
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp

@@ -1,0 +1,14 @@
+# ESP-IDF build output
+build/
+managed_components/
+sdkconfig.old
+
+# Local tooling
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Never commit device credentials or flash dumps
+nvs_backup*
+*.nvs

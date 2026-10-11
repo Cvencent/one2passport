@@ -1,0 +1,13 @@
+FoloOS AI Passport
+
+This repository contains an unofficial community-derived firmware and host
+tooling for FoloToy AI Passport. It is not an official FoloToy release and is
+not endorsed or supported by FoloToy.
+
+Official upstream projects and documentation:
+- https://github.com/FoloToy/ai-passport
+- https://github.com/FoloToy/folo-ai-passport-xiaozhi
+- https://docs.folotoy.com/zh/docs/web-tool/
+
+The existing MIT License and upstream copyright notice are preserved. Third-
+party assets and dependencies remain subject to their own licenses.

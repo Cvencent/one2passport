@@ -40,15 +40,17 @@ void xz_heap_report(const char *tag) {
 #define RELAY_MODE 0               // 1=经电脑中继 TCP1443 转发 443
 #define PLAIN_WS_TEST 0            // 1=连本地明文 WS(8089)抓包
 #define RELAY_MODE_OTA_BIGTEST 0   // 1=OTA 走电脑本地 8080 大响应
+// 诊断用：改成运行中继/抓包脚本的那台电脑的局域网 IP（下面三个开关默认关闭）
+#define XZ_RELAY_HOST "192.168.1.100"
 
 #if RELAY_MODE_OTA_BIGTEST
-#define XZ_OTA_URL      "http://192.168.0.35:8080/xiaozhi/ota/"   // 大响应接收实验
+#define XZ_OTA_URL      "http://" XZ_RELAY_HOST ":8080/xiaozhi/ota/"   // 大响应接收实验
 #else
 // ⚠ 必须用**正式服** xiaozhi.me, 不能用公共测试服 api.tenclass.net:
 //   测试服对任何 MAC 都直接返回 websocket 配置, **永不返回 activation**,
 //   因此设备码永远出不来(用户"打开什么都没有"的根因)。
 //   正式服 https://xiaozhi.me/api/ota/ 在设备未绑定时返回:
-//     {"activation":{"code":"961572","message":"xiaozhi.me
+//     {"activation":{"code":"961572","message":"xiaozhi.me",
 //                    "challenge":"<uuid>"}}
 //   用户拿 code 去 xiaozhi.me 绑定后, 后续请求即返回 websocket 配置。
 //   用 https(会 301 到 https, disable_auto_redirect=false 自动跟随); OTA 发生
@@ -269,13 +271,11 @@ static bool ota_fetch_config(void)
         ESP_LOGW(TAG, "TLS-free mode: ws url=%.60s", s_url);
     }
 #if RELAY_MODE
-#endif
-#if RELAY_MODE
-    snprintf(s_url, sizeof(s_url), "wss://192.168.0.35:1443/xiaozhi/v1/");
+    snprintf(s_url, sizeof(s_url), "wss://" XZ_RELAY_HOST ":1443/xiaozhi/v1/");
     ESP_LOGW(TAG, "RELAY_MODE: url=%s", s_url);
 #endif
 #if PLAIN_WS_TEST
-    snprintf(s_url, sizeof(s_url), "ws://192.168.0.35:8089/xiaozhi/v1/");
+    snprintf(s_url, sizeof(s_url), "ws://" XZ_RELAY_HOST ":8089/xiaozhi/v1/");
     ESP_LOGW(TAG, "PLAIN_WS_TEST url=%s", s_url);
 #endif
     ESP_LOGI(TAG, "OTA ok: url=%.60s token=%d chars", s_url, (int)strlen(s_token));
@@ -616,7 +616,7 @@ bool xiaozhi_client_connect(void)
     if (netif) {
         esp_netif_dns_info_t dns = {};
 #if RELAY_MODE
-        dns.ip.u_addr.ip4.addr = ipaddr_addr("192.168.0.35");  // 中继/电脑接管DNS
+        dns.ip.u_addr.ip4.addr = ipaddr_addr(XZ_RELAY_HOST);  // 中继/电脑接管DNS
 #else
         dns.ip.u_addr.ip4.addr = ipaddr_addr("223.5.5.5");
 #endif

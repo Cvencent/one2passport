@@ -76,8 +76,8 @@ def merge(bootloader: Path, partition: Path, app: Path, out: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="生成 ESP32 合并固件(0x0 起刷)")
-    parser.add_argument("--build-dir", type=Path,
-                        default=Path("D:/aipassport/ai-passport-official/build"))
+    parser.add_argument("--build-dir", type=Path, default=Path("build"),
+                        help="ESP-IDF 构建目录(默认 ./build)")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -87,7 +87,7 @@ def main() -> int:
     merge(
         build / "bootloader" / "bootloader.bin",
         build / "partition_table" / "partition-table.bin",
-        build / "FoloToy-AI-Passport.bin",
+        build / "Internet-Radio.bin",
         out,
     )
     return 0

@@ -13,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-MAIN = Path(r"D:/aipassport/leo-codex/main")
+MAIN = Path(__file__).resolve().parent / "main"
 
 problems = []
 notes = []
@@ -26,6 +26,7 @@ def read(name):
 home = read("radio_home.cc")
 ui = read("radio_ui.cc")
 cc = read("main.cc")
+apps = read("app_apps.cc")
 
 # ── 检查 1: 建屏函数的首次创建路径必须有 lv_screen_load ──
 print("[检查1] radio_home_screen_create 的首次创建路径")
@@ -89,19 +90,20 @@ for fn in ("radio_ui_show_main", "radio_ui_show_home"):
     else:
         notes.append(f"{fn} 无多余 load(交给建屏函数统一决策)")
 
-# ── 检查 4: 启动时确实调用了 show_home ──
-print("[检查4] 启动入口")
-if "radio_ui_show_home()" not in cc:
-    problems.append("app_main 里没有调用 radio_ui_show_home(),首页永远不会显示")
+# ── 检查 4: 首页确实被 lv_screen_load 过(历史 bug:屏建好了却没 load) ──
+print("[检查4] 启动首页的显示调用")
+registry = read("app_registry.cc")
+if "lv_screen_load(s_home_scr)" not in registry:
+    problems.append("app_registry.cc 没有 lv_screen_load(s_home_scr),首页建好但不会被显示")
 else:
-    notes.append("app_main 调用了 radio_ui_show_home()")
+    notes.append("app_registry.cc 用 lv_screen_load(s_home_scr) 真正显示首页")
 
 # ── 检查 5: 离开 LEO 页面前要停 50ms 定时器 ──
 print("[检查5] 50ms 定时器的看门狗")
 if "s_page_visible" not in ui:
     problems.append("缺少 s_page_visible,timer_callback 会写已销毁对象")
 else:
-    if "radio_ui_leave_leo_page" not in cc:
+    if "radio_ui_leave_leo_page" not in apps:
         problems.append("进入 Codex 页前没有调 radio_ui_leave_leo_page()")
     else:
         notes.append("离开 LEO 页面前会停掉 50ms 定时器")

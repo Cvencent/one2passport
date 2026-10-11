@@ -1,6 +1,6 @@
 # Light home verification, 2026-10-11
 
-Firmware built successfully and flashed to COM4, MAC 98:c3:77:f5:52:70; esptool hash verified. Final firmware size 2506720 bytes.
+Firmware built successfully and flashed to COM4; esptool hash verified. Final firmware size 2506720 bytes.
 
 Implemented: Codex render buffers and project catalog allocated on entry (8800 bytes) and freed on exit; home bridge does not auto-request project catalog. Radio full control tree cleared on exit; same audio core continues at home. Catalog discovery deferred to full radio, existing cached catalog skips automatic refresh. National fallback results do not overwrite an existing cached catalog. MP3 prewarmed pool retained because its decoder requires a contiguous block unavailable after Wi-Fi startup.
 

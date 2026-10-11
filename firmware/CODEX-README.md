@@ -13,9 +13,9 @@
 
 | 产物 | 路径 |
 | --- | --- |
-| 设备固件 | `D:/aipassport/leo-codex/build/Internet-Radio.bin` |
-| 工程源码 | `D:/aipassport/leo-codex/` |
-| PC 桥接包 | `D:/aipassport/foloos/windows-package/` |
+| 设备固件 | `firmware/build/Internet-Radio.bin`（构建产物） |
+| 工程源码 | `firmware/` |
+| PC 桥接包 | `windows-client/` |
 
 固件大小 **2,223,712 字节（2.12 MB）**，factory 分区余量 **900.4 KB**。
 
@@ -24,8 +24,8 @@
 ## 二、烧录
 
 ```bash
-cd D:/aipassport && /d/espressif/python_env/idf5.5_py3.13_env/Scripts/python.exe \
-  idf_build.py -C D:/aipassport/leo-codex -p <COM口> flash monitor
+cd firmware
+idf.py -p <COM口> flash monitor
 ```
 
 或直接用 esptool（`<COM口>` 换成实际端口）：
@@ -88,7 +88,7 @@ python -m esptool --chip esp32c3 -b 460800 --before default_reset --after hard_r
 ### 第 2 步：PC 端配对并启动
 
 ```bash
-cd D:/aipassport/foloos/windows-package/runtime
+cd windows-client/runtime
 python pair_device.py          # 自动发现设备并完成配对
 python windows_bridge.py       # 启动桥接(保持运行)
 ```
@@ -97,7 +97,7 @@ python windows_bridge.py       # 启动桥接(保持运行)
 `%LOCALAPPDATA%\FoloOS\bridge.json`，与 `windows_bridge.py` 共用同一份配置。
 配对只需做一次；以后直接启动桥接即可。
 
-也可用图形入口：双击 `D:/aipassport/foloos/windows-package/安装与管理编程伴侣.bat`，
+也可用图形入口：双击 `windows-client/安装与管理编程伴侣.bat`，
 选 `1. 一键安装或修复`。
 
 ---
@@ -158,7 +158,7 @@ FoloOS 原版走 **USB 串口**下发 token：PC 端随机生成 32 位 token，
 ### 移除
 
 - `ui_menu_chrome.c`（970 KB）、`ui_icons.c`（415 KB）——本工程自绘 UI，未参与链接；
-  原文件已备份至 `D:/aipassport/temp/removed_from_main/`，可逆。
+  原文件未纳入本工程。
 - `word_bear`（你在狗叫什么）全部代码与 `WordBear` 数据目录引用。
 
 ---

@@ -8,7 +8,7 @@
 
 ## 下载
 
-固件与 Windows 客户端见 **[Releases](../../releases/latest)**。
+固件与 Windows 客户端见 **[Releases](https://github.com/Cvencent/one2passport/releases/latest)**。
 
 | 文件 | 说明 |
 | --- | --- |

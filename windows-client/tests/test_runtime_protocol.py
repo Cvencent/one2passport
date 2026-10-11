@@ -6,7 +6,7 @@ import tempfile
 import threading
 import unittest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "windows-package" / "runtime"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "runtime"))
 from mac_bridge import wire_messages
 
 

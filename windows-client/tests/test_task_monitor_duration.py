@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).parents[1] / 'windows-package' / 'runtime'))
+sys.path.insert(0, str(Path(__file__).parents[1] / 'runtime'))
 from task_monitor import TaskMonitor
 
 class TaskDurationTests(unittest.TestCase):

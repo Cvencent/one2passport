@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "windows-package" / "runtime"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "runtime"))
 from codex_backend import CodexAppServer
 from mac_bridge import NetworkBridge, SerialBridge
 

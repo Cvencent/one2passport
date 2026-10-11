@@ -117,7 +117,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 ## 八、从源码运行（不想用 EXE 时）
 
 ```bash
-cd D:/aipassport/foloos/windows-package/runtime
+cd windows-client/runtime
 python tray_app.py
 ```
 
@@ -130,7 +130,7 @@ python tray_app.py
 改了 `tray_app.py` 之后：
 
 ```bash
-cd D:/aipassport/foloos/windows-package/runtime
+cd windows-client/runtime
 python _gen_ico.py                              # 重新生成图标(可选)
 python -m PyInstaller --noconfirm --clean CodexBridge.spec
 # 产物: dist/CodexBridge.exe

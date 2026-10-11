@@ -1,7 +1,7 @@
 from pathlib import Path
 import unittest
 
-SOURCE = Path(__file__).parents[2] / 'leo-codex' / 'main' / 'app_coding.c'
+SOURCE = Path(__file__).parents[2] / 'firmware' / 'main' / 'app_coding.c'
 
 class PagingActionLayoutTests(unittest.TestCase):
     def test_running_page_reapplies_actions_after_promoting_paging(self):

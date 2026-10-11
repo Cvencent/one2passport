@@ -19,7 +19,7 @@ class FakeProcess:
 class WindowsStdioCodexTests(unittest.TestCase):
     def test_wifi_setup_keeps_single_com_port_as_array(self):
         script = (
-            Path(__file__).parents[1] / "tools" / "windows_wifi_setup.ps1"
+            Path(__file__).parents[1] / "runtime" / "windows_wifi_setup.ps1"
         ).read_text(encoding="utf-8-sig")
         self.assertIn(
             "$ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)",
@@ -27,7 +27,7 @@ class WindowsStdioCodexTests(unittest.TestCase):
         )
 
     def test_package_has_management_and_tray_launchers(self):
-        package = Path(__file__).parents[1] / "windows-package"
+        package = Path(__file__).parents[1]
         self.assertEqual(
             {path.name for path in package.glob("*.bat")},
             {"安装与管理编程伴侣.bat", "启动Codex桥接.bat"},

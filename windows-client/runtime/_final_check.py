@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-pkg = Path(r"D:/aipassport/foloos/windows-package")
+pkg = Path(__file__).resolve().parents[1]
 exe = pkg / "CodexBridge.exe"
 log = Path(os.environ["LOCALAPPDATA"]) / "FoloOS" / "CodexBridge" / "bridge.log"
 

@@ -6,7 +6,7 @@ import unittest
 
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root))
-sys.path.insert(0, str(root / "windows-package" / "runtime"))
+sys.path.insert(0, str(root / "runtime"))
 
 import codex_backend
 import windows_codex_backend

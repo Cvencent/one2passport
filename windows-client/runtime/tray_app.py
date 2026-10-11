@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
 import json
 import os
 import queue
@@ -46,6 +47,9 @@ STATE_ERROR = "error"            # 连接异常,正在自动重试
 STATE_STOPPED = "stopped"        # 已停止
 STATE_UNPAIRED = "unpaired"      # 尚未与设备配对
 
+# 托盘图标看护线程的巡检间隔(秒)。
+ICON_WATCHDOG_INTERVAL_SECONDS = 15.0
+
 # 状态 -> (标签, 图标底色)。底色是托盘上唯一能一眼看到的信息源,
 # 所以用高饱和度的语义色,而不是品牌色。
 STATE_STYLE: dict[str, tuple[str, str]] = {
@@ -57,6 +61,34 @@ STATE_STYLE: dict[str, tuple[str, str]] = {
     STATE_STOPPED: ("已停止", "#667085"),
     STATE_UNPAIRED: ("未配对", "#667085"),
 }
+
+
+def tray_icon_registered(hwnd, uid, tip):
+    """探测托盘图标是否还挂在通知区域。返回 True/False,判断不了时返回 None。
+
+    用 Shell_NotifyIcon(NIM_MODIFY) 做只读探测:图标还在时返回 True,
+    已被系统摘掉时返回 False。这是唯一可靠的信号 —— 看起来更直观的
+    Shell_NotifyIconGetRect 在 Win11 上对"被收进溢出区"的图标会直接返回
+    E_FAIL,拿它判断会得出"图标不见了"的错误结论,然后每轮巡检都白挂一次。
+    """
+    if os.name != "nt" or not hwnd:
+        return None
+    try:
+        from pystray._util import win32
+    except Exception:
+        # 拿不到 pystray 的内部结构就没法探测,当作"在",不做多余动作。
+        return None
+    try:
+        data = win32.NOTIFYICONDATAW(
+            cbSize=ctypes.sizeof(win32.NOTIFYICONDATAW),
+            hWnd=hwnd,
+            hID=uid,
+            uFlags=win32.NIF_TIP,
+            szTip=(tip or "")[:120],
+        )
+        return bool(win32.Shell_NotifyIcon(win32.NIM_MODIFY, data))
+    except Exception:
+        return None
 
 
 def resolve_tools_dir() -> Path:
@@ -540,6 +572,8 @@ class TrayApp:
         self._bridge_queue: queue.Queue = queue.Queue()
         self._bridge: ObservableBridge | None = None
         self._bridge_thread: threading.Thread | None = None
+        self._watchdog: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
 
         self._icon = pystray.Icon(
             "folos-codex-bridge",
@@ -585,6 +619,10 @@ class TrayApp:
         pystray = self._pystray
         Item = pystray.MenuItem
         return pystray.Menu(
+            # 左键单击的默认动作:弹一个状态框。既方便用户确认程序还活着,
+            # 也避免"点一下图标程序就没了"这种默认动作是退出的设计。
+            Item("查看状态", self._on_show_status, default=True),
+            pystray.Menu.SEPARATOR,
             Item(lambda _item: f"Codex 桥接 · {self._status_line()}", None, enabled=False),
             Item(lambda _item: self._address_line(), None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -599,7 +637,10 @@ class TrayApp:
             ),
             Item("查看当前配置", self._on_show_config),
             pystray.Menu.SEPARATOR,
-            Item("退出", self._on_quit, default=True),
+            # 退出必须是显式动作。pystray 把 default=True 的那一项绑到鼠标
+            # 左键单击上;以前这里挂在"退出"上,用户随手点一下托盘图标整个
+            # 桥接就退出了,看上去就像"图标过几秒自己没了"。
+            Item("退出", self._on_quit),
         )
 
     # -- 菜单动作(都在托盘线程里,不能阻塞) -----------------------------
@@ -648,6 +689,30 @@ class TrayApp:
             f"设备地址：{host or '自动发现'}:{port}\n"
             f"配对密钥：{token}\n"
             f"Codex 工作目录：{Path.home()}\n"
+            f"日志目录：{log_dir()}",
+        )
+
+    def _on_show_status(self, _icon, _item) -> None:
+        """左键单击的默认动作:后台弹状态框,不阻塞托盘消息循环。"""
+        threading.Thread(
+            target=self._show_status_dialog, name="tray-status", daemon=True
+        ).start()
+
+    def _show_status_dialog(self) -> None:
+        with self._state_lock:
+            state, detail = self._state, self._detail
+        label = STATE_STYLE.get(state, STATE_STYLE[STATE_STOPPED])[0]
+        pairing = load_pairing()
+        if pairing is None:
+            address = "未配对"
+        else:
+            address = f"{pairing[0] or '自动发现'}:{pairing[1]}"
+        tasks = self._bridge.task_count if self._bridge else 0
+        show_message(
+            "Codex 桥接",
+            f"状态：{label} · {detail}\n"
+            f"设备地址：{address}\n"
+            f"已处理任务：{tasks}\n"
             f"日志目录：{log_dir()}",
         )
 
@@ -714,6 +779,45 @@ class TrayApp:
             thread.join(timeout=timeout)
         self._bridge_thread = None
 
+    # -- 托盘图标看护 -----------------------------------------------------
+
+    def _start_icon_watchdog(self) -> None:
+        if self._watchdog is not None and self._watchdog.is_alive():
+            return
+        self._watchdog = threading.Thread(
+            target=self._icon_watchdog, name="tray-watchdog", daemon=True
+        )
+        self._watchdog.start()
+
+    def _icon_watchdog(self) -> None:
+        """兜底:定期确认图标还挂在通知区域上,掉了就补挂回去。
+
+        Windows 会主动摘掉通知区域的图标(explorer 重启、系统重排托盘、
+        远程桌面切换等)。pystray 只处理了 WM_TASKBARCREATED 一种情况,
+        其余情况下图标会静静地消失,用户看到的就是"图标过一会儿没了",
+        而进程其实还活着。这里只做"查 + 补",不动图标外观。
+        """
+        while not self._watchdog_stop.wait(ICON_WATCHDOG_INTERVAL_SECONDS):
+            try:
+                self._ensure_icon_registered()
+            except Exception:
+                print(traceback.format_exc())
+
+    def _ensure_icon_registered(self) -> None:
+        icon = self._icon
+        hwnd = getattr(icon, "_hwnd", None)
+        if not hwnd:
+            return
+        # pystray 用 id(icon) 当通知区域里的 uID,探测要带上同一个值;
+        # 标题保持一致,免得探测本身把 tooltip 改掉。
+        state = tray_icon_registered(hwnd, id(icon), getattr(icon, "title", ""))
+        if state is not False:
+            return
+        print("托盘图标已从通知区域消失,正在重新挂上。")
+        # pystray 没有公开的"刷新"接口,直接调私有 _show()(NIM_ADD):
+        # 图标还在时它会原地覆盖,不会产生第二个图标。
+        icon._show()
+
     # -- 启动 -------------------------------------------------------------
 
     def _on_ready(self, icon) -> None:
@@ -723,12 +827,14 @@ class TrayApp:
             self._apply_state(STATE_UNPAIRED, "尚未配对设备，请点「配对设备…」")
         else:
             self._start_bridge()
+        self._start_icon_watchdog()
 
     def run(self) -> None:
         print("托盘程序已启动,正在进入消息循环")
         try:
             self._icon.run(setup=self._on_ready)
         finally:
+            self._watchdog_stop.set()
             if self._bridge is not None:
                 self._bridge.request_stop()
             self._join_bridge(timeout=6.0)

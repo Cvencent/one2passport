@@ -29,6 +29,23 @@ else:
     )
 
 
+# 托盘程序是 GUI 进程(打包时 console=False),自身没有控制台。codex.exe 是
+# 控制台程序,Windows 因此会给它单独新建一个控制台窗口 —— 对用户来说就是
+# 双击托盘程序后凭空多出一个"CMD 黑框"。CREATE_NO_WINDOW 让子进程使用
+# 不可见的控制台。
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _hidden_startupinfo():
+    """让子进程的主窗口不显示;非 Windows 平台返回 None。"""
+    if os.name != "nt":
+        return None
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = subprocess.SW_HIDE
+    return info
+
+
 def _codex_desktop_candidates() -> list[Path]:
     """列出 Codex 桌面端(code++)自带的 codex.exe 候选路径。
 
@@ -126,6 +143,10 @@ class WindowsCodexAppServer(CodexAppServer):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                # 必须抑制子进程的控制台,否则 GUI 托盘程序会带出一个
+                # 常驻的 CMD 窗口(见 CREATE_NO_WINDOW 的注释)。
+                creationflags=CREATE_NO_WINDOW,
+                startupinfo=_hidden_startupinfo(),
             )
         except OSError as error:
             raise CodexProtocolError("Windows 无法启动 Codex app-server") from error

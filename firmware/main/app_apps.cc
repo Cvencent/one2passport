@@ -18,6 +18,7 @@
 #include "radio_display_settings.h"
 #include "ssid_manager.h"
 #include <algorithm>
+#include <atomic>
 #include <array>
 extern "C" {
 #include "ui_pixel.h"
@@ -44,26 +45,77 @@ bool settings_app_back(void);
 extern void app_framework_go_home(void);  // 由 app_registry.cc 提供(内部 go_home)
 extern bool radio_player_init();
 
+// 异步抢占收音机解码器池。
+//
+// 为什么必须异步: enter_app 跑在 LVGL 任务上下文(ui_flush_timer), 而
+// radio_player_ensure_pool() 会阻塞在 s_pool_mutex 上 —— 那个锁正被播放 /
+// 流媒体 worker 持有。在 LVGL 上下文里等锁等于让 taskLVGL 自己被看门狗判死
+// (实测: task_wdt 报 "Tasks currently running: CPU 0: taskLVGL" 每 5s 一次,
+// 且 ensure_pool 一行日志都没打出来, 说明根本没走到)。
+//
+// 做法: 只投一个任务立刻返回, 让 worker 慢慢等锁、慢慢抢池。
+// 池抢不到也只是收音机播不了, 不会拖累 UI。
+static std::atomic<bool> g_radio_prewarm_busy{false};
+
+static void radio_pool_prewarm_task(void *)
+{
+    radio_player_ensure_pool();
+    g_radio_prewarm_busy.store(false, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+void radio_request_pool_prewarm()
+{
+    // 已经在抢池时不重复起任务, 免得反复进出收音机堆出一串任务。
+    bool expected = false;
+    if (!g_radio_prewarm_busy.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (xTaskCreate(radio_pool_prewarm_task, "radio_prewarm", 3072,
+                    nullptr, 4, nullptr) != pdPASS) {
+        ESP_LOGW("app_apps", "radio prewarm task alloc failed; "
+                              "falling back to inline ensure");
+        g_radio_prewarm_busy.store(false, std::memory_order_release);
+        radio_player_ensure_pool();
+    }
+}
 // ---- 收音机 ----
 bool radio_app_enter(void) {
     s_settings_open = false;
+    // 收音机解码池与无线桥无法同时常驻；前台收音机独占内存，退出时恢复桥。
+    coding_bridge_stop_wireless();
+
+    // ⚠⚠ 内存顺序(2026-10-12 修复"进收音机就卡死发烫"):
+    //   抢占解码器池必须**先于**建 UI: 解码器首帧要一块 ~20KB 连续内存,
+    //   若先建 UI(吃 ~7KB 并把堆切碎), largest 只剩 4KB, 解码器必然开不出来,
+    //   播放循环反复重试空转 = 发热 + task_wdt 连环触发。
+    //
+    //   ⚠ 但**不能在这里同步调** ensure_pool(): enter_app 运行在 LVGL 任务
+    //   上下文里, 而 ensure_pool 会阻塞在 s_pool_mutex 上(播放/流媒体任务
+    //   正在用池), 于是 LVGL 任务被自己的 watchdog 判死:
+    //     task_wdt: Tasks currently running: CPU 0: taskLVGL
+    //   实测一次都没打��� ensure_pool 日志就是这么被饿死的。
+    //   正确做法: 交给自己新建的 worker 任务去抢池, LVGL 立即返回。
+    radio_request_pool_prewarm();
     // radio_ui_show_* 内部自己拿 LVGL 锁; 外层再拿会双重锁死(进应用卡住的根因)
     radio_ui_show_leo_main();
-    // ⚠ 顺序关键: **先建 UI 再恢复播放器内存池**。
-    // 反过来的话, 池里的 MP3 解码器(需 ~19KB 连续块)会先占走内存, 随后 UI 重建
-    // 只能挤到极小空间(实测 enter_app 瞬间 dma=100!), 既拖慢 UI 又让后续
-    // "点继续"时解码器复用失败 -> 卡在"正在缓冲"。
-    // 池本身是**懒恢复**的: stream_station 开头发现池缺失也会自行 ensure,
-    // 所以这里晚一点恢复不影响播放, 但保住了 UI 的空间。
-    radio_player_ensure_pool();
     radio_player_set_playing(true);
     app_radio_request_catalog();
     return true;
 }
 void radio_app_exit(void) {
     s_settings_open = false;
-    // Keep the audio core; release full controls for lightweight home playback.
+    radio_player_set_playing(false);
+    radio_player_wait_idle(3000);
     radio_ui_leave_leo_page();
+    // ⚠ 这里**故意不** release_pool()。解码器池是开机在堆最空的时刻抢到的
+    //   (heap largest ~90KB), 一旦放掉, 碎片堆里再也拼不出它需要的
+    //   ~20KB 连续块 —— 实测重新抢占必然失败, 收音机就永久播不了,
+    //   播放循环还会反复重试空转(发热 + task_wdt 连环触发)。
+    //   真正需要大块内存的是小智(opus 编码器 25KB)和 Codex(无线桥),
+    //   它们各自在 enter 里显式 release; 设置这类应用不需要。
+    coding_bridge_start_wireless();
 }
 void radio_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
     if (s_settings_open) {
@@ -81,13 +133,16 @@ bool codex_app_enter(void) {
     // Pause shared audio while retaining the prewarmed radio decoder.
     radio_player_set_playing(false);
     radio_player_wait_idle(1500);
-    esp_err_t bridge_result = coding_bridge_init();
+    radio_player_release_pool();
+    esp_err_t bridge_result = coding_bridge_start_wireless();
     app_coding_enter();   // app_coding 内部自管理锁
     if (bridge_result != ESP_OK) app_coding_bridge_error("桥接启动失败，请退出后重试");
     return app_coding_full_ready();
 }
 void codex_app_exit(void) {
     app_coding_exit();
+    // 进 Codex 时为无线桥让出过解码器池, 退出后异步抢回来。
+    radio_request_pool_prewarm();
 }
 void codex_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
     app_coding_key(btn, ev);
@@ -106,6 +161,26 @@ static lv_obj_t *xz_code_label;   // 设备激活码(大字)
 static lv_timer_t *xz_evt_timer;
 static bool xz_recording;
 static bool xz_connecting;
+static volatile bool xz_connect_cancel;
+static volatile bool xz_connect_task_alive;
+
+static bool xz_cancelled(void) {
+    return xz_connect_cancel || xiaozhi_client_is_cancelled();
+}
+
+static bool xz_cancelled_delay(uint32_t delay_ms) {
+    while (delay_ms > 0 && !xz_cancelled()) {
+        const uint32_t slice = delay_ms > 100 ? 100 : delay_ms;
+        vTaskDelay(pdMS_TO_TICKS(slice));
+        delay_ms -= slice;
+    }
+    return xz_cancelled();
+}
+
+static void xz_connect_task_exit(void) {
+    xz_connect_task_alive = false;
+    vTaskDelete(nullptr);
+}
 
 static void xz_apply_state(int st) {
     if (!xz_pet_body || !xz_status) return;
@@ -191,6 +266,9 @@ bool xiaozhi_app_enter(void) {
     ESP_LOGI(kTag, "xiaozhi enter begin");
     xz_recording = false;
     xz_connecting = true;
+    const bool can_start_connect =
+        !xz_connect_task_alive && xiaozhi_client_reset_cancel();
+    xz_connect_cancel = !can_start_connect;
     // 小智需要大块连续内存(opus 25KB + mic 栈 18KB + TLS ~20KB), 先释放收音机池
     // (此时收音机已暂停)。退出小智时 radio_player_ensure_pool() 会重新抢占。
     radio_player_set_playing(false);
@@ -202,6 +280,9 @@ bool xiaozhi_app_enter(void) {
     } else {
         radio_player_release_pool();
     }
+    // 小智前台运行期间独占内存，退出后由 xiaozhi_app_exit 恢复无线桥。
+    coding_bridge_stop_wireless();
+
     // ⚠ opus 预热**不在这里做**: 它要抢 25KB 连续块, 会使后面的 OTA TLS 握手
     // (需约 20KB 连续块)失败 —— 实测 largest 从 13824 掉到不够。
     // opus 预热移到 OTA 完成之后(见 xiaozhi_async_connect_task), 二者互斥。
@@ -260,17 +341,28 @@ bool xiaozhi_app_enter(void) {
     lv_obj_set_pos(h, 0, 298); lv_obj_set_width(h, 240);
     lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
 
-    xz_apply_state(4);
+    if (can_start_connect) {
+        xz_apply_state(4);
+    } else {
+        xz_connecting = false;
+        xz_apply_state(5);
+        if (xz_msg) lv_label_set_text(xz_msg, "上一次连接正在关闭，请稍后再试");
+    }
     lv_screen_load(xz_scr);
     xz_evt_timer = lv_timer_create(xz_evt_timer_cb, 30, nullptr);
     bsp_lvgl_unlock();
 
     // 后台连接(阻塞式OTA+WS, 放独立任务避免卡UI)
     xiaozhi_client_init();
+    // 丢弃上一次会话残留的 UI 事件, 否则旧错误会在新页面立即显示"连接失败"。
+    { xz_ui_event_t stale; while (xQueueReceive(xiaozhi_client_events(), &stale, 0) == pdTRUE) {} }
+    if (!can_start_connect) return true;
     ESP_LOGI(kTag, "xiaozhi page ready, starting connect task");
     extern void xiaozhi_async_connect_task(void *);
+    xz_connect_task_alive = true;
     if (xTaskCreate((TaskFunction_t)xiaozhi_async_connect_task, "xz_conn", 6144,
                     nullptr, 4, nullptr) != pdPASS) {
+        xz_connect_task_alive = false;
         ESP_LOGE("xiaozhi", "xz_conn task create failed (heap?)");
         xz_connecting = false;
         xz_apply_state(5);
@@ -282,26 +374,44 @@ bool xiaozhi_app_enter(void) {
 void xiaozhi_async_connect_task(void *) {
     // 用户在网页输入设备码后，服务端可能需要几秒才更新 OTA 状态。
     // 保持当前页面并轮询，避免必须退出再进入小智才能触发下一次请求。
+    int transient_failures = 0;
     for (int attempt = 0; attempt < 60; ++attempt) {
+        if (xz_cancelled()) break;
         if (xiaozhi_client_connect()) {
-            vTaskDelete(nullptr);
+            xz_connect_task_exit();
             return;
         }
-        if (!xiaozhi_client_activation_code()[0] &&
-            !xiaozhi_client_activation_message()[0]) {
-            xz_ui_event_t event = XZ_EV_ERROR;
-            xQueueSend(xiaozhi_client_events(), &event, 0);
-            vTaskDelete(nullptr);
-            return;
+        if (xz_cancelled()) break;
+        if (xiaozhi_client_activation_code()[0] ||
+            xiaozhi_client_activation_message()[0]) {
+            // 待激活/需重新绑定: 保持当前页轮询, 等用户在 xiaozhi.me 完成绑定。
+            if (xz_cancelled_delay(5000)) break;
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        // 瞬时失败(网络/DNS/TLS/WS 握手超时): 先重试几次再报"连接失败",
+        // 避免一次网络抖动就把用户挡在门外。
+        if (++transient_failures < 5) {
+            if (xz_cancelled_delay(3000)) break;
+            continue;
+        }
+        xz_ui_event_t event = XZ_EV_ERROR;
+        xQueueSend(xiaozhi_client_events(), &event, 0);
+        xz_connect_task_exit();
+        return;
+    }
+    if (xz_cancelled()) {
+        xz_connect_task_exit();
+        return;
     }
     xz_ui_event_t event = XZ_EV_ERROR;
     xQueueSend(xiaozhi_client_events(), &event, 0);
-    vTaskDelete(nullptr);
+    xz_connect_task_exit();
 }
 
 void xiaozhi_app_exit(void) {
+    // 小智不后台驻留: 退出后禁止连接任务继续重试，并立即关闭当前 WS。
+    xz_connect_cancel = true;
+    xz_connecting = false;
     if (xz_recording) {
         xiaozhi_client_stop_listening();
         xz_recording = false;
@@ -312,12 +422,18 @@ void xiaozhi_app_exit(void) {
         xz_pet_body = xz_status = xz_msg = xz_code_label = xz_eye_l = xz_eye_r = nullptr;
         bsp_lvgl_unlock();
     }
-    xiaozhi_client_close();
-    // 释放 opus 编码器, 把 25KB 内存还给收音机(否则收音机 MP3 无内存解不出)
-    xiaozhi_opus_release();
+    const bool cancel_settled = xiaozhi_client_cancel();
+    if (cancel_settled) {
+        // 下次进入小智时重新初始化编码器状态。
+        xiaozhi_opus_release();
+    } else {
+        ESP_LOGI(kTag, "xiaozhi exit: connect task still unwinding");
+    }
+    // 退出小智 = 归还之前为 opus 编码器让出的内存。此时异步把收音机
+    // 解码器池抢回来(不阻塞当前任务), 否则下次进收音机必然开不出解码器。
+    radio_request_pool_prewarm();
     // 回收音机内存池(进小智时释放过), 让收音机再次可播。
-    radio_player_ensure_pool();
-    radio_player_set_playing(true);
+    coding_bridge_start_wireless();
 }
 
 void xiaozhi_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {

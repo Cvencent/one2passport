@@ -51,6 +51,9 @@ constexpr char kTag[] = "internet_radio";
 struct KeyMessage {
     bsp_btn_t button;
     bsp_btn_ev_t event;
+    // 自动化测试用: >=0 表示直接跳到该应用, 忽略 button/event。
+    // 生产路径所有按键都显式写 -1, 所以正常按键行为完全不变。
+    int8_t app_jump = -1;
 };
 
 enum class ConfigInputMode {
@@ -218,11 +221,11 @@ static void button_event_bridge(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     KeyMessage msg{};
     switch (ev) {
         case BSP_BTN_CLICK:
-            msg = {btn, BSP_BTN_CLICK};
+            msg = {btn, BSP_BTN_CLICK, -1};
             xQueueSend(s_key_queue, &msg, 0);
             break;
         case BSP_BTN_LONG:
-            msg = {btn, BSP_BTN_LONG};
+            msg = {btn, BSP_BTN_LONG, -1};
             xQueueSend(s_key_queue, &msg, 0);
             break;
         default:  // PRESS/RELEASE/DOUBLE 走现有逻辑不需要
@@ -230,16 +233,21 @@ static void button_event_bridge(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     }
 }
 
+// 自动化测试: 请求跳到指定应用。转发到 UI 队列由 LVGL 定时器执行。
+static void serial_app_jump_request(int app_id);
 // 串口按键注入(自动化测试): fap_shot 任务回调, 只入队
 static void serial_key_inject(char c) {
     KeyMessage msg{};
     switch (c) {
-        case 'u': msg = {BSP_BTN_UP,   BSP_BTN_CLICK}; break;
-        case 'd': msg = {BSP_BTN_DOWN, BSP_BTN_CLICK}; break;
-        case 'o': msg = {BSP_BTN_OK,   BSP_BTN_CLICK}; break;
-        case 'j': msg = {BSP_BTN_DOWN, BSP_BTN_LONG};  break;
-        case 'l': msg = {BSP_BTN_OK,   BSP_BTN_LONG};  break;
-        case 'k': msg = {BSP_BTN_UP,   BSP_BTN_LONG};  break;
+        case 'u': msg = {BSP_BTN_UP,   BSP_BTN_CLICK, -1}; break;
+        case 'd': msg = {BSP_BTN_DOWN, BSP_BTN_CLICK, -1}; break;
+        case 'o': msg = {BSP_BTN_OK,   BSP_BTN_CLICK, -1}; break;
+        case 'j': msg = {BSP_BTN_DOWN, BSP_BTN_LONG, -1};  break;
+        case 'l': msg = {BSP_BTN_OK,   BSP_BTN_LONG, -1};  break;
+        case 'k': msg = {BSP_BTN_UP,   BSP_BTN_LONG, -1};  break;
+        case '1': case '2': case '3': case '4':
+            serial_app_jump_request(c - '1');
+            return;
         default: return;
     }
     if (s_key_queue) xQueueSend(s_key_queue, &msg, 0);
@@ -285,14 +293,14 @@ void button_task(void *) {
                 pressed_at = xTaskGetTickCount();
                 long_sent = false;
             } else if (previous >= 0 && !long_sent) {
-                const KeyMessage message = {static_cast<bsp_btn_t>(previous), BSP_BTN_CLICK};
+                const KeyMessage message = {static_cast<bsp_btn_t>(previous), BSP_BTN_CLICK, -1};
                 xQueueSend(s_key_queue, &message, 0);
             }
         }
 
         if (stable >= 0 && !long_sent &&
             xTaskGetTickCount() - pressed_at >= pdMS_TO_TICKS(850)) {
-            const KeyMessage message = {static_cast<bsp_btn_t>(stable), BSP_BTN_LONG};
+            const KeyMessage message = {static_cast<bsp_btn_t>(stable), BSP_BTN_LONG, -1};
             xQueueSend(s_key_queue, &message, 0);
             long_sent = true;
         }
@@ -300,6 +308,54 @@ void button_task(void *) {
     }
 }
 
+// SoftAP 的 beacon 缓冲(hostap attach)每次要 752 字节, 且分配失败时驱动不会返回
+// 错误 —— 它直接解引用空指针, 必崩(实测 "wifi:alloc eb len=752 type=4 fail" 之后
+// 紧跟 Load access fault)。所以必须在开 AP 之前自己确认 DMA 够用,
+// 不够就延后重试, 绝不能把设备送进重启循环。
+//
+// 阈值 6KB: 一次 hostap attach 连续要 2 块 752B, 再加 beacon/STA 缓冲与后续
+// 扫描/DNS/HTTPD 的余量。低于 6KB 时开 AP 属于赌博, 宁可晚点开。
+static constexpr unsigned kSetupApDmaBudgetBytes = 6144;
+
+// 开机时没有可用凭据 -> 需要进配网。但**绝不能直接在 app_main 里同步开**:
+//   此刻 I2S DMA + USB 桥接把 dma 压到 ~1.7KB, 而 hostap 的 beacon 缓冲
+//   (752B x 2) 分配失败后驱动不返回错误、直接解引用空指针:
+//     wifi:alloc eb len=752 type=4 fail
+//     Guru Meditation Error: Core 0 panic'ed (Load access fault)
+//   设备会陷入"一直响、反复刷首页"的重启循环。
+// 开机只置 need_setup_ap, 真正的开 AP 交给 30s 守护任务走 enter_wifi_config(),
+// 它会先停播放并释放解码器池, 再在专用任务上开 AP。
+//
+// StartConfigAp() 本身又是一次很重的调用: 起 DNS server + httpd(24 个 URI
+// handler) + cJSON + 扫描定时器, 实测能在 2KB 栈上直接吃穿
+// (2026-10-12: watchdog 任务 radio_wifi_guard 栈 2048, 同步调它 ->
+//  "Stack protection fault", 栈区间只有 2032 字节)。
+// 所以它绝不能在 watchdog / LVGL 这类小栈任务上同步执行 —— 统一挪到
+// 这个专用任务上, 12KB 静态栈, 与调用者无关。
+static void start_config_ap_on_dedicated_task();
+
+static void config_ap_start_task(void *arg)
+{
+    auto *manager = static_cast<WifiManager *>(arg);
+    manager->StartConfigAp();
+    vTaskDelete(nullptr);
+}
+
+static void start_config_ap_on_dedicated_task()
+{
+    auto &manager = WifiManager::GetInstance();
+    // 栈从堆上分配, **不占静态内存**。这一点很关键:
+    //   开机常驻的每一块静态内存都在跟收音机解码器抢堆。实测给本任务
+    //   预留 12KB 静态栈后, post_coding_bridge 的可用堆从 8760 掉到 6148,
+    //   进收音机时 MP3 解码器(需 ~20KB 连续块)彻底开不出来 ->
+    //   free_all 掉到 156 字节 -> task_wdt 每 5s 触发 -> 卡死发烫。
+    //   配网页不用收音机, 进配网前刚释放过解码器池, 那时堆上借 12KB 很安全。
+    if (xTaskCreate(config_ap_start_task, "cfg_ap_start", 3072,
+                    &manager, 5, nullptr) != pdPASS) {
+        ESP_LOGE(kTag, "config AP start task failed; retrying inline");
+        manager.StartConfigAp();
+    }
+}
 void enter_wifi_config(bool clear_saved_networks, bool allow_cancel = false) {
     if (s_config_mode.load()) return;
     ESP_LOGI(kTag, "Entering Wi-Fi configuration mode");
@@ -315,7 +371,11 @@ void enter_wifi_config(bool clear_saved_networks, bool allow_cancel = false) {
     if (clear_saved_networks) SsidManager::GetInstance().Clear();
     (void)allow_cancel;   // V6: 配网页无条件可退出(长按OK), 否则无网设备会被锁死在配网页
     s_config_can_cancel.store(true);
-    WifiManager::GetInstance().StartConfigAp();
+    // 同 deferred_setup_ap_task: hostap 的 beacon 缓冲分配失败后驱动不会返回错误,
+    // 而是直接解引用空指针崩溃, 所以开 AP 前先确认 DMA 余量, 不够就记日志。
+    ESP_LOGW(kTag, "config AP: dma=%u (budget %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA), kSetupApDmaBudgetBytes);
+    start_config_ap_on_dedicated_task();
 }
 
 void show_saved_wifi() {
@@ -595,11 +655,24 @@ void handle_config_input(const KeyMessage &message) {
 // 从根上消除 lv_inv_area 竞态挂死。
 static QueueHandle_t s_ui_queue;   // 二级队列: input_task -> LVGL任务
 
+// 实现: 投到 UI 队列, 由 ui_flush_timer 在 LVGL 任务上下文执行。
+// 不能在串口注入回调里直接 enter_app: 那是 fap 截图任务, 会与 LVGL 抢锁死锁。
+static void serial_app_jump_request(int app_id) {
+    if (!s_ui_queue) return;
+    KeyMessage jump = {BSP_BTN_OK, BSP_BTN_CLICK, -1};
+    jump.app_jump = (int8_t)app_id;
+    xQueueSend(s_ui_queue, &jump, 0);
+}
+
 static void ui_flush_timer_cb(lv_timer_t *) {
     KeyMessage message;
     // 一次最多处理 4 条, 避免长按连发时饿死渲染
     for (int i = 0; i < 4; ++i) {
         if (xQueueReceive(s_ui_queue, &message, 0) != pdTRUE) break;
+        if (message.app_jump >= 0) {
+            app_framework_launch_app(message.app_jump);
+            continue;
+        }
         if (s_config_mode.load(std::memory_order_acquire)) {
             handle_config_input(message);
         } else {
@@ -1025,14 +1098,19 @@ extern "C" void app_main(void) {
     }
 
 
+    // NVS 为空 => 全新设备没有任何可用凭据, 必须进配网。但**绝不能在这里直接开 AP**:
+    //   此刻堆/DMA 刚被 WiFi 缓冲 + I2S DMA + codec 吃穿(实测 post_audio_init
+    //   dma 只剩 7736 字节, largest 7680), SoftAP 的 beacon 缓冲(752 x 2)
+    //   分配不出来 -> ieee80211_hostap_attach 里空指针被解引用:
+    //     wifi:alloc eb len=752 type=4 fail
+    //     Guru Meditation Error: Core 0 panic'ed (Load access fault)
+    //   设备陷入无限重启, 表现为"一直响、反复刷首页"。
+    // 修法: 推迟到所有开机初始化(音频/音效/桥接/守护任务)全部做完之后再开,
+    // 那时收音机还没开始播放, DMA 余量充足, AP 能稳定起来。
     auto &ssid_manager = SsidManager::GetInstance();
     const auto &saved_networks = ssid_manager.GetSsidList();
-    if (saved_networks.empty()) {
-        // Public/share builds contain no owner's Wi-Fi credentials. A fresh
-        // device therefore opens its setup portal immediately.
-        s_portal_auto_opened.store(true);
-        manager.StartConfigAp();
-    } else {
+    const bool need_setup_ap = saved_networks.empty();
+    if (!need_setup_ap) {
         // Existing owners keep all networks already stored in NVS. Give those
         // networks 30 seconds to appear before opening the setup portal.
         manager.StartStation();
@@ -1061,5 +1139,7 @@ extern "C" void app_main(void) {
                           nullptr, 4, s_wifi_guard_stack, &s_wifi_guard_tcb) == NULL) {
         ESP_LOGE(kTag, "Wi-Fi watchdog task failed");
     }
+
+
     ESP_LOGI(kTag, "Internet radio ready");
 }

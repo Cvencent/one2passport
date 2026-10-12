@@ -843,6 +843,20 @@ static StackType_t s_mic_stack_storage[XZ_MIC_STACK_WORDS];
 static StaticTask_t s_mic_tcb;
 static TaskHandle_t s_mic_task;
 
+// 录音任务栈上的大缓冲必须搬到静态区。2026-10-12 实测崩溃:
+//   长按 OK 说话 -> opus_encode() 走 SILK 编码(silk_encode_frame_FIX ->
+//   silk_NSQ_c), 22KB 栈被吃穿, 触发 "Stack protection fault":
+//     Stack pointer: 0x3fca57d0
+//     Stack bounds:  0x3fca581c - 0x3fcab010
+//   设备当场重启回首页, 表现为"一说话就崩"。
+// 这两块合计 ~2.9KB(XZ_CHUNK_SAMPLES*2 + 1024), 移出栈后给 SILK 留足余量。
+// 关键: mic 栈本来就是静态数组 s_mic_stack_storage[], 所以这次搬移是
+// **.bss 内部搬家, 净增静态内存为 0** —— 既不碰 RF 校准/DMA 那条敏感线,
+// 又把栈溢出彻底解决。不能改成"把栈加到 32KB", 那会让开机
+// post_coding_bridge 的 dma 掉到 1032 字节, 触发 RF 校准失败死循环。
+static int16_t *s_mic_pcm;
+static uint8_t *s_mic_opus;
+
 static bool xz_opus_encoder_init(void)
 {
     if (s_encoder_ready) return true;
@@ -903,12 +917,12 @@ static void xz_capture_run(int16_t *pcm)
 
     send_listen_state("start");
     s_listening = true;
-    uint8_t opus[1024];
+    uint8_t *opus = s_mic_opus;
     uint32_t frames = 0;
     while (s_listening && s_ws_open) {
         if (bsp_audio_read(pcm, XZ_CHUNK_SAMPLES * sizeof(int16_t)) != ESP_OK) break;
         int encoded = opus_encode(s_opus_state, pcm, XZ_CHUNK_SAMPLES,
-                                  opus, (int)sizeof(opus));
+                                  opus, (int)sizeof(s_mic_opus));
         if (encoded <= 0) {
             ESP_LOGW(TAG, "opus encode failed: %d", encoded);
             break;
@@ -927,8 +941,17 @@ static void xz_capture_run(int16_t *pcm)
             esp_websocket_client_send_bin(s_ws, (const char *)opus,
                                           encoded, pdMS_TO_TICKS(1000));
         }
-        if (++frames % 16 == 0)   // about once per second (60ms/frame)
+        if (++frames % 16 == 0) {  // about once per second (60ms/frame)
             ESP_LOGI(TAG, "opus up: %lu frames", (unsigned long)frames);
+            // 栈余量自检: SILK 编码路径实测会吃 20KB+, 余量低于 1KB 时
+            // 提前告警。下次再有人调大编码器复杂度, 日志能直接指出问题,
+            // 而不是等到用户"一说话就重启"才发现。
+            UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+            if (free_bytes < 1024) {
+                ESP_LOGE(TAG, "mic stack nearly exhausted: %u bytes free of %d",
+                         (unsigned)free_bytes, XZ_MIC_STACK_WORDS);
+            }
+        }
     }
     send_listen_state("stop");
     s_listening = false;
@@ -937,8 +960,23 @@ static void xz_capture_run(int16_t *pcm)
 static void xz_capture_task(void *arg)
 {
     (void)arg;
-    int16_t pcm[XZ_CHUNK_SAMPLES];
-    xz_capture_run(pcm);
+    // 借堆: 录音期间才需要这两块缓冲, 录完立刻还给堆。
+    // 进小智时收音机已暂停并释放了解码器池, 此时的堆足以借出 ~2.9KB。
+    s_mic_pcm = (int16_t *)malloc(sizeof(int16_t) * XZ_CHUNK_SAMPLES);
+    s_mic_opus = (uint8_t *)malloc(1024);
+    if (!s_mic_pcm || !s_mic_opus) {
+        ESP_LOGE(TAG, "mic buffers alloc failed (pcm=%p opus=%p)",
+                 s_mic_pcm, s_mic_opus);
+        free(s_mic_pcm);  free(s_mic_opus);
+        s_mic_pcm = NULL;  s_mic_opus = NULL;
+        s_listening = false;
+        s_mic_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    xz_capture_run(s_mic_pcm);
+    free(s_mic_pcm);  free(s_mic_opus);
+    s_mic_pcm = NULL;  s_mic_opus = NULL;
     ESP_LOGI(TAG, "mic task stack high water: %u bytes free of %d",
              (unsigned)uxTaskGetStackHighWaterMark(NULL), XZ_MIC_STACK_WORDS);
     s_mic_task = NULL;

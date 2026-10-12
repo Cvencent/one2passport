@@ -49,9 +49,17 @@ void app_framework_init(void);
 // input_task 调: 按键事件进框架统一分发(全局导航+应用转发)
 void app_framework_dispatch(bsp_btn_t btn, bsp_btn_ev_t ev);
 
+// 异步抢占收音机解码器池。必须在 LVGL 任务上下文之外执行,
+// 详见 app_apps.cc 里 radio_request_pool_prewarm 的注释。
+void radio_request_pool_prewarm();
+
 // 系统级回首页(配网退出/异常恢复): 退出当前应用并载入首页桌面
 void app_framework_go_home(void);
 void app_framework_go_menu(void);
+
+// 自动化测试用: 直接跳到指定应用(0=收音机 1=Codex 2=小智AI 3=设置)。
+// 供串口注入命令调用, 走与 UI 点击完全相同的 enter_app 路径。
+void app_framework_launch_app(int app_id);
 
 // 当前所在层级(供外部如 Codex 桥接查询/驱动)
 typedef enum {

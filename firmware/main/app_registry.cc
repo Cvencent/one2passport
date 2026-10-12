@@ -1,4 +1,4 @@
-﻿// app_registry.cc —— V6 通用应用框架实现
+// app_registry.cc —— V6 通用应用框架实现
 //
 // 结构:
 //   [首页桌面]  --OK/长按UP-->  [应用菜单·轮播]  --OK-->  [应用]
@@ -84,6 +84,8 @@ static lv_obj_t *s_home_date;
 static lv_obj_t *s_home_np_card;    // 正在播放卡
 static lv_obj_t *s_home_np_name;
 static lv_obj_t *s_home_batt;
+static lv_obj_t *s_home_codex;
+static char s_home_codex_last[64] = "\x01";
 // 顶栏信号格: 首页/菜单共用一组(单页面驻留, 同一时刻只有一棵树 + 一个 s_home_batt)
 static lv_obj_t *s_home_sig[4];
 static lv_timer_t *s_home_tick;
@@ -307,6 +309,30 @@ static void home_eq_tick(lv_timer_t *timer) {
     lv_obj_invalidate(s_home_np_card);
 }
 
+// Render the Codex badge line from the shared unread counts. Layout is 240px
+// wide; short Chinese labels keep it comfortably within one line.
+static void refresh_home_codex(void) {
+    if (!s_home_codex) return;
+    uint32_t running = 0, done = 0, failed = 0;
+    app_coding_get_task_counts(&running, &done, &failed);
+    char text[64];
+    if (running == 0 && done == 0 && failed == 0) {
+        text[0] = '\0';
+    } else {
+        snprintf(text, sizeof(text), "运行 %u  完成 %u  失败 %u",
+                 (unsigned)running, (unsigned)done, (unsigned)failed);
+    }
+    if (strcmp(text, s_home_codex_last) == 0) return;
+    strcpy(s_home_codex_last, text);
+    lv_label_set_text(s_home_codex, text);
+    lv_obj_set_style_text_color(
+        s_home_codex,
+        lv_color_hex(failed > 0 ? C_DANGER
+                                : (done > 0 ? C_FG
+                                            : (running > 0 ? C_ACCENT : C_MUTED))),
+        0);
+}
+
 // ---------------------------------------------------------------------------
 static void home_tick(lv_timer_t *timer) {
     (void)timer;
@@ -330,14 +356,30 @@ static void home_tick(lv_timer_t *timer) {
         static const char *W[] = {"日","一","二","三","四","五","六"};
         snprintf(d, sizeof(d), "%02d月%02d日 周%s", local.tm_mon + 1, local.tm_mday,
                  W[local.tm_wday % 7]);
-        lv_label_set_text(s_home_clock, t);
-        lv_label_set_text(s_home_date, d);
+        // 只有文案真的变了才 set_text: LVGL 的 set_text 会无条件失效重绘,
+        // 逐秒重画是首页闲置发热的来源之一。
+        static char last_clock[8] = "";
+        static char last_date[32] = "";
+        if (strcmp(last_clock, t) != 0) {
+            strcpy(last_clock, t);
+            lv_label_set_text(s_home_clock, t);
+        }
+        if (strcmp(last_date, d) != 0) {
+            strcpy(last_date, d);
+            lv_label_set_text(s_home_date, d);
+        }
     }
-    // 顶栏状态(信号 + 电量)
-    refresh_top_bar();
+    refresh_home_codex();
+    // 顶栏状态(信号 + 电量): 电量/RSSI 变化很慢, 每 5 秒刷一次就够,
+    // 不必 1Hz 重排一遍标签和信号格。
+    static unsigned top_bar_tick = 5;
+    if (++top_bar_tick >= 5U) {
+        top_bar_tick = 0U;
+        refresh_top_bar();
+    }
     // 频谱条动画交给独立的低频定时器 home_eq_tick(300ms), 这里不再逐帧重绘。
     const bool playing = radio_player_is_playing();
-    // 单行文案: "正在播放 音乐名"(拼接, 不再占两行)
+    // 单行文案: "正在播放 音乐名"(拼接, 不再占两行); 同样只在变化时更新。
     if (s_home_np_name) {
         char line[96];
         if (playing) {
@@ -346,11 +388,17 @@ static void home_tick(lv_timer_t *timer) {
         } else {
             snprintf(line, sizeof(line), "已停止");
         }
-        lv_label_set_text(s_home_np_name, line);
+        static char last_line[96] = "";
+        if (strcmp(last_line, line) != 0) {
+            strcpy(last_line, line);
+            lv_label_set_text(s_home_np_name, line);
+        }
     }
 }
 
 static void home_build(void) {
+    s_home_codex_last[0] = '\x01';
+    s_home_codex_last[1] = '\0';
     s_home_scr = box(nullptr, 0, 0, 240, 320, C_BG);
 
     // 顶栏
@@ -379,6 +427,13 @@ static void home_build(void) {
     lv_obj_set_pos(s_home_date, 0, 160);
     lv_obj_set_width(s_home_date, 240);
     lv_obj_set_style_text_align(s_home_date, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Codex 待办行: 运行中 + 未读完成/失败。
+    // 只在数字变化时调 lv_label_set_text, 避免逐秒重绘导致发热。
+    s_home_codex = label(s_home_scr, "", 10, C_MUTED);
+    lv_obj_set_pos(s_home_codex, 0, 183);
+    lv_obj_set_width(s_home_codex, 240);
+    lv_obj_set_style_text_align(s_home_codex, LV_TEXT_ALIGN_CENTER, 0);
 
     // 正在播放卡(196..276, 卡片内坐标 0..80)
     s_home_np_card = box(s_home_scr, 12, 196, 216, 80, C_SURFACE);
@@ -409,6 +464,7 @@ static void home_build(void) {
     s_eq_frame = 0;
     s_home_eq_tick = lv_timer_create(home_eq_tick, 300, nullptr);
     pet_apply_codex_state((codex_state_t)s_codex_state);
+    refresh_home_codex();
 }
 
 static void menu_build(void) {
@@ -509,6 +565,7 @@ static void destroy_home(void) {
     if (s_home_scr) { lv_obj_delete(s_home_scr); s_home_scr = nullptr; }
     s_home_pet = s_home_body = s_home_deco = s_home_clock = s_home_date = nullptr;
     s_home_np_card = s_home_np_name = s_home_batt = nullptr;
+    s_home_codex = nullptr;
     for (int i = 0; i < 4; ++i) s_home_sig[i] = nullptr;
 }
 
@@ -574,6 +631,10 @@ static void go_menu(void) {
 
 void app_framework_go_menu(void) { go_menu(); }
 
+// 自动化测试入口: 与点击菜单项走同一条 enter_app 路径。
+// 调用方负责保证在 LVGL 任务上下文(定时器/按键分发)里调用。
+
+
 static void enter_app(app_id_t id) {
     ESP_LOGI(kTag, "enter_app id=%d name=%s", (int)id, APPS[id].name);
     xz_heap_report("enter_app_in");
@@ -582,7 +643,13 @@ static void enter_app(app_id_t id) {
     if (!bsp_lvgl_lock(1500)) return;
     lv_screen_load(s_transition_scr);
     destroy_menu();
-    bsp_lvgl_unlock();
+    // ⚠⚠ 内存(2026-10-12 修复"进应用就卡死发烫"):
+    //   首页树必须在进应用前销毁, 否则它和应用页同时常驻。
+    //   实测不销毁时进入收音机堆从 12076 掉到 1176、dma=48, LVGL 随即
+    //   分配失败卡死, task_wdt 每 5s 触发一次 —— 表现就是"一进应用就卡住、
+    //   发烫、还一直响"。首页重建很便宜(只在回首页时 ensure_home),
+    //   换来的 ~7-10KB 余量是收音机能解码、能播的前提。
+    destroy_home();
     // 当前活动屏已由空屏承接，应用创建时不再与菜单树争用堆。
     if (!app.enter()) {
         ESP_LOGE(kTag, "app %s enter failed", app.name);
@@ -628,6 +695,22 @@ void app_framework_dispatch(bsp_btn_t btn, bsp_btn_ev_t ev) {
         // 用户反馈: 回到首页后没有"退出/暂停收音机"的入口 —— 音乐一直在放。
         // 此处给首页加上"长按OK = 停止播放"的显式出口。
         if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK) { go_menu(); }
+        else if (ev == BSP_BTN_LONG && btn == BSP_BTN_DOWN) {
+            // 首页长按"下键" = 快捷进入 Codex(编程伴侣), 不看任务状态, 行为可预期。
+            // 注意: 本机堆很紧(回到首页后空闲约 25KB), 首页树和 Codex 页不能同时驻留,
+            // 所以先像 go_menu() 那样把首页拆掉, 再走"从菜单进入"的同一条路径。
+            ESP_LOGI(kTag, "home: long-press DOWN -> Codex shortcut");
+            xz_heap_report("home_codex_shortcut_in");
+            if (bsp_lvgl_lock(1500)) {
+                lv_screen_load(s_transition_scr);
+                destroy_home();
+                bsp_lvgl_unlock();
+            }
+            s_level = APP_LEVEL_MENU;      // 首页已拆掉, 失败回退 ensure_menu() 才自洽
+            s_menu_sel = APP_ID_CODEX;
+            enter_app(APP_ID_CODEX);
+            xz_heap_report("home_codex_shortcut_out");
+        }
         else if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
             if (radio_player_is_playing()) {
                 radio_player_set_playing(false);   // 停止播放(不切页)
@@ -703,3 +786,13 @@ void radio_app_resume(void) { /* 不自动恢复播放; 用户回收音机应用
 
 // 系统级"回首页"入口(配网退出、异常恢复等): 退出当前应用并载入首页
 void app_framework_go_home(void) { go_home(); }
+
+// 自动化测试入口: 与点击菜单项走同一条 enter_app 路径。
+// 调用方负责保证在 LVGL 任务上下文(定时器回调)里调用。
+void app_framework_launch_app(int app_id) {
+    if (app_id < 0 || app_id >= (int)APP_ID_COUNT) {
+        ESP_LOGW(kTag, "launch_app: bad id %d", app_id);
+        return;
+    }
+    enter_app((app_id_t)app_id);
+}

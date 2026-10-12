@@ -613,17 +613,16 @@ void input_task(void *) {
     while (true) {
         if (xQueueReceive(s_key_queue, &message, portMAX_DELAY) != pdTRUE) continue;
         ESP_LOGI("key_evt", "KEY btn=%d ev=%d", (int)message.button, (int)message.event);
-        // 先记活动 -> 屏幕若息屏则在此点亮。
-        // 必须在 note_activity() **之前**取 was_blanked(): 它返回的是当前状态,
-        // 而 note_activity() 会立刻把 s_screen_on 置回 true, 之后就问不出"刚才是否息屏"。
-        const bool woke = radio_display_was_blanked();
+        // 息屏时: 任意键只负责点亮屏幕, **不**执行该键的功能。
+        // 这样黑屏状态下误碰电源键不会切台/进出应用; 想操作就先点亮再按一次。
+        // (必须在 note_activity() 之前判断: 它会把 s_screen_on 置回 true。)
+        if (radio_display_was_blanked()) {
+            radio_display_note_activity();          // 点亮 + 刷新计时
+            radio_display_grace_after_wake(3000); // 别刚点亮就二次息屏
+            ESP_LOGI(kTag, "key consumed to wake screen");
+            continue;
+        }
         radio_display_note_activity();
-        // 唤醒键不吞: 息屏后按下的这一次**就是**用户的第一次操作, 必须生效。
-        // 旧代码写成 if (!radio_display_note_activity()) continue;, 把返回值
-        // ("屏幕之前是否亮着") 当成"是否已唤醒"取反, 结果唤醒键被 continue 吃掉,
-        // 屏幕亮了但界面毫无反应, 用户只按一下就以为唤不醒(2026-10-12 修复)。
-        // 唤醒后给 3s 缓冲, 免得刚点亮就二次息屏, 同样像唤不醒。
-        if (woke) radio_display_grace_after_wake(3000);
         if (radio_easter_egg_is_playing()) {
             radio_easter_egg_stop();
             continue;

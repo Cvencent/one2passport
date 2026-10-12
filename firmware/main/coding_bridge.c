@@ -1036,6 +1036,14 @@ esp_err_t coding_bridge_init_usb_only(void)
 esp_err_t coding_bridge_start_wireless(void)
 {
     if (s_wireless_started) {
+        if (s_wireless_enabled) return ESP_OK;
+        esp_err_t resumed = wireless_bridge_init(process_wireless_line,
+                                                 send_wifi_status);
+        if (resumed != ESP_OK) {
+            ESP_LOGW(TAG, "wireless bridge restart failed: %s",
+                     esp_err_to_name(resumed));
+            return resumed;
+        }
         s_wireless_enabled = true;
         s_bridge_online = false;
         s_connected = false;
@@ -1069,6 +1077,7 @@ void coding_bridge_stop_wireless(void)
     /* 传输任务跟随 WifiManager 的 netif 生命周期；完整收音机/小智前台期间
      * 只停止把无线消息送进应用层，并放下当前鉴权会话。退出后由宿主重新拉起。 */
     s_wireless_enabled = false;
+    wireless_bridge_stop();
     s_allow_foreground_ui = false;
     s_bridge_online = false;
     s_connected = false;

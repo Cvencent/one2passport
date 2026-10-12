@@ -6,6 +6,7 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "app.h"
+#include "xiaozhi_client.h"
 #include "coding_bridge.h"
 #include "ui_sfx.h"
 #include "wireless_bridge.h"
@@ -1050,7 +1051,10 @@ extern "C" void app_main(void) {
     // 才在碎片堆上抢占, 实测 DMA 可用仅剩 60~184 字节 -> 收音机永远连不上。
     // 首页只保留最小化收音机（当前频道状态 + 播放/暂停）。完整解码器池
     // 进入收音机应用时再申请，避免开机常驻内存挤压 Wi-Fi 与 Codex 无线桥。
-    xz_heap_report("post_radio_prewarm");
+    // 首页只显示当前频道状态，不需要 MP3 解码器池。池改到进入完整收音机时申请：
+    // LVGL 已改为系统堆分配(见 sdkconfig.defaults)，但仍不宜在开机就把 ~20KB
+    // 连续块钉死 —— 小智 Opus(24.5KB) 与 OTA TLS(~20KB) 都需要大块连续内存。
+    xz_heap_report("post_radio_prewarm_skipped");
     ESP_ERROR_CHECK(bsp_display_init());
     if (!bsp_lvgl_init()) {
         ESP_LOGE(kTag, "Display initialization failed");

@@ -28,6 +28,7 @@ bool radio_player_init();
 bool radio_player_prewarm(void);
 void radio_player_release_pool(void);   // 进小智等大内存应用前释放
 void radio_player_ensure_pool(void);    // 退出后重新抢占
+bool radio_player_has_pool();           // 首页最小化服务仅在有池时恢复播放
 
 // 取电台目录搜索用的 8KB 预分配缓冲(开机时随解码器池一起抢下)。
 // 返回 nullptr 表示尚未预分配, 调用方应回退到自己 malloc。

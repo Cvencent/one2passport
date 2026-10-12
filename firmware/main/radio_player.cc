@@ -488,6 +488,10 @@ bool radio_player_prewarm(void) {
 // 释放收音机内存池: 进入小智等需要大块连续内存的应用前调用(此时收音机已暂停)。
 // 退出后再由 radio_player_ensure_pool() 重新抢占。
 // 这是"无后台应用"内存模型的落地: 谁在用谁占内存, 不用即还。
+bool radio_player_has_pool() {
+    return s_decoder_pool != nullptr && s_output_pool != nullptr && s_input_pool != nullptr;
+}
+
 void radio_player_release_pool(void) {
     xSemaphoreTakeRecursive(s_pool_mutex, portMAX_DELAY);
     if (s_decoder_pool) { esp_audio_simple_dec_close(s_decoder_pool); s_decoder_pool = nullptr; }

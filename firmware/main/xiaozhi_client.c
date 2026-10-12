@@ -910,7 +910,7 @@ extern int opus_encoder_ctl(void *st, int request, ...);
 extern int opus_encode(void *st, const short *pcm, int frame_size,
                        unsigned char *data, int max_data_bytes);
 
-static uint8_t s_opus_state[XZ_OPUS_STATE_CAPACITY] __attribute__((aligned(4)));
+static void *s_opus_state;
 static int s_opus_state_size;
 static bool s_encoder_ready;
 static bool s_encoder_gave_up;
@@ -941,11 +941,21 @@ static bool xz_opus_encoder_init(void)
     if (s_encoder_gave_up) return false;
 
     s_opus_state_size = opus_encoder_get_size(1);
-    if (s_opus_state_size <= 0 || s_opus_state_size > (int)sizeof(s_opus_state)) {
-        ESP_LOGE(TAG, "opus state too large: need=%d capacity=%u",
-                 s_opus_state_size, (unsigned)sizeof(s_opus_state));
+    if (s_opus_state_size <= 0) {
+        ESP_LOGE(TAG, "opus state size invalid: %d", s_opus_state_size);
         s_encoder_gave_up = true;
         return false;
+    }
+    if (s_opus_state == NULL) {
+        s_opus_state = heap_caps_malloc((size_t)s_opus_state_size,
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_opus_state == NULL) {
+            ESP_LOGE(TAG, "opus state alloc failed: need=%d largest=%u",
+                     s_opus_state_size,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            s_encoder_gave_up = true;
+            return false;
+        }
     }
     memset(s_opus_state, 0, (size_t)s_opus_state_size);
     // ⚠⚠ 必须与官方 xiaozhi-esp32 的 AS_OPUS_ENC_CONFIG() 对齐(2026-10-12):
@@ -981,10 +991,35 @@ static bool xz_opus_encoder_init(void)
 // Compatibility API used by app exit and startup call sites.
 bool xiaozhi_opus_prewarm(void) { return xz_opus_encoder_init(); }
 
+static bool xz_mic_task_stop_and_wait(void)
+{
+    s_listening = false;
+    if (!s_mic_task) return true;
+
+    // opus_encode() runs on this task. Do not free s_opus_state until the
+    // capture task has actually left the encoder.
+    for (int waited_ms = 0; s_mic_task && waited_ms < 3000; waited_ms += 10) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_mic_task) {
+        ESP_LOGE(TAG, "mic task did not stop in time; keeping Opus state");
+        return false;
+    }
+    return true;
+}
+
 void xiaozhi_opus_release(void)
 {
+    if (!xz_mic_task_stop_and_wait()) {
+        // The capture task still owns the encoder, so keep it allocated.
+        return;
+    }
     s_encoder_ready = false;
-    s_encoder_gave_up = false;
+    // 退出小智时**不释放** s_opus_state: 这块 24.5KB 连续内存只在"收音机池
+    // 已释放、桥接已停"的窄窗口里拿得到, 一旦还回碎片堆就再也拼不回来,
+    // 下次进小智必然失败(实测固定卡在 largest 20480)。这里只把编码器标记为
+    // 未初始化, 内存保留, 下次 xz_opus_encoder_init() 原地 memset + 重新初始化。
+    // gave_up 不清零, 避免失败后反复重试把 CPU 打满。
     // 先停播放任务(它会自己收尾), 再归还 TTS 解码器 state。
     // play_stop 内部也会释放解码器, 这里再调一次是幂等的。
     xz_tts_play_stop();
@@ -1305,12 +1340,13 @@ bool xiaozhi_client_connect(void)
     }
     if (xz_cancel_requested()) goto done;
     xz_heap_report("xz_connect_pre");
-    // Static Opus state no longer competes with TLS for heap. Keep OTA first
-    // so the session token is fresh, then initialize the encoder in place.
+    // 先在堆还完整时抢下 Opus(24.5KB 连续块): 进小智时收音机池已释放、
+    // 桥接已停, 此刻连续块最富余。若让 OTA 先跑, TLS 会把这块切碎, Opus
+    // 往往就再也拿不到(实测曾固定卡在 largest 20480 < 24524 失败)。
+    if (!xiaozhi_opus_prewarm()) goto done;
     if (!ota_fetch_config()) goto done;
     s_cached_ver = s_proto_version;
     if (xz_cancel_requested()) goto done;
-    if (!xiaozhi_opus_prewarm()) goto done;
     if (!ws_connect_and_hello()) goto done;
     success = true;
 

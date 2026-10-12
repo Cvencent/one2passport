@@ -133,7 +133,7 @@ static uint32_t s_last_task_elapsed_ms;
 static bool s_has_remote_task_elapsed;
 
 #define s_detail (s_workspace->detail)
-#define s_render_detail (s_workspace->render_detail)
+#define s_render_detail (s_workspace->detail)
 static char s_page_text[512];
 static catalog_mode_t s_catalog_mode;
 #define s_catalog (s_workspace->catalog)
@@ -1069,10 +1069,7 @@ static void coding_render(void)
     for (int i = 0; i < 2; ++i) {
         lv_obj_set_style_bg_color(s_pet_phrase_tail[i], lv_color_hex(accent), 0);
     }
-    if (strcmp(s_detail, detail) != 0) {
-        snprintf(s_detail, sizeof(s_detail), "%s", detail);
-        s_page = 0U;
-    }
+    /* s_detail and detail intentionally share one workspace buffer now. */
     if ((s_flow.stage == CODING_STAGE_DONE || s_flow.stage == CODING_STAGE_ERROR) &&
         s_active_message_id[0] != '\0') {
         codex_read_tracker_visit(s_active_message_id, "", lv_tick_get());

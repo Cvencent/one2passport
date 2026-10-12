@@ -126,8 +126,8 @@ void radio_app_exit(void) {
     //   播放循环还会反复重试空转(发热 + task_wdt 连环触发)。
     //   真正需要大块内存的是小智(opus 编码器 25KB)和 Codex(无线桥),
     //   它们各自在 enter 里显式 release; 设置这类应用不需要。
-    coding_bridge_start_wireless();
-    coding_bridge_set_foreground_ui(false);
+    // 由 app_framework_minimize_services() 统一恢复桥接与收音机，
+    // 这里不再单独抢资源，避免两条恢复路径互相覆盖。
 }
 void radio_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
     if (s_settings_open) {
@@ -154,9 +154,8 @@ bool codex_app_enter(void) {
 }
 void codex_app_exit(void) {
     app_coding_exit();
+    // 退出完整 Codex 回到最小化 Codex: 由框架统一恢复桥接与收音机。
     coding_bridge_set_foreground_ui(false);
-    // 退出完整 Codex 回到最小化 Codex: 桥接继续接收通知, 不启动完整页面。
-    radio_request_pool_prewarm();
 }
 void codex_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
     app_coding_key(btn, ev);
@@ -551,11 +550,7 @@ void xiaozhi_app_exit(void) {
     } else {
         ESP_LOGI(kTag, "xiaozhi exit: connect task still unwinding");
     }
-    // 退出小智 = 归还之前为 opus 编码器让出的内存。此时异步把收音机
-    // 解码器池抢回来(不阻塞当前任务), 否则下次进收音机必然开不出解码器。
-    radio_request_pool_prewarm();
-    // 退出小智 = 回到首页/菜单的最小化层: 恢复桥接与最小化收音机。
-    coding_bridge_start_wireless();
+    // 退出小智 = 回到首页/菜单的最小化层: 由框架统一恢复桥接与收音机。
     coding_bridge_set_foreground_ui(false);
 }
 

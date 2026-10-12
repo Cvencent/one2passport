@@ -27,6 +27,7 @@ extern "C" {
 #include "ui_phosphor.h"
 }
 #include "radio_player.h"
+#include "coding_bridge.h"
 #include "radio_font.h"
 #include "app.h"
 #include "bsp_battery.h"
@@ -795,8 +796,17 @@ void radio_app_pause(void)  {
 void radio_app_resume(void) { /* 不自动恢复播放; 用户回收音机应用自行按OK */ }
 
 void app_framework_minimize_services(bool restore_radio) {
+    if (s_level != APP_LEVEL_HOME && s_level != APP_LEVEL_MENU) return;
+
+    /* Miniature services own the home/menu layer only. Full-screen apps stop
+     * these services before taking their resources, and this is the single
+     * place that brings them back when the framework leaves an app. */
+    if (coding_bridge_start_wireless() != ESP_OK) {
+        ESP_LOGW(kTag, "minimized Codex bridge could not start");
+    }
+    coding_bridge_set_foreground_ui(false);
     if (restore_radio && s_minimized_radio_should_play &&
-        (s_level == APP_LEVEL_HOME || s_level == APP_LEVEL_MENU)) {
+        radio_player_has_pool()) {
         radio_player_set_playing(true);
     }
 }

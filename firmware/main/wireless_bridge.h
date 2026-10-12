@@ -42,6 +42,9 @@ typedef bool (*wireless_bridge_authenticate_t)(const char *line,
 esp_err_t wireless_bridge_init(wireless_bridge_line_cb_t line_cb,
                                wireless_bridge_status_cb_t status_cb);
 
+// 停止网络任务并关闭 TCP/UDP socket。下一次 wireless_bridge_init() 可重新启动。
+void wireless_bridge_stop(void);
+
 // 安装统一协议握手处理。返回 true 表示该行已完成 bridge_auth 应答，
 // 传输层不再把这一行交给应用消息回调。
 void wireless_bridge_set_authenticate(

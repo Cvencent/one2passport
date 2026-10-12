@@ -60,6 +60,8 @@ static bool s_client_authenticated;
 static bool s_wifi_connected;
 static char s_token[TOKEN_MAX + 1];
 static char s_ip[16];
+static volatile bool s_task_stop_requested;
+static TaskHandle_t s_task_handle;
 
 static esp_err_t save_token(const char *token);
 
@@ -237,6 +239,7 @@ static void network_task(void *argument)
     ESP_LOGI(TAG, "LAN bridge ready on TCP %d", BRIDGE_PORT);
 
     while (true) {
+        if (s_task_stop_requested) break;
         int client = -1;
         if (xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             client = s_client_fd;
@@ -328,6 +331,12 @@ static void network_task(void *argument)
             }
         }
     }
+
+    client_replace(-1);
+    close(tcp_fd);
+    close(udp_fd);
+    s_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 static void load_token(void)
@@ -421,10 +430,25 @@ esp_err_t wireless_bridge_init(wireless_bridge_line_cb_t line_cb,
      * esp_netif_create_default_wifi_sta() 会返回 NULL 并导致启动失败。 */
     load_token();
 
+    if (s_task_handle != NULL) return ESP_OK;
+    s_task_stop_requested = false;
     if (xTaskCreate(network_task, "wireless_bridge", NETWORK_TASK_STACK,
-                    NULL, 4, NULL) != pdPASS) {
+                    NULL, 4, &s_task_handle) != pdPASS) {
+        s_task_handle = NULL;
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "transport ready, token=%s", s_token[0] ? "loaded" : "missing");
     return ESP_OK;
+}
+
+void wireless_bridge_stop(void)
+{
+    s_task_stop_requested = true;
+    client_replace(-1);
+    for (int i = 0; i < 100 && s_task_handle != NULL; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (s_task_handle != NULL) {
+        ESP_LOGW(TAG, "network task did not stop in time");
+    }
 }

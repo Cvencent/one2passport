@@ -8,7 +8,6 @@
 typedef struct { char id[8]; char title[192]; } coding_catalog_item_t;
 typedef struct {
  char detail[CODING_RENDER_CAPACITY];
- char render_detail[CODING_RENDER_CAPACITY];
  coding_catalog_item_t catalog[CODING_CATALOG_CAPACITY];
 } coding_workspace_t;
 

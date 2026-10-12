@@ -59,6 +59,11 @@ void app_coding_bridge_done_with_elapsed(const char *text, uint32_t elapsed_ms);
 void app_coding_bridge_error_with_elapsed(const char *text, uint32_t elapsed_ms);
 void app_coding_bridge_state(uint32_t running, uint32_t done, uint32_t failed);
 void app_coding_result_identity(const char *thread_id, const char *turn_id);
+void app_coding_remote_status(const char *text);
+void app_coding_remote_task(const char *thread_id, const char *text,
+                            const char *message_id);
+void app_coding_remote_result(const char *thread_id, const char *status,
+                              const char *text, const char *message_id);
 // 项目/会话列表(电脑端分批下发,begin -> item* -> end)。
 void app_coding_catalog_begin(const char *scope);
 void app_coding_catalog_item(const char *scope, const char *id,
@@ -86,6 +91,15 @@ typedef enum {
 void app_coding_enter(void);
 bool app_coding_full_ready(void);
 app_codex_state_t app_coding_get_pet_state(void);
+// 首页徽标使用的任务计数（只读，由最近一次 codex_state 同步）。
+void app_coding_get_task_counts(uint32_t *running, uint32_t *done,
+                                uint32_t *failed);
+// 首页计数由桥接层在后台直接维护（按 message_id 去重、按 read_state 消未读）。
+void app_home_set_codex_counts(uint32_t running, uint32_t done,
+                               uint32_t failed);
+// 完整 Codex 页面是否正在前台显示。桥接层在后台只更新状态，不触碰页面控件。
+bool app_coding_full_ui_active(void);
+void app_coding_apply_read_state(const char *message_id, uint32_t read_count);
 void app_coding_exit(void);
 void app_coding_key(bsp_btn_t button, bsp_btn_ev_t event);
 bool app_coding_back(void);

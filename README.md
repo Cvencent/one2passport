@@ -35,7 +35,7 @@ Passport。设备端支持的能力由桥接器按设备配置，未开启的能
 - 城市电台：按网络位置自动定位，也可手动切换城市
 - 设备端配网：直接在设备上搜索 Wi-Fi、输入密码，无需手机
 - 定时播放、亮度/熄屏、已存网络管理
-- Codex 页（长按 UP 进入）：显示会话状态，支持语音对话
+- 首页/菜单只运行最小化收音机和最小化 Codex；完整收音机、完整 Codex 只在进入对应应用时创建
 - 全中文界面，内置点阵字库
 
 按键操作、烧录参数与 Codex 页行为见
@@ -61,28 +61,20 @@ python firmware/merge_bin.py --build-dir firmware/build --out AI-Passport-MERGED
 
 ## Codex 接入状态
 
-这条 `main` 分支里的固件仍然使用旧的 `FOLOOS_DISCOVER_V1` 发现请求和旧握手：
-
-```text
-FOLOOS_DISCOVER_V1
-bridge_auth -> bridge_auth_ok
-```
-
-新的通用 CodexBridge 使用统一协议：
+本仓库固件已迁移到 CodexBridge 的统一设备协议，只保留这一套发现与握手：
 
 ```text
 CODEXBRIDGE_DISCOVER
 bridge_auth -> bridge_auth_ok -> bridge_ready
 ```
 
-两者目前**不能直接完成新协议配对**。因此：
-
-- 启动 CodexBridge 后，旧的 `%LOCALAPPDATA%\FoloOS\bridge.json` 只会被迁入
-  `%LOCALAPPDATA%\CodexBridge\devices.json`，在托盘里显示为待迁移设备。
-- AI Passport 要真正接入通用协议，需要把固件发现应答补充 `device_id`、`name`、
-  `capabilities`，把握手升级为 `bridge_auth_ok -> bridge_ready`，并实现
-  `message`、`read_state`、`read_ack` 等统一消息。
-- 在固件完成迁移前，不要把旧固件描述成已经兼容新版 CodexBridge。
+- 设备以 MAC 派生稳定 `device_id`（`aipassport-<mac>`），型号
+  `FoloOS-AI-Passport`，发现与握手都上报同一份 `capabilities`。
+- 固件声明支持 `status`、`text`、`tasks`、`results`、`read_ack`；实际启用哪几项由
+  CodexBridge 按设备配置，默认只启用最小集合，未启用的能力不会下发到设备。
+- 设备接收统一 `message`、`read_state`，结果页停留满 2 秒上报一次 `read_ack`；
+  多台设备的已读状态由 CodexBridge 广播同步。
+- 旧 `FOLOOS_DISCOVER_V1` 与旧握手已从固件移除，不保留协议分支。
 
 ## 测试
 
@@ -119,7 +111,8 @@ This repository is now firmware-only. The PC-side bridge lives at
 here. Firmware binaries ship through this repository's Releases page; the
 CodexBridge installer ships through the CodexBridge repository.
 
-The current `main` firmware still speaks the legacy `FOLOOS_DISCOVER_V1`
-discovery and handshake protocol. The unified `CODEXBRIDGE_DISCOVER` protocol
-requires a firmware migration before direct pairing is available. Licensed
-under MIT; see `firmware/LICENSE`.
+The current `main` firmware speaks the unified CodexBridge device protocol
+(`CODEXBRIDGE_DISCOVER` plus `bridge_auth -> bridge_auth_ok -> bridge_ready`).
+The legacy `FOLOOS_DISCOVER_V1` path has been removed. The device advertises its
+supported capabilities and CodexBridge decides which ones are enabled and
+delivered. Licensed under MIT; see `firmware/LICENSE`.

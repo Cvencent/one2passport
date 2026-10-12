@@ -10,6 +10,8 @@
 #include "bsp_audio.h"
 #include "bsp_display.h"
 #include "cJSON.h"
+#include "codex_bridge_protocol.h"
+#include "codex_background_state.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "fap_screenshot.h"
@@ -20,10 +22,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
+#include "ui_sfx.h"
+#include "app_registry.h"
 #include "wireless_bridge.h"
 
 #define BRIDGE_LINE_MAX 768
-#define BRIDGE_TIMEOUT_US (12LL * 1000LL * 1000LL)
+#define BRIDGE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 #define CAPTURE_SAMPLE_RATE 16000
 #define CAPTURE_CHUNK_SAMPLES 160
 #define CAPTURE_CHUNK_BYTES (CAPTURE_CHUNK_SAMPLES * sizeof(int16_t))
@@ -35,7 +39,17 @@ static const char *TAG = "coding_bridge";
 extern bool radio_is_playing_c(void);
 static bool s_ready;
 static bool s_connected;
+static bool s_wireless_started;
+static bool s_wireless_enabled;
+static bool s_bridge_online;
+static bool s_allow_foreground_ui;
+static codex_bridge_parser_t s_wireless_parser;
+static char s_active_message_id[CODEX_BRIDGE_ID_MAX];
+static char s_enabled_capabilities[CODEX_BRIDGE_CAPABILITY_MAX][CODEX_BRIDGE_CAPABILITY_LEN];
+static size_t s_enabled_capability_count;
 static int64_t s_last_message_us;
+static app_codex_state_t s_background_codex_state = APP_CODEX_OFFLINE;
+static codex_background_state_t s_background_state;
 static volatile bool s_capture_requested;
 static volatile bool s_capture_cancelled;
 static bool s_capture_wireless;
@@ -239,6 +253,35 @@ static bool send_json(cJSON *root)
     return sent;
 }
 
+static bool send_wireless_line(const char *line, size_t length)
+{
+    return wireless_bridge_write(line, length);
+}
+
+static bool authenticate_wireless(const char *line, const char *device_id)
+{
+    return codex_bridge_protocol_accept_line(line, send_wireless_line, device_id);
+}
+
+static void capabilities_replace_from_message(const codex_bridge_message_t *message)
+{
+    if (message == NULL) return;
+    s_enabled_capability_count = message->capability_count;
+    for (size_t index = 0; index < s_enabled_capability_count; ++index) {
+        snprintf(s_enabled_capabilities[index], CODEX_BRIDGE_CAPABILITY_LEN, "%s",
+                 message->capabilities[index]);
+    }
+}
+
+bool coding_bridge_capability_enabled(const char *capability)
+{
+    if (capability == NULL) return false;
+    for (size_t index = 0; index < s_enabled_capability_count; ++index) {
+        if (strcmp(s_enabled_capabilities[index], capability) == 0) return true;
+    }
+    return false;
+}
+
 static cJSON *event_create(const char *type)
 {
     cJSON *root = cJSON_CreateObject();
@@ -257,6 +300,49 @@ static void send_simple(const char *type)
 bool coding_bridge_is_connected(void)
 {
     return s_connected;
+}
+
+static app_codex_state_t background_pet_state(void)
+{
+    switch (codex_background_pet_state(&s_background_state)) {
+    case CODEX_BACKGROUND_IDLE: return APP_CODEX_IDLE;
+    case CODEX_BACKGROUND_BUSY: return APP_CODEX_BUSY;
+    case CODEX_BACKGROUND_DONE: return APP_CODEX_DONE;
+    case CODEX_BACKGROUND_FAIL: return APP_CODEX_FAIL;
+    case CODEX_BACKGROUND_OFFLINE:
+    default: return APP_CODEX_OFFLINE;
+    }
+}
+
+static void home_codex_counts_changed(void)
+{
+    app_home_set_codex_counts(s_background_state.running,
+                              s_background_state.done,
+                              s_background_state.failed);
+}
+
+static void home_codex_state_changed(void)
+{
+    s_background_codex_state = background_pet_state();
+    home_codex_counts_changed();
+    app_home_set_codex_state(s_background_codex_state);
+}
+
+static void background_read_state_changed(const char *message_id)
+{
+    if (message_id == NULL || message_id[0] == '\0') return;
+    if (!codex_background_mark_read(&s_background_state, message_id)) return;
+    home_codex_state_changed();
+}
+
+void coding_bridge_set_foreground_ui(bool active)
+{
+    s_allow_foreground_ui = active;
+}
+
+bool coding_bridge_foreground_ui_active(void)
+{
+    return s_allow_foreground_ui;
 }
 
 static void send_wifi_status(const char *status, const char *ip)
@@ -756,7 +842,110 @@ static void process_line(const char *line, bool usb_transport)
 
 static void process_wireless_line(const char *line)
 {
-    process_line(line, false);
+    if (!s_wireless_enabled) {
+        codex_bridge_parser_reset(&s_wireless_parser);
+        return;
+    }
+    codex_bridge_message_t message = {0};
+    if (!codex_bridge_protocol_feed(&s_wireless_parser, line, strlen(line), &message)) {
+        return;
+    }
+    if (!s_bridge_online) {
+        if (strcmp(message.type, "bridge_ready") == 0 && !message.ignored) {
+            capabilities_replace_from_message(&message);
+            s_bridge_online = true;
+            s_connected = true;
+            s_background_state.connected = true;
+            s_last_message_us = esp_timer_get_time();
+            home_codex_state_changed();
+            if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+                app_coding_bridge_connected(true);
+                bsp_lvgl_unlock();
+            }
+        }
+        codex_bridge_protocol_reset_message(&message);
+        return;
+    }
+    if (strcmp(message.type, "bridge_ready") == 0) {
+        capabilities_replace_from_message(&message);
+        s_last_message_us = esp_timer_get_time();
+        codex_bridge_protocol_reset_message(&message);
+        return;
+    }
+    if (strcmp(message.type, "capabilities_update") == 0) {
+        capabilities_replace_from_message(&message);
+        s_last_message_us = esp_timer_get_time();
+        codex_bridge_protocol_reset_message(&message);
+        return;
+    }
+    if (strcmp(message.type, "read_state") == 0) {
+        s_last_message_us = esp_timer_get_time();
+        background_read_state_changed(message.message_id);
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_apply_read_state(message.message_id, message.read_count);
+            bsp_lvgl_unlock();
+        }
+        codex_bridge_protocol_reset_message(&message);
+        return;
+    }
+    if (strcmp(message.type, "message") == 0 && !message.ignored) {
+        s_last_message_us = esp_timer_get_time();
+        if (message.seq + 1 >= message.total) {
+            snprintf(s_active_message_id, sizeof(s_active_message_id), "%s",
+                     message.message_id);
+            const bool kind_status = strcmp(message.kind, "status") == 0 &&
+                                     coding_bridge_capability_enabled("status");
+            const bool kind_task = strcmp(message.kind, "task") == 0 &&
+                                   coding_bridge_capability_enabled("tasks");
+            const bool kind_result = strcmp(message.kind, "result") == 0 &&
+                                     coding_bridge_capability_enabled("results");
+            bool first_result = false;
+            if (kind_status || kind_task || kind_result) {
+                const uint32_t running = strcmp(message.status, "working") == 0 ||
+                                                 strcmp(message.status, "in_progress") == 0
+                                             ? 1U
+                                             : 0U;
+                if (kind_result) {
+                    /* Results are immutable and may be rebroadcast; only the
+                     * first delivery increments the unread badge. */
+                    codex_background_apply(&s_background_state, message.kind,
+                                           message.status, running);
+                    first_result = codex_background_apply_result(
+                        &s_background_state, message.message_id, message.status);
+                    if (first_result) {
+                        home_codex_state_changed();
+                    }
+                } else {
+                    codex_background_apply(&s_background_state, message.kind,
+                                           message.status, running);
+                    home_codex_state_changed();
+                }
+            }
+            if (first_result && !coding_bridge_foreground_ui_active()) {
+                app_voice_mode_t mode = app_settings_voice_mode();
+                if (strcmp(message.status, "failed") == 0) {
+                    ui_sfx_play(UI_SFX_FAIL);
+                } else if (mode == APP_VOICE_SPEECH) {
+                    ui_sfx_play(UI_SFX_DONE_SPEECH);
+                } else if (mode == APP_VOICE_TONE) {
+                    ui_sfx_play(UI_SFX_CONFIRM);
+                }
+            }
+            if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+                if (kind_status) {
+                    app_coding_remote_status(message.body);
+                } else if (kind_task) {
+                    app_coding_remote_task(message.thread_id, message.body,
+                                           message.message_id);
+                } else if (kind_result) {
+                    app_coding_remote_result(message.thread_id, message.status,
+                                             message.body, message.message_id);
+                }
+                bsp_lvgl_unlock();
+            }
+        }
+    }
+    codex_bridge_protocol_reset_message(&message);
 }
 
 static void process_usb_line(const char *line)
@@ -766,12 +955,17 @@ static void process_usb_line(const char *line)
 
 static void bridge_tick(void)
 {
+    if (!s_wireless_enabled) return;
     if (s_connected &&
             esp_timer_get_time() - s_last_message_us > BRIDGE_TIMEOUT_US) {
             s_capture_requested = false;
             s_long_text_target = LONG_TEXT_NONE;
-            if (bsp_lvgl_lock(500)) {
-                s_connected = false;
+            s_connected = false;
+            s_bridge_online = false;
+            codex_background_reset(&s_background_state);
+            home_codex_state_changed();
+            wireless_bridge_disconnect();
+            if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
                 app_coding_bridge_connected(false);
                 bsp_lvgl_unlock();
             }
@@ -800,12 +994,105 @@ esp_err_t coding_bridge_init(void)
     s_ready = true;
     fap_set_json_line_hook(process_usb_line);
     fap_set_tick_hook(bridge_tick);
+    codex_bridge_protocol_init();
+    wireless_bridge_set_authenticate(authenticate_wireless,
+                                     codex_bridge_protocol_device_id());
     esp_err_t wireless = wireless_bridge_init(process_wireless_line,
                                               send_wifi_status);
     if (wireless != ESP_OK) {
         ESP_LOGW(TAG, "wireless bridge unavailable: %s",
                  esp_err_to_name(wireless));
+    } else {
+        s_wireless_started = true;
+        s_wireless_enabled = true;
+        s_bridge_online = false;
     }
     ESP_LOGI(TAG, "USB audio bridge ready, wireless=%d", wireless == ESP_OK);
     return ESP_OK;
+}
+
+esp_err_t coding_bridge_init_usb_only(void)
+{
+    if (s_ready) return ESP_OK;
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t config = {
+            .tx_buffer_size = 2048,
+            .rx_buffer_size = 2048,
+        };
+        esp_err_t result = usb_serial_jtag_driver_install(&config);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "USB driver install failed: %s", esp_err_to_name(result));
+            return result;
+        }
+    }
+    usb_serial_jtag_vfs_use_driver();
+    s_ready = true;
+    fap_set_json_line_hook(process_usb_line);
+    fap_set_tick_hook(bridge_tick);
+    ESP_LOGI(TAG, "USB audio bridge ready");
+    return ESP_OK;
+}
+
+esp_err_t coding_bridge_start_wireless(void)
+{
+    if (s_wireless_started) {
+        s_wireless_enabled = true;
+        s_bridge_online = false;
+        s_connected = false;
+        codex_background_reset(&s_background_state);
+        home_codex_state_changed();
+        /* Resume after full-screen foreground use: force one reconnect so the
+         * host replays messages/read state that arrived while we were mute. */
+        wireless_bridge_disconnect();
+        return ESP_OK;
+    }
+    esp_err_t ready = coding_bridge_init_usb_only();
+    if (ready != ESP_OK) return ready;
+    codex_bridge_protocol_init();
+    wireless_bridge_set_authenticate(authenticate_wireless,
+                                     codex_bridge_protocol_device_id());
+    esp_err_t wireless = wireless_bridge_init(process_wireless_line,
+                                              send_wifi_status);
+    if (wireless != ESP_OK) {
+        ESP_LOGW(TAG, "wireless bridge unavailable: %s",
+                 esp_err_to_name(wireless));
+        return wireless;
+    }
+    s_wireless_started = true;
+    s_wireless_enabled = true;
+    s_bridge_online = false;
+    return ESP_OK;
+}
+
+void coding_bridge_stop_wireless(void)
+{
+    /* 传输任务跟随 WifiManager 的 netif 生命周期；完整收音机/小智前台期间
+     * 只停止把无线消息送进应用层，并放下当前鉴权会话。退出后由宿主重新拉起。 */
+    s_wireless_enabled = false;
+    s_allow_foreground_ui = false;
+    s_bridge_online = false;
+    s_connected = false;
+    s_enabled_capability_count = 0U;
+    codex_background_reset(&s_background_state);
+    s_background_codex_state = APP_CODEX_OFFLINE;
+    app_home_set_codex_counts(0U, 0U, 0U);
+    app_home_set_codex_state(APP_CODEX_OFFLINE);
+    /* Drop the current PC session so the discovery loop reconnects and the
+     * host replays the latest unread/read state when we resume. */
+    wireless_bridge_disconnect();
+    codex_bridge_parser_reset(&s_wireless_parser);
+}
+
+bool coding_bridge_send_read_ack(const char *message_id)
+{
+    if (!codex_bridge_protocol_send_read_ack(send_wireless_line, message_id)) {
+        return false;
+    }
+    /* The host broadcasts read_state to other devices, not back to the
+     * sender. Clear this device's own unread badge as soon as its ack lands,
+     * otherwise leaving the full Codex page would resurrect the stale count. */
+    if (codex_background_mark_read(&s_background_state, message_id)) {
+        home_codex_state_changed();
+    }
+    return true;
 }

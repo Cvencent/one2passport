@@ -184,6 +184,23 @@ extern "C" esp_err_t codex_wifi_configure(const char *ssid, const char *password
     return ok ? ESP_OK : ESP_FAIL;
 }
 
+// Xiaozhi's C client asks the host for the station state before it needs to
+// resolve the XiaoZhi service.  These are thin adapters over WifiManager so
+// the C translation units do not have to depend on the C++ singleton.
+extern "C" int wifi_manager_is_connected(void) {
+    return WifiManager::GetInstance().IsConnected() ? 1 : 0;
+}
+
+extern "C" const char *wifi_manager_get_ip_address(void) {
+    static std::string address;
+    address = WifiManager::GetInstance().GetIpAddress();
+    return address.c_str();
+}
+
+extern "C" esp_netif_t *wifi_manager_get_station_netif(void) {
+    return esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+}
+
 // Persists the city the listener picked in Settings so a restart comes back to
 // the same place instead of relocating from scratch every time.
 void save_selected_city(std::size_t choice_index) {
@@ -877,6 +894,9 @@ void wifi_event(WifiEvent event, const std::string &data) {
             manager.SetPowerSaveLevel(WifiPowerSaveLevel::BALANCED);
             start_sntp_once();
             radio_player_set_network(true);
+            // 首页/菜单的最小化收音机: 已有网络后自动播放当前频道。若当前在
+            // 完整收音机/Codex/小智应用内，则保持暂停，由应用自己控制音频。
+            app_framework_minimize_services(true);
             // ⚠⚠ 连网事件**不要**在这里触发目录搜索(2026-10-12 修复"收音机一直
             //   卡在正在切换电台/不出声")。
             //
@@ -1028,9 +1048,8 @@ extern "C" void app_main(void) {
     //
     // 2026-10-12 回归修复: 这个调用曾被整体删掉, 解码器改到 radio_app_enter()
     // 才在碎片堆上抢占, 实测 DMA 可用仅剩 60~184 字节 -> 收音机永远连不上。
-    if (!radio_player_prewarm()) {
-        ESP_LOGW(kTag, "Radio prewarm failed; decoder will be allocated lazily");
-    }
+    // 首页只保留最小化收音机（当前频道状态 + 播放/暂停）。完整解码器池
+    // 进入收音机应用时再申请，避免开机常驻内存挤压 Wi-Fi 与 Codex 无线桥。
     xz_heap_report("post_radio_prewarm");
     ESP_ERROR_CHECK(bsp_display_init());
     if (!bsp_lvgl_init()) {
@@ -1097,10 +1116,10 @@ extern "C" void app_main(void) {
     // I2S DMA and the ES8311 codec need a contiguous internal-RAM block.
     // Wi-Fi init must claim its buffers first; afterward the reduced 4x128
     // DMA pool fits in the remaining largest block.
-    if (!radio_player_init()) {
+    const bool audio_ready = radio_player_init();
+    if (!audio_ready) {
         radio_ui_set_playback(RadioPlaybackState::Error, "音频初始化失败");
         ESP_LOGE(kTag, "Audio player initialization failed");
-        return;
     }
     xz_heap_report("post_audio_init");
 
@@ -1112,8 +1131,8 @@ extern "C" void app_main(void) {
     // ---- Codex 监控页子系统 ----
     // 音频就绪后再装提示音,避免在 codec 未打开时播放。
     // wireless_bridge 的真正 init 放在下方 WifiManager 之后(socket 依赖 netif)。
-    app_coding_set_audio_available(true);
-    ui_sfx_init(true);
+    app_coding_set_audio_available(audio_ready);
+    ui_sfx_init(audio_ready);
     ui_sfx_set_volume(app_settings_sfx_volume());
     wireless_bridge_set_wifi_configure(codex_wifi_configure);
     if (!radio_sleep_timer_init()) {
@@ -1142,15 +1161,14 @@ extern "C" void app_main(void) {
     // WiFi station setup allocates event nodes and netif state. Start the
     // bridge only after those allocations so the bridge task cannot starve
     // the WiFi event loop during boot.
-    // 只装 USB 侧: 无线 socket 桥(TCP 8765 + UDP 8764 + 5KB 任务栈)实测常驻
-    // ~15KB 内部 RAM, 开机就常驻会把收音机解码池挤到碎片上(见 FEATURE_STATUS
-    // "Codex 桥接: 从开机启动改为进入 Codex 应用时初始化")。无线侧改由
-    // coding_bridge_start_wireless() 在进 Codex 应用时按需拉起。
-    esp_err_t bridge_result = coding_bridge_init_usb_only();
+    // 首页/菜单需要常驻最小化 Codex，因此无线桥在开机后即启动；完整 Codex
+    // 页面只在进入 Codex 应用时创建，桥接消息在后台只更新状态，不触碰页面。
+    esp_err_t bridge_result = coding_bridge_start_wireless();
     xz_heap_report("post_coding_bridge");
     if (bridge_result != ESP_OK) {
-        ESP_LOGW(kTag, "Codex USB bridge startup failed: %s", esp_err_to_name(bridge_result));
+        ESP_LOGW(kTag, "Codex bridge startup failed: %s", esp_err_to_name(bridge_result));
     }
+    coding_bridge_set_foreground_ui(false);
 
     // 用静态栈创建: 这条任务负责"30s 拿不到网就开配网门户", 属于兜底安全网,
     // 绝不能因为开机瞬间堆紧张而静默消失(实测 post_coding_bridge 时

@@ -34,10 +34,18 @@ typedef void (*wireless_bridge_status_cb_t)(const char *status, const char *ip);
 typedef esp_err_t (*wireless_bridge_wifi_configure_t)(const char *ssid,
                                                       const char *password);
 
+typedef bool (*wireless_bridge_authenticate_t)(const char *line,
+                                               const char *device_id);
+
 // 初始化传输层。必须在 WifiManager::Initialize() 之后调用
 // (socket 依赖已建立的 netif)。内部只加载 token 并启动网络任务。
 esp_err_t wireless_bridge_init(wireless_bridge_line_cb_t line_cb,
                                wireless_bridge_status_cb_t status_cb);
+
+// 安装统一协议握手处理。返回 true 表示该行已完成 bridge_auth 应答，
+// 传输层不再把这一行交给应用消息回调。
+void wireless_bridge_set_authenticate(
+    wireless_bridge_authenticate_t authenticate, const char *device_id);
 
 // 注册换网回调(见上方说明)。未注册时 wireless_bridge_configure 返回
 // ESP_ERR_INVALID_STATE。
@@ -56,6 +64,9 @@ esp_err_t wireless_bridge_configure(const char *ssid, const char *password,
 
 bool wireless_bridge_is_connected(void);
 void wireless_bridge_get_ip(char *buffer, size_t size);
+// 主动断开当前 PC 会话。下一次 PC 轮询发现设备时会重新认证并让主机重放
+// 当前未读消息与已读状态；设备端不需要保存消息缓存。
+void wireless_bridge_disconnect(void);
 
 #ifdef __cplusplus
 }

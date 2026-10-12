@@ -49,7 +49,19 @@ python -m esptool --chip esp32c3 -b 460800 --before default_reset --after hard_r
 
 ## 三、按键操作
 
-### 收音机主界面
+### 首页 / 菜单：只跑最小化服务
+
+首页与菜单不是完整应用页，只保留两个轻量服务：
+
+- **最小化收音机**：继续播放当前频道，短按 OK 暂停/恢复，不加载完整收音机页。
+- **最小化 Codex**：后台接收任务状态、结果和已读同步，更新首页宠物与未读数字，
+  不创建完整 Codex 页面。
+
+进入完整应用时，另一个最小化服务会让出资源：进完整收音机时最小化 Codex 退出，
+进完整 Codex 时最小化收音机退出，进小智 AI 时两者都退出。退出完整应用后才回到
+首页/菜单的最小化层，并按用户在最小化层最后一次选择的播放/暂停状态恢复。
+
+### 完整收音机
 
 | 操作 | 效果 |
 | --- | --- |
@@ -58,16 +70,17 @@ python -m esptool --chip esp32c3 -b 460800 --before default_reset --after hard_r
 | 长按 OK | 进入设置 |
 | **长按 UP** | **进入 Codex 页** |
 
-### Codex 页
+### 完整 Codex
 
 | 操作 | 效果 |
 | --- | --- |
-| **长按 UP** | **退出，回到收音机主界面** |
+| **长按 UP** | **退出，回到菜单** |
 | 点击 UP / DOWN | 上移 / 下移一格（选项、决策、列表） |
 | 点击 OK | 确认；在“开始录音”上是开始/停止录音 |
 | 录音中再点 OK | 结束录音 → 等待识别 → 确认后发送 |
 
-进入 Codex 页时会自动暂停收音机播放并等播放器空闲，避免与语音链路抢音频。
+进入完整 Codex 时会暂停最小化收音机、释放解码池，并启动完整 Codex 页面和无线桥接。
+退出完整 Codex 时销毁页面，只保留后台最小化 Codex，不恢复完整收音机页面。
 
 ---
 
@@ -131,29 +144,24 @@ CodexBridge 的目标协议只有一套，不区分 V1/V2：
 
 ### 当前固件状态
 
-本分支固件仍使用旧的 `FOLOOS_DISCOVER_V1`，发现应答只有：
+本分支固件已经完成统一协议迁移，只保留这一套握手：
 
-```json
-{"device":"FoloOS-AI-Passport","port":8765}
+```text
+CODEXBRIDGE_DISCOVER
+bridge_auth -> bridge_auth_ok -> bridge_ready
 ```
 
-旧握手也只有 `bridge_auth -> bridge_auth_ok`。这与新版 CodexBridge 的统一协议
-不兼容，所以当前固件**不能直接完成新协议配对**。
-
-CodexBridge 会把旧的 `%LOCALAPPDATA%\FoloOS\bridge.json` 迁入
-`%LOCALAPPDATA%\CodexBridge\devices.json`，并以 `legacy:<旧IP>` 形式保留记录；
-这只是一条迁移线索，不代表设备已经支持统一协议。
-
-### 需要完成的固件迁移
-
-1. 发现请求处理改为精确匹配 `CODEXBRIDGE_DISCOVER`。
-2. 发现应答补充稳定的 `device_id`、`name` 与 `capabilities`。
-3. `bridge_auth_ok` 补充 `device_id`、`model`、`name`、`firmware` 与 `capabilities`。
-4. 接收并保存首次 `bridge_ready.capabilities`，用 5 秒心跳维持在线。
-5. 解析统一 `message`，实现 `read_ack` 上报与其他设备的 `read_state` 同步。
-6. 保持管理中心的其他功能不变，只迁移 Codex 采集与桥接能力。
-
-在完成这些改动前，不要把 `main` 分支固件描述为“已经兼容 CodexBridge”。
+- 发现请求精确匹配 `CODEXBRIDGE_DISCOVER`，应答带稳定的
+  `device_id`（`aipassport-<mac>`）、`name`、`port` 与 `capabilities`。
+- `bridge_auth_ok` 上报 `device_id`、`model`、`name`、`firmware` 与同一份
+  `capabilities`，与发现应答一致。
+- 设备声明支持 `status`、`text`、`tasks`、`results`、`read_ack`；实际启用项由
+  CodexBridge 按设备配置，默认只开最小集合。
+- 接收首次及心跳 `bridge_ready.capabilities` 与 `capabilities_update`，据此决定显示
+  哪些消息；15 秒未收到 PC 消息判定离线。
+- 解析统一 `message` 与 `read_state`；结果页停留满 2 秒上报一次 `read_ack`，其他
+  设备已读后同步刷新“已读人数”。
+- 旧 `FOLOOS_DISCOVER_V1` 与旧握手代码已删除，不存在 V1/V2 分支。
 
 ---
 
@@ -166,7 +174,10 @@ CodexBridge 会把旧的 `%LOCALAPPDATA%\FoloOS\bridge.json` 迁入
 | `main/app_coding.c` | Codex 页面：动画形象、会话列表、对话渲染、按键状态机 |
 | `main/coding_flow.c` | 对话流程状态机（录音/识别/确认/排队/运行/审批） |
 | `main/coding_bridge.c` | PC 桥接协议：录音上行、语音下行、USB + 无线双通道 |
-| `main/wireless_bridge.c` | 当前仍为旧版 TCP/UDP 传输层 |
+| `main/wireless_bridge.c` | 统一协议 TCP/UDP 传输层：发现、token 配对与鉴权回调 |
+| `main/codex_bridge_protocol.c/.h` | 统一发现、握手、能力、消息分片与 read_ack 编解码 |
+| `main/codex_background_state.h` | 最小化 Codex 的状态、未读结果去重与已读清零 |
+| `main/codex_read_tracker.c` | 结果页停留 2 秒的已读计时器 |
 | `main/ui_sfx.c` | 按键音效 |
 | `main/ui_pixel.c` / `.h` | 像素风 UI 基元（面板、标签、选中态） |
 | `main/lv_font_cn_16.c` | 中文点阵字体（GB2312 全集 6763 字） |
@@ -192,8 +203,8 @@ CodexBridge 会把旧的 `%LOCALAPPDATA%\FoloOS\bridge.json` 迁入
 | 现象 | 处理 |
 | --- | --- |
 | CodexBridge 提示未登录 ChatGPT | 在 Codex App Server 使用 ChatGPT 账户登录；API Key 登录不等于可用 |
-| 托盘里出现 `legacy:<IP>` 设备 | 那是旧 `bridge.json` 迁移记录；固件尚未完成统一协议迁移 |
-| CodexBridge 发现不到设备 | 确认设备已联网、与电脑同网段；当前 `main` 固件仍只应答旧发现请求 |
+| 托盘里出现 `legacy:<IP>` 设备 | 那是旧 `bridge.json` 迁移记录；新固件会另以 `aipassport-<mac>` 上线 |
+| CodexBridge 发现不到设备 | 确认设备已联网、与电脑同网段，且 UDP 8764 未被防火墙拦截 |
 | 设备端提示“麦克风不可用” | 检查 `bsp_audio` 初始化；重启设备 |
 | 构建报 `lvgl/lvgl.h not found` | 确认 `main/CMakeLists.txt` 里有 `LV_LVGL_H_INCLUDE_SIMPLE` 定义 |
 | 构建报 `undefined reference to wireless_bridge_*` | 确认相关头文件有 `extern "C"` 守卫 |

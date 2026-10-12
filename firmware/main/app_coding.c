@@ -8,6 +8,7 @@
 #include "coding_workspace.h"
 #include "coding_pet.h"
 #include "coding_bridge.h"
+#include "codex_bridge_protocol.h"
 #include "esp_log.h"
 #include "lvgl.h"
 #include "ui_pixel.h"
@@ -92,9 +93,13 @@ static coding_flow_t s_flow;
 static coding_pet_t s_pet_state;
 static char s_result_thread[64];
 static char s_result_turn[64];
+static char s_active_message_id[80];
+static char s_read_ack_message_id[80];
+static uint32_t s_read_count;
 static bool s_local_unread;
 static bool s_initialized;
 static bool s_audio_available;
+static bool s_full_ui_active;
 static bool s_have_rendered_stage;
 static coding_stage_t s_rendered_stage;
 static lv_obj_t *s_screen;
@@ -549,7 +554,7 @@ static void update_meta(void)
         return;
     }
     char elapsed[16];
-    char meta[48];
+    char meta[96];
     uint32_t now = lv_tick_get();
 
     switch (s_flow.stage) {
@@ -582,10 +587,20 @@ static void update_meta(void)
         break;
     case CODING_STAGE_DONE:
         format_elapsed(elapsed, sizeof(elapsed), s_last_task_elapsed_ms);
-        snprintf(meta, sizeof(meta), "完成用时 %s", elapsed);
+        if (s_read_count > 0U) {
+            snprintf(meta, sizeof(meta), "完成用时 %s · %u 人已读", elapsed,
+                     (unsigned)s_read_count);
+        } else {
+            snprintf(meta, sizeof(meta), "完成用时 %s", elapsed);
+        }
         break;
     case CODING_STAGE_ERROR:
-        snprintf(meta, sizeof(meta), "可重新录音后再试");
+        if (s_read_count > 0U) {
+            snprintf(meta, sizeof(meta), "失败 · %u 人已读",
+                     (unsigned)s_read_count);
+        } else {
+            snprintf(meta, sizeof(meta), "可重新录音后再试");
+        }
         break;
     default:
         meta[0] = '\0';
@@ -600,6 +615,17 @@ static void record_animate(lv_timer_t *timer)
     if (s_screen == NULL) return;
 
     s_record_frame++;
+    if ((s_flow.stage == CODING_STAGE_DONE || s_flow.stage == CODING_STAGE_ERROR) &&
+        s_screen != NULL && s_active_message_id[0] != '\0' &&
+        strcmp(s_active_message_id, s_read_ack_message_id) != 0 &&
+        codex_read_tracker_take_due(s_active_message_id, "", lv_tick_get())) {
+        if (coding_bridge_send_read_ack(s_active_message_id)) {
+            snprintf(s_read_ack_message_id, sizeof(s_read_ack_message_id), "%s",
+                     s_active_message_id);
+        } else {
+            codex_read_tracker_rearm(s_active_message_id, "", lv_tick_get());
+        }
+    }
     if (s_flow.stage == CODING_STAGE_TRANSCRIBING &&
         lv_tick_elaps(s_transcribing_started_ms) >= 18000U) {
         coding_bridge_cancel_record();
@@ -1047,6 +1073,12 @@ static void coding_render(void)
         snprintf(s_detail, sizeof(s_detail), "%s", detail);
         s_page = 0U;
     }
+    if ((s_flow.stage == CODING_STAGE_DONE || s_flow.stage == CODING_STAGE_ERROR) &&
+        s_active_message_id[0] != '\0') {
+        codex_read_tracker_visit(s_active_message_id, "", lv_tick_get());
+    } else {
+        codex_read_tracker_reset();
+    }
     s_selected = selected;
     set_actions(a0, a1, a2, a3);
     render_body_page();
@@ -1080,7 +1112,8 @@ void app_coding_bridge_connected(bool connected)
         if (s_catalog_mode != CATALOG_NONE) coding_bridge_cancel_catalog();
         s_selecting_thread = false;
         s_catalog_mode = CATALOG_NONE;
-    } else if (s_workspace != NULL && s_current_task[0] == '\0' &&
+    } else if (coding_bridge_capability_enabled("tasks") &&
+               s_workspace != NULL && s_current_task[0] == '\0' &&
                s_catalog_mode == CATALOG_NONE) {
         s_catalog_mode = CATALOG_LOADING_PROJECTS;
         s_catalog_count = 0;
@@ -1260,6 +1293,51 @@ void app_coding_result_identity(const char *thread_id, const char *turn_id)
     snprintf(s_result_turn, sizeof(s_result_turn), "%s", turn_id);
 }
 
+void app_coding_remote_status(const char *text)
+{
+    app_power_activity();
+    ensure_initialized();
+    coding_flow_set_task_status(&s_flow, text);
+    coding_render();
+}
+
+void app_coding_remote_task(const char *thread_id, const char *text,
+                            const char *message_id)
+{
+    app_power_activity();
+    ensure_initialized();
+    snprintf(s_result_thread, sizeof(s_result_thread), "%s",
+             thread_id != NULL ? thread_id : "");
+    snprintf(s_active_message_id, sizeof(s_active_message_id), "%s",
+             message_id != NULL ? message_id : "");
+    s_read_count = 0U;
+    coding_flow_set_task_status(&s_flow, text);
+    coding_render();
+}
+
+void app_coding_remote_result(const char *thread_id, const char *status,
+                              const char *text, const char *message_id)
+{
+    app_power_activity();
+    ensure_initialized();
+    snprintf(s_result_thread, sizeof(s_result_thread), "%s",
+             thread_id != NULL ? thread_id : "");
+    s_result_turn[0] = '\0';
+    snprintf(s_active_message_id, sizeof(s_active_message_id), "%s",
+             message_id != NULL ? message_id : "");
+    s_read_count = 0U;
+    if (status != NULL && strcmp(status, "failed") == 0) {
+        coding_flow_set_error(&s_flow, text);
+        ui_sfx_play(UI_SFX_FAIL);
+    } else {
+        coding_flow_set_done(&s_flow, text);
+        app_voice_mode_t mode = app_settings_voice_mode();
+        if (mode == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
+        else if (mode == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
+    }
+    coding_render();
+}
+
 void app_coding_capture_level(uint8_t level)
 {
     s_capture_level = level > 100 ? 100 : level;
@@ -1279,6 +1357,24 @@ void app_coding_display_active(bool active)
     if (s_record_timer == NULL) return;
     if (active) lv_timer_resume(s_record_timer);
     else lv_timer_pause(s_record_timer);
+}
+
+void app_coding_apply_read_state(const char *message_id, uint32_t read_count)
+{
+    if (message_id == NULL ||
+        strcmp(message_id, s_active_message_id) != 0) {
+        return;
+    }
+    s_read_count = read_count;
+    if (s_meta != NULL) update_meta();
+}
+
+void app_coding_get_task_counts(uint32_t *running, uint32_t *done,
+                                uint32_t *failed)
+{
+    if (running != NULL) *running = s_pet_state.running;
+    if (done != NULL) *done = s_pet_state.done;
+    if (failed != NULL) *failed = s_pet_state.failed;
 }
 
 // 首页宠物用的 Codex 状态查询(线程安全只读)
@@ -1320,6 +1416,7 @@ void app_coding_enter(void)
         ESP_LOGE(kTag, "full Codex workspace unavailable");
         return;
     }
+    s_full_ui_active = true;
 
     // 进入 Codex 时更新首页状态
     radio_home_set_codex_status(s_flow.connected ? "工作中" : "离线");
@@ -1336,7 +1433,8 @@ void app_coding_enter(void)
         s_catalog_mode = CATALOG_NONE;
         s_selecting_thread = true;
         coding_bridge_request_review();
-    } else if (s_flow.connected && !task_in_progress && !s_local_unread) {
+    } else if (s_flow.connected && coding_bridge_capability_enabled("tasks") &&
+               !task_in_progress && !s_local_unread) {
         /* Opening Coding Companion always lands on a fresh project catalog.
          * No navigation key is required to reveal the first project. */
         s_catalog_mode = CATALOG_LOADING_PROJECTS;
@@ -1355,6 +1453,9 @@ void app_coding_enter(void)
     s_task_started_ms = 0U;
     s_last_task_elapsed_ms = 0U;
     s_has_remote_task_elapsed = false;
+    s_read_count = 0U;
+    s_read_ack_message_id[0] = '\0';
+    codex_read_tracker_reset();
     s_screen = ui_pixel_bare_screen_create();
     pet_create(s_screen);
 
@@ -1416,6 +1517,8 @@ void app_coding_enter(void)
 
 void app_coding_exit(void)
 {
+    s_full_ui_active = false;
+    codex_read_tracker_reset();
     release_project_cache();
     coding_bridge_cancel_catalog();
     s_catalog_mode = CATALOG_NONE;
@@ -1461,6 +1564,7 @@ void app_coding_exit(void)
 
 static void open_projects(void)
 {
+    if (!coding_bridge_capability_enabled("tasks")) return;
     s_cancel_confirm = false;
     release_project_cache();
     s_catalog_return_page = s_page;
@@ -1681,3 +1785,5 @@ void app_coding_key(bsp_btn_t button, bsp_btn_ev_t event)
 }
 
 bool app_coding_full_ready(void) { return s_screen != NULL; }
+
+bool app_coding_full_ui_active(void) { return s_full_ui_active; }

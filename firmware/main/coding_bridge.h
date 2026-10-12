@@ -13,6 +13,13 @@ extern "C" {
 #include "esp_err.h"
 
 esp_err_t coding_bridge_init(void);
+esp_err_t coding_bridge_init_usb_only(void);
+esp_err_t coding_bridge_start_wireless(void);
+void coding_bridge_stop_wireless(void);
+void coding_bridge_set_foreground_ui(bool active);
+bool coding_bridge_foreground_ui_active(void);
+bool coding_bridge_send_read_ack(const char *message_id);
+bool coding_bridge_capability_enabled(const char *capability);
 void coding_bridge_send_record_start(void);
 void coding_bridge_send_record_stop(void);
 void coding_bridge_cancel_record(void);

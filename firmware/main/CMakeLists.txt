@@ -11,6 +11,8 @@ idf_component_register(
          # ---- Codex 监控页(移植自 FoloOS「口袋百宝箱」,已按要求裁剪)----
          "app_coding.c"
          "coding_bridge.c"
+         "codex_bridge_protocol.c"
+         "codex_read_tracker.c"
          "coding_flow.c" "serial_dispatch.c"
          "wireless_bridge.c"
          "ui_pixel.c" "ui_pixel_math.c" "ui_sfx.c"

@@ -42,6 +42,9 @@ struct RadioCatalogPause {
 RadioCatalogPause radio_player_pause_for_catalog(void);
 void radio_player_resume_after_catalog(RadioCatalogPause pause);
 void radio_player_set_network(bool connected);
+// 播放状态变化时切换 WiFi 省电级别。实现位于 main.cc，属于播放器的宿主
+// 钩子；radio_player.cc 只依赖这个声明。
+void radio_wifi_set_streaming(bool streaming);
 void radio_player_toggle();
 void radio_player_set_playing(bool playing);
 bool radio_player_is_playing();

@@ -106,6 +106,12 @@ static lv_obj_t *s_menu_side[2];    // 左右预览小图标
 
 // Codex 状态(首页宠物)
 static volatile codex_state_t s_codex_state = CODEX_STATE_IDLE;
+static volatile uint32_t s_home_codex_running;
+static volatile uint32_t s_home_codex_done;
+static volatile uint32_t s_home_codex_failed;
+// 首页/菜单的最小化收音机播放意图。完整 Codex/小智会临时停播，但退出后
+// 只恢复用户在最小化层真正想要的播放状态，不能把用户手动暂停覆盖掉。
+static bool s_minimized_radio_should_play = true;
 
 // 色板(与 ui_pixel.h 一致)
 #define C_BG      0x000F05
@@ -313,8 +319,9 @@ static void home_eq_tick(lv_timer_t *timer) {
 // wide; short Chinese labels keep it comfortably within one line.
 static void refresh_home_codex(void) {
     if (!s_home_codex) return;
-    uint32_t running = 0, done = 0, failed = 0;
-    app_coding_get_task_counts(&running, &done, &failed);
+    const uint32_t running = s_home_codex_running;
+    const uint32_t done = s_home_codex_done;
+    const uint32_t failed = s_home_codex_failed;
     char text[64];
     if (running == 0 && done == 0 && failed == 0) {
         text[0] = '\0';
@@ -337,15 +344,8 @@ static void refresh_home_codex(void) {
 static void home_tick(lv_timer_t *timer) {
     (void)timer;
     if (!s_home_scr) return;
-    // Codex 状态轮询 → 首页宠物四态(在 LVGL 任务内, 安全)
-    {
-        const app_codex_state_t st = app_coding_get_pet_state();
-        const codex_state_t mapped = (codex_state_t)st;
-        if (mapped != (codex_state_t)s_codex_state) {
-            s_codex_state = mapped;
-            pet_apply_codex_state(mapped);
-        }
-    }
+    // 首页宠物只由最小化 Codex 的后台状态驱动；完整 Codex 页面即使退出后
+    // 仍保留过状态，也不能反向覆盖首页/菜单的最小化状态。
     // 时钟
     const time_t now = ::time(nullptr);
     if (now > 1700000000) {
@@ -452,7 +452,7 @@ static void home_build(void) {
     lv_obj_add_event_cb(s_home_np_card, home_eq_draw, LV_EVENT_DRAW_MAIN, nullptr);
 
     // 底部提示: 说明首页按键(长按OK = 退出收音机/暂停播放)
-    lv_obj_t *h = label(s_home_scr, "OK 菜单   长按OK 停止播放", 10, 0x3F8F68);
+    lv_obj_t *h = label(s_home_scr, "OK 暂停/继续   长按OK 菜单", 10, 0x3F8F68);
     lv_obj_set_pos(h, 0, 296);
     lv_obj_set_width(h, 240);
     lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
@@ -612,6 +612,10 @@ static void go_home(void) {
     destroy_menu();
     ensure_home();
     bsp_lvgl_unlock();
+    // app.exit() runs while s_level is still APP_LEVEL_APP, so the minimize
+    // helper intentionally ignores it there. Restore only after the framework
+    // has actually returned to the home layer.
+    if (s_level == APP_LEVEL_HOME) app_framework_minimize_services(true);
     xz_heap_report("go_home_out");
 }
 
@@ -626,6 +630,7 @@ static void go_menu(void) {
     destroy_home();
     ensure_menu();
     bsp_lvgl_unlock();
+    if (s_level == APP_LEVEL_MENU) app_framework_minimize_services(true);
     xz_heap_report("go_menu_out");
 }
 
@@ -639,6 +644,9 @@ static void enter_app(app_id_t id) {
     ESP_LOGI(kTag, "enter_app id=%d name=%s", (int)id, APPS[id].name);
     xz_heap_report("enter_app_in");
     const app_entry_t &app = APPS[id];
+    // 记住进入完整应用前的最小化收音机状态。Codex/小智会暂时停播并释放
+    // 解码池，返回首页/菜单时再按用户原本的播放意图恢复。
+    s_minimized_radio_should_play = radio_player_is_playing();
     if (app.audio_pause) app.audio_pause();
     if (!bsp_lvgl_lock(1500)) return;
     lv_screen_load(s_transition_scr);
@@ -691,10 +699,16 @@ void app_framework_dispatch(bsp_btn_t btn, bsp_btn_ev_t ev) {
     // 配网等待页长按OK 强制跳过(由 wifi 模块在自己 task 处理, 这里不管)
 
     if (s_level == APP_LEVEL_HOME) {
-        // 首页 OK -> 进菜单; 长按 OK -> 停止播放(退出收音机)。
-        // 用户反馈: 回到首页后没有"退出/暂停收音机"的入口 —— 音乐一直在放。
-        // 此处给首页加上"长按OK = 停止播放"的显式出口。
-        if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK) { go_menu(); }
+        // 首页最小化收音机: 点击 OK 暂停/恢复当前频道, 长按 OK 进菜单。
+        if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) { go_menu(); }
+        else if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK) {
+            radio_player_toggle();
+            s_minimized_radio_should_play = radio_player_is_playing();
+            if (bsp_lvgl_lock(200)) {
+                if (s_home_np_name) lv_label_set_text(s_home_np_name, "正在切换");
+                bsp_lvgl_unlock();
+            }
+        }
         else if (ev == BSP_BTN_LONG && btn == BSP_BTN_DOWN) {
             // 首页长按"下键" = 快捷进入 Codex(编程伴侣), 不看任务状态, 行为可预期。
             // 注意: 本机堆很紧(回到首页后空闲约 25KB), 首页树和 Codex 页不能同时驻留,
@@ -710,23 +724,6 @@ void app_framework_dispatch(bsp_btn_t btn, bsp_btn_ev_t ev) {
             s_menu_sel = APP_ID_CODEX;
             enter_app(APP_ID_CODEX);
             xz_heap_report("home_codex_shortcut_out");
-        }
-        else if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
-            if (radio_player_is_playing()) {
-                radio_player_set_playing(false);   // 停止播放(不切页)
-                ESP_LOGI(kTag, "home: stop playback (user long-press OK)");
-                if (bsp_lvgl_lock(200)) {
-                    if (s_home_np_name) lv_label_set_text(s_home_np_name, "已停止");
-                    bsp_lvgl_unlock();
-                }
-            } else {
-                radio_player_set_playing(true);    // 再长按 -> 恢复播放
-                ESP_LOGI(kTag, "home: resume playback (user long-press OK)");
-                if (bsp_lvgl_lock(200)) {
-                    if (s_home_np_name) lv_label_set_text(s_home_np_name, "播放中");
-                    bsp_lvgl_unlock();
-                }
-            }
         }
         return;
     }
@@ -758,6 +755,19 @@ void app_home_set_codex_state(codex_state_t state) {
     }
 }
 
+void app_home_set_codex_counts(uint32_t running, uint32_t done,
+                               uint32_t failed) {
+    s_home_codex_running = running;
+    s_home_codex_done = done;
+    s_home_codex_failed = failed;
+    if (s_level == APP_LEVEL_HOME && s_home_codex) {
+        if (bsp_lvgl_lock(200)) {
+            refresh_home_codex();
+            bsp_lvgl_unlock();
+        }
+    }
+}
+
 app_level_t app_framework_level(void) { return s_level; }
 app_id_t    app_framework_active(void) { return s_active; }
 
@@ -783,6 +793,17 @@ void radio_app_pause(void)  {
     }
 }
 void radio_app_resume(void) { /* 不自动恢复播放; 用户回收音机应用自行按OK */ }
+
+void app_framework_minimize_services(bool restore_radio) {
+    if (restore_radio && s_minimized_radio_should_play &&
+        (s_level == APP_LEVEL_HOME || s_level == APP_LEVEL_MENU)) {
+        radio_player_set_playing(true);
+    }
+}
+
+void app_framework_note_minimized_radio_playing(bool playing) {
+    s_minimized_radio_should_play = playing;
+}
 
 // 系统级"回首页"入口(配网退出、异常恢复等): 退出当前应用并载入首页
 void app_framework_go_home(void) { go_home(); }

@@ -83,8 +83,9 @@ void radio_request_pool_prewarm()
 // ---- 收音机 ----
 bool radio_app_enter(void) {
     s_settings_open = false;
-    // 收音机解码池与无线桥无法同时常驻；前台收音机独占内存，退出时恢复桥。
+    // 完整收音机进入时彻底退出最小化 Codex：无线桥不再处理任何消息。
     coding_bridge_stop_wireless();
+    // 完整收音机前台独占音频与内存，最小化 Codex 通知让位。
 
     // ⚠⚠ 内存顺序(2026-10-12 修复"进收音机就卡死发烫"):
     //   抢占解码器池必须**先于**建 UI: 解码器首帧要一块 ~20KB 连续内存,
@@ -108,6 +109,7 @@ bool radio_app_enter(void) {
     //   先 set_playing 让播放任务立刻在还完整的堆上把连接建起来, UI 随后建,
     //   各取所需, 互不抢。
     radio_player_set_playing(true);
+    app_framework_note_minimized_radio_playing(true);
     // radio_ui_show_* 内部自己拿 LVGL 锁; 外层再拿会双重锁死(进应用卡住的根因)
     radio_ui_show_leo_main();
     app_radio_request_catalog();
@@ -115,8 +117,8 @@ bool radio_app_enter(void) {
 }
 void radio_app_exit(void) {
     s_settings_open = false;
-    radio_player_set_playing(false);
-    radio_player_wait_idle(3000);
+    // 完整收音机退出后保留当前频道和播放/暂停状态，交回首页的最小化收音机。
+    app_framework_note_minimized_radio_playing(radio_player_is_playing());
     radio_ui_leave_leo_page();
     // ⚠ 这里**故意不** release_pool()。解码器池是开机在堆最空的时刻抢到的
     //   (heap largest ~90KB), 一旦放掉, 碎片堆里再也拼不出它需要的
@@ -125,6 +127,7 @@ void radio_app_exit(void) {
     //   真正需要大块内存的是小智(opus 编码器 25KB)和 Codex(无线桥),
     //   它们各自在 enter 里显式 release; 设置这类应用不需要。
     coding_bridge_start_wireless();
+    coding_bridge_set_foreground_ui(false);
 }
 void radio_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
     if (s_settings_open) {
@@ -139,18 +142,20 @@ void radio_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
 
 // ---- Codex ----
 bool codex_app_enter(void) {
-    // Pause shared audio while retaining the prewarmed radio decoder.
+    // 进入完整 Codex: 最小化收音机退出, 释放解码器池给桥接与页面。
     radio_player_set_playing(false);
     radio_player_wait_idle(1500);
     radio_player_release_pool();
     esp_err_t bridge_result = coding_bridge_start_wireless();
     app_coding_enter();   // app_coding 内部自管理锁
+    coding_bridge_set_foreground_ui(app_coding_full_ready());
     if (bridge_result != ESP_OK) app_coding_bridge_error("桥接启动失败，请退出后重试");
     return app_coding_full_ready();
 }
 void codex_app_exit(void) {
     app_coding_exit();
-    // 进 Codex 时为无线桥让出过解码器池, 退出后异步抢回来。
+    coding_bridge_set_foreground_ui(false);
+    // 退出完整 Codex 回到最小化 Codex: 桥接继续接收通知, 不启动完整页面。
     radio_request_pool_prewarm();
 }
 void codex_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
@@ -386,7 +391,7 @@ bool xiaozhi_app_enter(void) {
     } else {
         radio_player_release_pool();
     }
-    // 小智前台运行期间独占内存，退出后由 xiaozhi_app_exit 恢复无线桥。
+    // 小智前台运行期间独占内存，Codex 桥与最小化服务全部退出。
     coding_bridge_stop_wireless();
 
     // ⚠ opus 预热**不在这里做**: 它要抢 25KB 连续块, 会使后面的 OTA TLS 握手
@@ -549,8 +554,9 @@ void xiaozhi_app_exit(void) {
     // 退出小智 = 归还之前为 opus 编码器让出的内存。此时异步把收音机
     // 解码器池抢回来(不阻塞当前任务), 否则下次进收音机必然开不出解码器。
     radio_request_pool_prewarm();
-    // 回收音机内存池(进小智时释放过), 让收音机再次可播。
+    // 退出小智 = 回到首页/菜单的最小化层: 恢复桥接与最小化收音机。
     coding_bridge_start_wireless();
+    coding_bridge_set_foreground_ui(false);
 }
 
 void xiaozhi_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {

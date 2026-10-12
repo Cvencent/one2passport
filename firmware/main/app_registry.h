@@ -53,6 +53,13 @@ void app_framework_dispatch(bsp_btn_t btn, bsp_btn_ev_t ev);
 // 详见 app_apps.cc 里 radio_request_pool_prewarm 的注释。
 void radio_request_pool_prewarm();
 
+// 首页/菜单的最小化服务恢复入口。restore_radio=true 时，只有当前处于
+// 首页/菜单才恢复当前频道播放；完整应用前台时不会抢占音频。
+void app_framework_minimize_services(bool restore_radio);
+
+// 完整收音机页改变播放状态时同步最小化收音机的恢复意图。
+void app_framework_note_minimized_radio_playing(bool playing);
+
 // 系统级回首页(配网退出/异常恢复): 退出当前应用并载入首页桌面
 void app_framework_go_home(void);
 void app_framework_go_menu(void);
@@ -81,6 +88,8 @@ typedef enum {
     CODEX_STATE_ATTENTION,
 } codex_state_t;
 void app_home_set_codex_state(codex_state_t state);
+void app_home_set_codex_counts(uint32_t running, uint32_t done,
+                               uint32_t failed);
 
 #ifdef __cplusplus
 }

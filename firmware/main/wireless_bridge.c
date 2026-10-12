@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "codex_bridge_protocol.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -45,11 +46,13 @@
 static const char *TAG = "wireless_bridge";
 static const char *NVS_NAMESPACE = "folo_bridge";
 static const char *NVS_TOKEN_KEY = "token";
-static const char *DISCOVERY_REQUEST = "FOLOOS_DISCOVER_V1";
+static const char *DISCOVERY_REQUEST = "CODEXBRIDGE_DISCOVER";
 
 static wireless_bridge_line_cb_t s_line_cb;
 static wireless_bridge_status_cb_t s_status_cb;
 static wireless_bridge_wifi_configure_t s_wifi_configure_cb;
+static wireless_bridge_authenticate_t s_authenticate_cb;
+static char s_device_id[24];
 static SemaphoreHandle_t s_client_lock;
 static int s_client_fd = -1;
 static bool s_client_authenticated;
@@ -129,11 +132,7 @@ static bool authenticate_line(const char *line)
     bool matches = is_auth && s_token[0] != '\0' &&
                    strcmp(token->valuestring, s_token) == 0;
     /* TOFU(首次信任配对):设备本地没有 token 时,接受电脑端带来的第一个
-     * 合法 token 并落盘。这是因为本工程的配网页由 esp-wifi-connect 提供,
-     * 无法像 FoloOS 原版那样在配网表单里附带 token 字段,故改为
-     * 「首次连接即配对」。配对之后 token 固定,后续连接必须严格匹配。
-     * 前提:仅在设备已联上 Wi-Fi(即已通过配网)时才可能收到 bridge_auth,
-     * 局域网外的扫描者无法触达。 */
+     * 合法 token 并落盘。配对之后 token 固定,后续连接必须严格匹配。 */
     bool pair_first_time = is_auth && s_token[0] == '\0';
     if (pair_first_time) {
         strlcpy(s_token, token->valuestring, sizeof(s_token));
@@ -146,12 +145,21 @@ static bool authenticate_line(const char *line)
                  saved == ESP_OK ? "ok" : esp_err_to_name(saved));
     }
 
+    /* Mark the session before invoking the protocol callback: the callback
+     * writes bridge_auth_ok through the normal authenticated transport. */
     if (xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
         s_client_authenticated = true;
         xSemaphoreGive(s_client_lock);
     }
-    static const char reply[] = "{\"type\":\"bridge_auth_ok\"}\n";
-    wireless_bridge_write(reply, sizeof(reply) - 1);
+    bool accepted = s_authenticate_cb != NULL &&
+                    s_authenticate_cb(line, s_device_id);
+    if (!accepted) {
+        if (xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+            s_client_authenticated = false;
+            xSemaphoreGive(s_client_lock);
+        }
+        return false;
+    }
     ESP_LOGI(TAG, "bridge client authenticated");
     return true;
 }
@@ -278,10 +286,33 @@ static void network_task(void *argument)
                      * discover_wireless_device() 判定值逐字一致,
                      * 否则电脑端收不到应答、报"局域网内没有发现已配网的
                      * AI Passport"。此处刻意沿用 FoloOS 原版字符串。 */
-                    static const char reply[] =
-                        "{\"device\":\"FoloOS-AI-Passport\",\"port\":8765}";
-                    sendto(udp_fd, reply, sizeof(reply) - 1, 0,
-                           (struct sockaddr *)&source, source_length);
+                    cJSON *reply = cJSON_CreateObject();
+                    if (reply != NULL) {
+                        cJSON_AddStringToObject(reply, "device", "FoloOS-AI-Passport");
+                        cJSON_AddStringToObject(reply, "device_id", s_device_id);
+                        cJSON_AddStringToObject(reply, "name", "AI Passport");
+                        cJSON_AddNumberToObject(reply, "port", BRIDGE_PORT);
+                        cJSON *capabilities = cJSON_CreateArray();
+                        if (capabilities != NULL) {
+                            size_t capability_count = 0;
+                            const char *const *supported =
+                                codex_bridge_protocol_capabilities(&capability_count);
+                            for (size_t index = 0; index < capability_count; ++index) {
+                                cJSON_AddItemToArray(
+                                    capabilities,
+                                    cJSON_CreateString(supported[index])
+                                );
+                            }
+                            cJSON_AddItemToObject(reply, "capabilities", capabilities);
+                        }
+                        char *payload = cJSON_PrintUnformatted(reply);
+                        if (payload != NULL) {
+                            sendto(udp_fd, payload, strlen(payload), 0,
+                                   (struct sockaddr *)&source, source_length);
+                            cJSON_free(payload);
+                        }
+                        cJSON_Delete(reply);
+                    }
                 }
             }
         }
@@ -325,6 +356,13 @@ void wireless_bridge_set_wifi_configure(wireless_bridge_wifi_configure_t configu
     s_wifi_configure_cb = configure;
 }
 
+void wireless_bridge_set_authenticate(
+    wireless_bridge_authenticate_t authenticate, const char *device_id)
+{
+    s_authenticate_cb = authenticate;
+    strlcpy(s_device_id, device_id != NULL ? device_id : "", sizeof(s_device_id));
+}
+
 void wireless_bridge_set_wifi_state(bool connected, const char *ip)
 {
     s_wifi_connected = connected;
@@ -339,6 +377,11 @@ void wireless_bridge_set_wifi_state(bool connected, const char *ip)
 bool wireless_bridge_is_connected(void)
 {
     return s_wifi_connected;
+}
+
+void wireless_bridge_disconnect(void)
+{
+    client_replace(-1);
 }
 
 void wireless_bridge_get_ip(char *buffer, size_t size)

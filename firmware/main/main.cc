@@ -870,8 +870,24 @@ void wifi_event(WifiEvent event, const std::string &data) {
             manager.SetPowerSaveLevel(WifiPowerSaveLevel::BALANCED);
             start_sntp_once();
             radio_player_set_network(true);
+            // ⚠⚠ 连网事件**不要**在这里触发目录搜索(2026-10-12 修复"收音机一直
+            //   卡在正在切换电台/不出声")。
+            //
+            //   起因: WiFi 每次重连都会走到这个分支, 搜索于是被反复触发。搜索本身
+            //   先 pause 播放(radio_player_pause_for_catalog), 再要 8KB 响应缓冲
+            //   和一个 6144 栈的 catalog 任务 —— 而这台 C3 此时 largest 只有 ~4.8KB。
+            //   结果 socket 分不到内部 RAM:
+            //     transport_base: Failed to open a new connection: 32774 (NO_MEM)
+            //   搜索又常常对 CN 城市查不到结果(返回 0 个台), 最后:
+            //     radio_player: playback task could not restart after catalog
+            //   播放任务再也起不来, 界面就一直停在"正在连接电台/正在切换电台"。
+            //
+            //   目录只在真正需要时加载: 进入收音机且没有缓存目录时, 或用户手动选城市。
             if (app_framework_level() == APP_LEVEL_APP &&
-                app_framework_active() == APP_ID_RADIO) start_remembered_catalog_search();
+                app_framework_active() == APP_ID_RADIO &&
+                !radio_player_has_cached_catalog()) {
+                start_remembered_catalog_search();
+            }
             break;
         }
         case WifiEvent::Disconnected:

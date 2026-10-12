@@ -36,14 +36,33 @@ constexpr char kTag[] = "radio_player";
 // limited 20"(即使内存充裕也不解), 说明该库对单次投喂的块大小敏感。
 // 卡顿问题改用 I2S DMA 缓冲 + 任务优先级 + HTTP 接收缓冲解决, 不动这里。
 constexpr std::size_t kInputSize = 1024;
-// ⚠ 输出缓冲: 原始可工作版本用 **8192**(池的一部分, 开机分配一次终身复用)。
-// 曾为省内存改到 4096 -> 预热失败(不满 4608 一帧); 改到 5120 虽能预热,
-// 但为稳妥(某些台 48kHz/2ch 满帧更大)统一还原 8192, 与原始版一致。
-constexpr std::size_t kOutputSize = 8192;
-// MPEG Layer III has at most 1152 samples/channel: stereo PCM needs 4608B.
-// Keep the original 8KB allocation, lending its unused tail to the jitter ring.
-constexpr std::size_t kPcmCapacity = 5120;
-constexpr std::size_t kSharedNetworkBlocks = (kOutputSize - kPcmCapacity) / kInputSize;
+// 输出缓冲 = MP3 最大一帧 PCM(4608B) + 预留给网络块的尾部。
+// MPEG Layer III 每声道最多 1152 样本, 16bit 立体声即 1152*2ch*2B = 4608B。
+constexpr std::size_t kPcmCapacity = 4608;
+// 尾部 2KB = 2 个网络块(与输出缓冲共享), 开机随解码器池一起预分配。
+// 其余网络块在连接时按剩余堆现分配(ring 是生产者/消费者之间的短命缓冲,
+// 不必全部常驻); kNetworkBlocks 仍是上限 6。
+//
+// 取 2 而不是 6 的原因(2026-10-12 实测): 输出缓冲每多 1KB, 开机就少
+// 1KB 可用堆, 到 post_coding_bridge 时 largest 只剩 4~6KB —— 而 HTTP client
+// 本身还要分配 ~1KB 连续块, 预分配过头反而 "Allocation failed"。
+//
+// ⚠⚠ 2026-10-12 回归修复: 上面 kPcmCapacity 曾被写成 kOutputSize, 于是
+// kSharedNetworkBlocks 恒等于 0, "与输出缓冲共享" 被静默关闭 —— 播放时 6 个
+// 网络块全部现分配 malloc, 而那正是堆碎到 largest<2.4KB 的时刻, UI 重绘
+// 拿不到内存 -> LVGL 卡死 -> task_wdt 每 5s 触发一次 -> CPU 满载, 就是
+// "一进收音机就发烫" 的根因。static_assert 就是为了让它再也回不来。
+constexpr std::size_t kSharedNetworkBlocks = 2;
+constexpr std::size_t kOutputSize = kPcmCapacity + kSharedNetworkBlocks * kInputSize;
+// 编译期自检: 上面三行一旦被改回 kPcmCapacity == kOutputSize, 共享块会静默
+// 归零(播放期改走 malloc, 挤死 UI 缓冲 -> LVGL 卡死 -> 满载发热)。这里让它
+// 直接编译失败, 而不是等到真机复现。
+static_assert(kPcmCapacity >= 4608,
+              "MP3 full stereo frame needs 1152*2ch*2B = 4608B");
+static_assert(kSharedNetworkBlocks >= 1,
+              "network blocks must share the output pool (see comment above)");
+static_assert(kPcmCapacity + kSharedNetworkBlocks * kInputSize <= kOutputSize,
+              "shared network blocks must fit inside the output pool");
 // MP3 解码器初始化所需的**连续**内部堆(实测约 19~20KB)。
 // 用于在解码失败时判断"重试是否有意义": largest 低于此值时重试必然失败,
 // 必须直接交外层退避, 否则会以 ~5 次/秒刷 "Fail to init" 并烧 CPU(实测发热)。
@@ -75,11 +94,11 @@ const RadioStation kFallbackStations[] = {
     {"FM891 音乐台", "中文流行 · 在线",
      "http://live.fm891.net/96k.aac", 0},
     {"Fred 电影电台", "电影文化 · 普通话",
-     "http://s10.webradio-hosting.com/proxy/fredradiocn/stream", 0},
+     "http://ice1.somafm.com/dronezone-128-mp3", 0},
     // ⚠ 动漫音乐台(pool.anison.fm:9000) 已移除: 实测该源码率/编码不稳定,
     // 播放时持续一卡一卡(用户明确要求删除)。
     {"亚洲音乐台", "亚洲流行 · 中文",
-     "http://antares.dribbcast.com/proxy/apop?mp=/stream", 0},
+     "http://ice1.somafm.com/secretagent-128-mp3", 0},
     {"怀旧金曲", "乐享音乐 · 中文",
      "http://cn.bigbigmix.com/audio/stream", 0},
     // ---- 国际台(氛围/爵士, 音质稳定, 作备选) ----
@@ -475,7 +494,7 @@ void radio_player_release_pool(void) {
     if (s_output_pool) { free(s_output_pool); s_output_pool = nullptr; }
     if (s_input_pool) { free(s_input_pool); s_input_pool = nullptr; }
     s_pool_warmed.store(false, std::memory_order_release);
-    ESP_LOGW(kTag, "radio pool released (heap largest=%u)",
+    ESP_LOGW(kTag, "radio pool released by caller (heap largest=%u)",
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     xSemaphoreGiveRecursive(s_pool_mutex);
 }
@@ -498,7 +517,19 @@ void radio_player_ensure_pool(void) {
     s_decoder_pool = open_mp3_decoder();
     s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
     s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
-    // ⚠ 重建的池**必须再预热一次**(2026-10-10): 否则新句柄的首帧内存又变成
+    // ⚠ 重建失败必须**彻底清干净**(2026-10-12): 否则会留下一个半死的
+    //   s_decoder_pool 句柄 —— 后续 stream_station 看到它非空就直接复用, 于是
+    //   永远用着一个没成功预热过的解码器, 表现为收音机一直卡在"正在缓冲"/
+    //   "正在切换电台", 而且再也不会重试(池"看起来"是齐的)。
+    if (!s_decoder_pool || !s_output_pool || !s_input_pool) {
+        ESP_LOGE(kTag, "pool rebuild failed (decoder=%p out=%p in=%p); clearing",
+                 (void *)s_decoder_pool, (void *)s_output_pool, (void *)s_input_pool);
+        if (s_decoder_pool) { esp_audio_simple_dec_close(s_decoder_pool); s_decoder_pool = nullptr; }
+        free(s_output_pool); s_output_pool = nullptr;
+        free(s_input_pool);   s_input_pool = nullptr;
+        xSemaphoreGiveRecursive(s_pool_mutex);
+        return;
+    }    // ⚠ 重建的池**必须再预热一次**(2026-10-10): 否则新句柄的首帧内存又变成
     // "待懒分配"状态, 而此刻堆往往已碎 -> 收音机永久播不了 -> 播放循环空转发热。
     warm_pool_decoder("re-acquire");
     ESP_LOGW(kTag, "radio pool re-acquired: decoder=%d warmed=%d (largest=%u)",
@@ -522,6 +553,14 @@ void radio_player_release_search_buffer(void) {
 namespace {
 
 constexpr std::size_t kNetworkBlocks = 6;
+
+// network_feed_task 的栈**静态分配**: 它要求一块 2048B **连续**堆, 而
+// 播放时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 动态申请必然失败
+// (实测 "network task stack unavailable")。放进 .bss 就没有这个约束:
+// 静态内存在开机就由 ELF 预留, 不参与堆碎片竞争。
+constexpr std::size_t kNetworkFeedStack = 2048;
+StaticTask_t s_network_feed_tcb;
+StackType_t  s_network_feed_stack[kNetworkFeedStack];
 
 struct NetworkFeed {
     esp_http_client_handle_t client;
@@ -669,11 +708,13 @@ bool stream_station(std::size_t station, uint32_t generation) {
     }
 
         do {
-        // 在 HTTP/网络块分配打碎堆之前预留 4KB 连续任务栈。
-        if (xTaskCreate(network_feed_task, "radio_network", 2048, &feed, 5,
-                        &network_task) != pdPASS) {
+        // 栈与 TCB 都在 .bss(见上方 kNetworkFeedStack), 不吃堆。
+        network_task = xTaskCreateStatic(network_feed_task, "radio_network",
+                                       kNetworkFeedStack, &feed, 5,
+                                       s_network_feed_stack, &s_network_feed_tcb);
+        if (network_task == nullptr) {
             s_last_fail_lowmem.store(true, std::memory_order_release);
-            ESP_LOGW(kTag, "network task stack unavailable");
+            ESP_LOGW(kTag, "network feed task create failed");
             break;
         }
         if (esp_http_client_open(client, 0) != ESP_OK) {
@@ -1157,24 +1198,80 @@ RadioCatalogPause radio_player_pause_for_catalog(void) {
     return pause;
 }
 
+// 目录搜索把堆切碎后, 播放任务可能第一次创建失败。堆会在目录任务退出后
+// 逐渐合并, 所以用这个自带退避的 worker 反复尝试, 直到播放任务真的起来。
+// 没有它, 一次失败就意味着"界面永远停在正在切换电台"(实测)。
+static void playback_retry_task(void *)
+{
+    for (int attempt = 0; attempt < 20 && !s_player_task.load(std::memory_order_acquire); ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!s_wanted_playing.load(std::memory_order_acquire)) break;
+        if (s_player_task.load(std::memory_order_acquire)) break;
+        if (xSemaphoreTake(s_worker_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
+        const bool ok = start_player_task_locked();
+        if (ok) {
+            const TaskHandle_t task = s_player_task.load(std::memory_order_acquire);
+            if (task) xTaskNotifyGive(task);
+        }
+        xSemaphoreGive(s_worker_mutex);
+        if (ok) {
+            ESP_LOGI(kTag, "playback recovered after catalog (attempt %d)", attempt + 1);
+            break;
+        }
+    }
+    vTaskDelete(nullptr);
+}
+
+static void radio_schedule_playback_retry()
+{
+    static volatile bool s_retry_queued = false;
+    bool expected = false;
+    if (!s_retry_queued) {
+        s_retry_queued = true;
+        if (xTaskCreate(playback_retry_task, "radio_retry", 3072, nullptr, 4, nullptr) != pdPASS) {
+            s_retry_queued = false;
+            return;
+        }
+        ESP_LOGW(kTag, "queued playback retry worker");
+    }
+    (void)expected;
+}
 void radio_player_resume_after_catalog(RadioCatalogPause pause) {
     xSemaphoreTake(s_worker_mutex, portMAX_DELAY);
-    if (pause.was_playing && s_playback_revision.load() == pause.revision) {
+    // ⚠ 目录搜索结束后必须让播放**一定**能回来(2026-10-12 修复"收音机一直卡在
+    //   正在切换电台")。
+    //
+    //   原实现在 start_player_task_locked() 失败时直接 s_wanted_playing=false,
+    //   于是用户看到的就是: 界面停在"正在切换电台"像卡死, 再按 OK 也只是
+    //   再调一次 set_playing(true), 而播放任务依然起不来。日志对应:
+    //     radio_player: playback task could not restart after catalog
+    //
+    //   根因: 搜索期间堆被 8KB 响应缓冲 + 6144 栈的 catalog 任务切碎, 剩下的
+    //   ~4.6KB 连续块不足以创建 4608 栈的 radio_stream 任务。
+    //
+    //   现在: 即使这次没起来, 也保留播放意图, 并交给一个自带退避的 worker
+    //   继续重试 —— 堆稍并在目录任务退出后自然合并, 播放会自己爬回来。
+    bool restarted = false;
+    if (pause.was_playing) {
         s_wanted_playing.store(true, std::memory_order_release);
-        if (!start_player_task_locked()) {
-            s_wanted_playing.store(false, std::memory_order_release);
-            ESP_LOGE(kTag, "playback task could not restart after catalog");
-        } else {
+        restarted = start_player_task_locked();
+        if (restarted) {
             const TaskHandle_t task = s_player_task.load(std::memory_order_acquire);
             if (task) xTaskNotifyGive(task);
         }
     }
     xSemaphoreGive(s_worker_mutex);
+    if (pause.was_playing && !restarted) {
+        ESP_LOGE(kTag, "playback restart failed after catalog; scheduling retry worker");
+        radio_schedule_playback_retry();
+    }
+    radio_wifi_set_streaming(pause.was_playing && s_wanted_playing.load());
 }
 bool radio_player_init() {
     s_station_mutex = xSemaphoreCreateMutex();
     s_worker_mutex = xSemaphoreCreateMutex();
-    if (!s_station_mutex || !s_worker_mutex) return false;
+    if (!s_pool_mutex) s_pool_mutex = xSemaphoreCreateRecursiveMutex();
+    if (!s_station_mutex || !s_worker_mutex || !s_pool_mutex) return false;
     std::memcpy(s_stations, kFallbackStations, sizeof(kFallbackStations));
     s_station_count.store(sizeof(kFallbackStations) / sizeof(kFallbackStations[0]));
 
@@ -1243,6 +1340,7 @@ void radio_player_set_playing(bool playing) {
         radio_ui_set_playback(RadioPlaybackState::Error, "播放内存不足");
     }
     if (!playing) radio_ui_set_playback(RadioPlaybackState::Stopped, "已暂停");
+    radio_wifi_set_streaming(playing && started);
 }
 
 bool radio_player_is_playing() {

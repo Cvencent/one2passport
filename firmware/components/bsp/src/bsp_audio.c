@@ -41,13 +41,13 @@ static esp_err_t i2s_full_duplex_init(void) {
     // DMA 缓冲决定"抗网络抖动"能力, 但**必须省着用**: C3 内部 DMA RAM 很紧,
     // 且收音机 MP3 解码器需要 ~19KB 连续块, 挤占会导致
     // "ESP_MP3_DEC: Fail to init MP3 decoder ret 10"(实测 8x512=16KB 就触发)。
-    // 6x256: 每帧 4B(stereo16bit) -> 6*256*4 = 6KB, 约 35ms @44.1kHz。
-    // 比原始 4x120(1.9KB, 仅 11ms)抗抖能力提升 3 倍, 仅多占约 4KB。
+    // 4x128: 每帧 4B(stereo16bit) -> 4*128*4 = 2KB, 约 12ms @44.1kHz。
+    // WiFi 初始化后堆最大连续块只有约 12KB, 只能使用小 DMA 池。
     i2s_chan_config_t chan = {
         .id = BSP_I2S_PORT,
         .role = I2S_ROLE_MASTER,
-        .dma_desc_num = 6,
-        .dma_frame_num = 256,
+        .dma_desc_num = 4,
+        .dma_frame_num = 128,
         .auto_clear_after_cb = true,
         .auto_clear_before_cb = false,
         .intr_priority = 0,
@@ -187,9 +187,14 @@ esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch) {
 
     // ⚠ open 之后【不要】手动覆写 ES8311 的时钟分频寄存器(REG01~06):
     //   驱动已按采样率与 MCLK 精确算好,覆写会导致 ADC/DAC 时序错乱、录音回放全是杂音。
-    //   这里只设麦克风模拟 PGA 增益。30dB 是 FoloOS 语音采集实测可用的档位:
-    //   偏低会把 16kHz 单声道录音压到几乎无声,偏高则底噪与削波明显。
-    esp_codec_dev_set_in_gain(s_dev, 30.0f);
+    //   这里只设麦克风模拟 PGA 增益。
+    //
+    // ⚠⚠ 30dB -> 40dB(2026-10-12 修复"小智一直只识别出'我'"):
+    //   实测上行音频 RMS 只有 147(正常说话应在 1000 以上), 云端 ASR 从这份
+    //   近乎静音的信号里只能挑出零星噪声, 于是无论说多久都识别成"我"。
+    //   ES8311 的模拟 PGA 上限约 40dB, 留 0dB 余量给驱动内部做防削波处理。
+    //   麦克风离喇叭较远时 30dB 明显不够(设备是桌面摆件, 人站在旁边说话)。
+    esp_codec_dev_set_in_gain(s_dev, 40.0f);
 
     s_opened = true; s_hz = hz; s_bits = bits; s_ch = ch;
     ESP_LOGI(TAG, "codec 打开 %luHz/%ubit/%uch", (unsigned long)hz, bits, ch);

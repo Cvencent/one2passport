@@ -664,6 +664,9 @@ static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data
                 cJSON *t = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(t))
                     snprintf(s_stt_text, sizeof(s_stt_text), "%.120s", t->valuestring);
+                // 把云端实际识别到的文本打进串口日志。识别质量问题的第一手证据:
+                // 之前只能靠 UI 上的一行字猜, 无法判断是音频上行有问题还是 ASR 本身。
+                ESP_LOGI(TAG, "stt: \"%s\"", s_stt_text);
                 xz_ui_event_t ev = XZ_EV_STT;
                 xQueueSend(s_event_queue, &ev, 0);
             } else if (strcmp(ty, "tts") == 0) {
@@ -673,6 +676,7 @@ static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data
                     cJSON *txt = cJSON_GetObjectItem(root, "text");
                     if (cJSON_IsString(txt))
                         snprintf(s_tts_text, sizeof(s_tts_text), "%.120s", txt->valuestring);
+                    ESP_LOGI(TAG, "tts text: \"%s\"", s_tts_text);
                     xz_ui_event_t ev = XZ_EV_TTS_START;
                     xQueueSend(s_event_queue, &ev, 0);
                 } else if (strcmp(s, "stop") == 0) {
@@ -819,7 +823,10 @@ void xiaozhi_client_close(void)
 //   因此这里取 22KB 而非 32KB, 并在录音任务里打印栈高水位实测校准。
 #define XZ_MIC_STACK_WORDS 22528
 #define OPUS_OK 0
-#define OPUS_APPLICATION_VOIP 2048
+// AUDIO(2049) 而非 VOIP(2048): 云端要把这段音频喂给 ASR 做识别, 需要保留
+// 辅音/高频细节; VOIP 会为通话质量 aggressively 砍掉这些, 导致识别率崩塌。
+#define OPUS_APPLICATION_AUDIO 2049
+#define OPUS_AUTO (-1000)      // 让编码器按内容自适应码率(官方 ESP_OPUS_BITRATE_AUTO)
 #define OPUS_SET_BITRATE_REQUEST 4002
 #define OPUS_SET_VBR_REQUEST 4006
 #define OPUS_SET_COMPLEXITY_REQUEST 4010
@@ -870,17 +877,26 @@ static bool xz_opus_encoder_init(void)
         return false;
     }
     memset(s_opus_state, 0, (size_t)s_opus_state_size);
-    int ret = opus_encoder_init(s_opus_state, 16000, 1, OPUS_APPLICATION_VOIP);
+    // ⚠⚠ 必须与官方 xiaozhi-esp32 的 AS_OPUS_ENC_CONFIG() 对齐(2026-10-12):
+    //   application = AUDIO (不是 VOIP)、bitrate = OPUS_AUTO (不是硬编码 24000)、
+    //   VBR 开、DTX 开。
+    //
+    //   之前用 VOIP + 固定 24kbps + 关闭 VBR/DTX, 结果云端 ASR 几乎听不清 ——
+    //   实测无论说多久, 识别结果几乎恒为"我"一个字。原因是 VOIP 模式是为
+    //   人声通话压缩的, 会在 aggressively 砍掉高频与辅音细节; 再叠加固定低码率
+    //   和关闭 VBR(动态码率), 单帧可用比特被压到 ASR 无法提取特征的程度。
+    //   AUDIO 模式保留更多语音细节, OPUS_AUTO 让编码器按内容自适应码率。
+    int ret = opus_encoder_init(s_opus_state, 16000, 1, OPUS_APPLICATION_AUDIO);
     if (ret != OPUS_OK) {
         ESP_LOGE(TAG, "opus static init failed: %d", ret);
         s_encoder_gave_up = true;
         return false;
     }
-    opus_encoder_ctl(s_opus_state, OPUS_SET_BITRATE_REQUEST, 24000);
-    opus_encoder_ctl(s_opus_state, OPUS_SET_VBR_REQUEST, 0);
+    opus_encoder_ctl(s_opus_state, OPUS_SET_BITRATE_REQUEST, OPUS_AUTO);
+    opus_encoder_ctl(s_opus_state, OPUS_SET_VBR_REQUEST, 1);
     opus_encoder_ctl(s_opus_state, OPUS_SET_COMPLEXITY_REQUEST, 0);
     opus_encoder_ctl(s_opus_state, OPUS_SET_INBAND_FEC_REQUEST, 0);
-    opus_encoder_ctl(s_opus_state, OPUS_SET_DTX_REQUEST, 0);
+    opus_encoder_ctl(s_opus_state, OPUS_SET_DTX_REQUEST, 1);
     s_encoder_ready = true;
     ESP_LOGI(TAG, "opus static encoder ready: state=%d bytes", s_opus_state_size);
     return true;
@@ -919,8 +935,41 @@ static void xz_capture_run(int16_t *pcm)
     s_listening = true;
     uint8_t *opus = s_mic_opus;
     uint32_t frames = 0;
+    // 软件自动增益(AGC)。
+    //
+    // 为什么需要: 设备是桌面摆件, 人站在旁边说话, 声压本来就小; ES8311 的模拟
+    // PGA 只有 ~40dB 上限, 光靠硬件增益在嘈杂/安静不同的房间里很难稳定。
+    // 实测未做 AGC 时上行 RMS 仅 147, 云端 ASR 只能从近乎静音的信号里认出"我"。
+    //
+    // 做法: 逐帧算 RMS, 把整帧统一缩放到目标 RMS(留峰值余量防削波)。
+    // 统一缩放保留波形形状, 不会破坏 ASR 关心的频谱特征。
+    // 只在偏安静时往上拉(最多 12x), 偏响时不动 —— 避免把噪声一起放大。
+    const double kTargetRms = 2600.0;
+    const double kMaxGain = 12.0;
+    double agc_gain = 1.0;
     while (s_listening && s_ws_open) {
         if (bsp_audio_read(pcm, XZ_CHUNK_SAMPLES * sizeof(int16_t)) != ESP_OK) break;
+        {
+            double acc = 0.0;
+            for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i)
+                acc += (double)pcm[i] * (double)pcm[i];
+            const double rms = __builtin_sqrt(acc / XZ_CHUNK_SAMPLES);
+            if (rms > 40.0 && rms < kTargetRms) {
+                const double want = kTargetRms / rms;
+                agc_gain = agc_gain * 0.7 + (want < kMaxGain ? want : kMaxGain) * 0.3;
+                if (agc_gain > 1.0) {
+                    // 用 double 累加再回写, 避免 16bit 乘法的溢出与截断失真。
+                    for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i) {
+                        const double v = (double)pcm[i] * agc_gain;
+                        if (v > 32767.0) pcm[i] = 32767;
+                        else if (v < -32768.0) pcm[i] = -32768;
+                        else pcm[i] = (int16_t)v;
+                    }
+                }
+            } else if (rms >= kTargetRms) {
+                agc_gain = 1.0;
+            }
+        }
         int encoded = opus_encode(s_opus_state, pcm, XZ_CHUNK_SAMPLES,
                                   opus, (int)sizeof(s_mic_opus));
         if (encoded <= 0) {
@@ -942,7 +991,18 @@ static void xz_capture_run(int16_t *pcm)
                                           encoded, pdMS_TO_TICKS(1000));
         }
         if (++frames % 16 == 0) {  // about once per second (60ms/frame)
-            ESP_LOGI(TAG, "opus up: %lu frames", (unsigned long)frames);
+            // 麦克风 RMS 探针: 确认真的在拾音。若长期为 0, 说明 I2S 读回来的
+            // 是静音, 上行给云端的就只是"房间里很安静" —— ASR 自然只能识别出
+            // "我"这种零星噪声。前馈 RMS 是判断"麦克风有没有工作"的唯一可靠信号。
+            {
+                // 用 double 累加: 960 个样本各自可到 32768, 平方后总和会远超
+                // int32 范围(实测打印出 4294967295 就是这里溢出成了 UINT_MAX)。
+                double acc = 0.0;
+                for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i)
+                    acc += (double)pcm[i] * (double)pcm[i];
+                ESP_LOGI(TAG, "opus up: %lu frames rms=%u", (unsigned long)frames,
+                         (unsigned)__builtin_sqrt(acc / XZ_CHUNK_SAMPLES));
+            }
             // 栈余量自检: SILK 编码路径实测会吃 20KB+, 余量低于 1KB 时
             // 提前告警。下次再有人调大编码器复杂度, 日志能直接指出问题,
             // 而不是等到用户"一说话就重启"才发现。

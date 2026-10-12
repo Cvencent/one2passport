@@ -98,9 +98,18 @@ bool radio_app_enter(void) {
     //   实测一次都没打��� ensure_pool 日志就是这么被饿死的。
     //   正确做法: 交给自己新建的 worker 任务去抢池, LVGL 立即返回。
     radio_request_pool_prewarm();
+    // ⚠⚠ 先启动播放, 再建 UI(2026-10-12 修复"进收音机一直转圈/不出声"):
+    //   播放要连 socket, 而 socket + esp_http_client 缓冲(2048+512)合计需要
+    //   ~5KB **连续**内存。若先建 UI, 堆被 LVGL 切碎后 largest 只剩 4608,
+    //   于是 socket 分不到内部 RAM:
+    //     wifi:mem fail
+    //     transport_base: Failed to open a new connection
+    //   表现为永远卡在"正在连接电台"/"正在切换电台"。
+    //   先 set_playing 让播放任务立刻在还完整的堆上把连接建起来, UI 随后建,
+    //   各取所需, 互不抢。
+    radio_player_set_playing(true);
     // radio_ui_show_* 内部自己拿 LVGL 锁; 外层再拿会双重锁死(进应用卡住的根因)
     radio_ui_show_leo_main();
-    radio_player_set_playing(true);
     app_radio_request_catalog();
     return true;
 }

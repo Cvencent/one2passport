@@ -34,6 +34,7 @@ extern "C" {
 #include "wifi_manager.h"   // 顶栏信号格: WifiManager::IsConnected()/GetRssi()
 
 static const char *kTag = "app_fw";
+static volatile bool s_defer_minimized_services;
 
 // ---------------------------------------------------------------------------
 // 收音机/设置接口(外部实现); Codex 由 app_coding.c 提供
@@ -615,7 +616,7 @@ static void go_home(void) {
     bsp_lvgl_unlock();
     // app.exit() runs while s_level is still APP_LEVEL_APP, so the minimize
     // helper intentionally ignores it there. Restore only after the framework
-    // has actually returned to the home layer.
+    // has actually returned to the home layer and the LVGL lock is released.
     if (s_level == APP_LEVEL_HOME) app_framework_minimize_services(true);
     xz_heap_report("go_home_out");
 }
@@ -631,6 +632,8 @@ static void go_menu(void) {
     destroy_home();
     ensure_menu();
     bsp_lvgl_unlock();
+    // The ordered restore may synchronously reclaim a 20KB decoder block,
+    // which must not hold up the LVGL/input path.
     if (s_level == APP_LEVEL_MENU) app_framework_minimize_services(true);
     xz_heap_report("go_menu_out");
 }
@@ -797,6 +800,21 @@ void radio_app_resume(void) { /* 不自动恢复播放; 用户回收音机应用
 
 void app_framework_minimize_services(bool restore_radio) {
     if (s_level != APP_LEVEL_HOME && s_level != APP_LEVEL_MENU) return;
+    if (s_defer_minimized_services) {
+        app_framework_restore_minimized_services_ordered();
+        return;
+    }
+
+    // The minimized radio decoder needs a 20KB contiguous block. Start it
+    // before the Codex bridge, which otherwise takes that block and leaves
+    // the radio stuck in "not enough contiguous heap" retries.
+    if (restore_radio && s_minimized_radio_should_play) {
+        // This path runs after the caller has released the LVGL lock. Use the
+        // synchronous ordered helper so the decoder owns its contiguous block
+        // before coding_bridge_start_wireless() allocates bridge resources.
+        radio_player_rewake_after_pool_ready();
+        radio_player_set_playing(true);
+    }
 
     /* Miniature services own the home/menu layer only. Full-screen apps stop
      * these services before taking their resources, and this is the single
@@ -805,14 +823,30 @@ void app_framework_minimize_services(bool restore_radio) {
         ESP_LOGW(kTag, "minimized Codex bridge could not start");
     }
     coding_bridge_set_foreground_ui(false);
-    if (restore_radio && s_minimized_radio_should_play &&
-        radio_player_has_pool()) {
-        radio_player_set_playing(true);
-    }
 }
 
 void app_framework_note_minimized_radio_playing(bool playing) {
     s_minimized_radio_should_play = playing;
+}
+
+void app_framework_defer_minimized_services_restore(void) {
+    s_defer_minimized_services = true;
+}
+
+void app_framework_restore_minimized_services_ordered(void) {
+    if (s_level != APP_LEVEL_HOME && s_level != APP_LEVEL_MENU) return;
+    s_defer_minimized_services = false;
+    // Rebuild the MP3 decoder first: the minimized Codex bridge allocates its
+    // own task/socket state and can reduce the largest contiguous block below
+    // the decoder's 20KB first-frame requirement.
+    if (s_minimized_radio_should_play) {
+        radio_player_rewake_after_pool_ready();
+        radio_player_set_playing(true);
+    }
+    if (coding_bridge_start_wireless() != ESP_OK) {
+        ESP_LOGW(kTag, "minimized Codex bridge could not start");
+    }
+    coding_bridge_set_foreground_ui(false);
 }
 
 // 系统级"回首页"入口(配网退出、异常恢复等): 退出当前应用并载入首页

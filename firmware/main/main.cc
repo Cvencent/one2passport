@@ -1049,12 +1049,8 @@ extern "C" void app_main(void) {
     //
     // 2026-10-12 回归修复: 这个调用曾被整体删掉, 解码器改到 radio_app_enter()
     // 才在碎片堆上抢占, 实测 DMA 可用仅剩 60~184 字节 -> 收音机永远连不上。
-    // 首页只保留最小化收音机（当前频道状态 + 播放/暂停）。完整解码器池
-    // 进入收音机应用时再申请，避免开机常驻内存挤压 Wi-Fi 与 Codex 无线桥。
-    // 首页只显示当前频道状态，不需要 MP3 解码器池。池改到进入完整收音机时申请：
-    // LVGL 已改为系统堆分配(见 sdkconfig.defaults)，但仍不宜在开机就把 ~20KB
-    // 连续块钉死 —— 小智 Opus(24.5KB) 与 OTA TLS(~20KB) 都需要大块连续内存。
-    xz_heap_report("post_radio_prewarm_skipped");
+    // 首页与菜单需要真正的最小化收音机，所以池在 Wi-Fi/I2S 初始化完成后、
+    // Codex 无线桥启动前预热；小智进入时会暂停播放并释放这块连续内存。
     ESP_ERROR_CHECK(bsp_display_init());
     if (!bsp_lvgl_init()) {
         ESP_LOGE(kTag, "Display initialization failed");
@@ -1126,6 +1122,15 @@ extern "C" void app_main(void) {
         ESP_LOGE(kTag, "Audio player initialization failed");
     }
     xz_heap_report("post_audio_init");
+
+    // The home/menu layer always owns a minimized radio. Prewarm after Wi-Fi
+    // and I2S have claimed their buffers, but before the Codex bridge task:
+    // earlier boot prewarm starved Wi-Fi; later (on first radio entry) leaves
+    // too little contiguous memory after the UI has fragmented the heap.
+    if (audio_ready && !radio_player_prewarm()) {
+        ESP_LOGW(kTag, "minimized radio decoder prewarm failed");
+    }
+    xz_heap_report("post_radio_prewarm");
 
     // ---- 小智 opus 编码器: 不在此预热 ----
     // 编码器(25KB 连续块)与收音机 MP3 解码器互斥: 开机预热会让收音机

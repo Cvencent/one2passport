@@ -1015,15 +1015,21 @@ void xiaozhi_opus_release(void)
         return;
     }
     s_encoder_ready = false;
-    // 退出小智时**不释放** s_opus_state: 这块 24.5KB 连续内存只在"收音机池
-    // 已释放、桥接已停"的窄窗口里拿得到, 一旦还回碎片堆就再也拼不回来,
-    // 下次进小智必然失败(实测固定卡在 largest 20480)。这里只把编码器标记为
-    // 未初始化, 内存保留, 下次 xz_opus_encoder_init() 原地 memset + 重新初始化。
-    // gave_up 不清零, 避免失败后反复重试把 CPU 打满。
     // 先停播放任务(它会自己收尾), 再归还 TTS 解码器 state。
     // play_stop 内部也会释放解码器, 这里再调一次是幂等的。
     xz_tts_play_stop();
     xz_opus_decoder_release();
+    // XiaoZhi owns this encoder only while its app is open. Once the app
+    // exits, hand the large contiguous block back so the minimized radio can
+    // reclaim its decoder pool. Re-entry allocates it again; OTA TLS now uses
+    // small 4KB/1KB buffers, so the old "never free or it never comes back"
+    // constraint no longer applies.
+    if (s_opus_state != NULL) {
+        free(s_opus_state);
+        s_opus_state = NULL;
+        s_opus_state_size = 0;
+    }
+    s_encoder_gave_up = false;
 }
 
 static void xz_capture_run(int16_t *pcm)

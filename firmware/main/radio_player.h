@@ -28,6 +28,7 @@ bool radio_player_init();
 bool radio_player_prewarm(void);
 void radio_player_release_pool(void);   // 进小智等大内存应用前释放
 void radio_player_ensure_pool(void);    // 退出后重新抢占
+void radio_player_rewake_after_pool_ready(void);  // 池就绪后唤醒播放任务
 bool radio_player_has_pool();           // 首页最小化服务仅在有池时恢复播放
 
 // 取电台目录搜索用的 8KB 预分配缓冲(开机时随解码器池一起抢下)。

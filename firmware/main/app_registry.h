@@ -56,6 +56,8 @@ void radio_request_pool_prewarm();
 // 首页/菜单的最小化服务恢复入口。restore_radio=true 时，只有当前处于
 // 首页/菜单才恢复当前频道播放；完整应用前台时不会抢占音频。
 void app_framework_minimize_services(bool restore_radio);
+void app_framework_defer_minimized_services_restore(void);
+void app_framework_restore_minimized_services_ordered(void);
 
 // 完整收音机页改变播放状态时同步最小化收音机的恢复意图。
 void app_framework_note_minimized_radio_playing(bool playing);

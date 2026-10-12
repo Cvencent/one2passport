@@ -176,6 +176,7 @@ static bool xz_recording;
 static bool xz_connecting;
 static volatile bool xz_connect_cancel;
 static volatile bool xz_connect_task_alive;
+static volatile bool xz_restore_home_on_task_exit;
 
 // 连接任务栈改静态(2026-10-12 第二轮修复): 二次进入小智时堆只剩 ~14KB、
 // largest 5.6KB, xTaskCreate 6KB 动态栈必然失败 -> 连接任务没起来, 旧 WS 死了
@@ -218,6 +219,25 @@ static bool xz_cancelled_delay(uint32_t delay_ms) {
 
 static void xz_connect_task_exit(void) {
     xz_connect_task_alive = false;
+    // A canceled connect task owns the final Opus/WS teardown. Do not let the
+    // home layer start reclaiming the radio while this task is still winding
+    // down, or its first decoder warmup runs without enough contiguous heap.
+    if (xz_restore_home_on_task_exit) {
+        xz_restore_home_on_task_exit = false;
+        xiaozhi_opus_release();
+        // The page switch runs on the input task. Give it a bounded moment to
+        // leave APP_LEVEL_APP, then restore the home services from this worker
+        // with Opus already returned to the heap.
+        for (int waited_ms = 0;
+             waited_ms < 1000 && app_framework_level() == APP_LEVEL_APP;
+             waited_ms += 20) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (app_framework_level() == APP_LEVEL_HOME ||
+            app_framework_level() == APP_LEVEL_MENU) {
+            app_framework_restore_minimized_services_ordered();
+        }
+    }
     vTaskDelete(nullptr);
 }
 
@@ -544,10 +564,16 @@ void xiaozhi_app_exit(void) {
         bsp_lvgl_unlock();
     }
     const bool cancel_settled = xiaozhi_client_cancel();
+    app_framework_defer_minimized_services_restore();
     if (cancel_settled) {
         // 下次进入小智时重新初始化编码器状态。
         xiaozhi_opus_release();
+        app_framework_restore_minimized_services_ordered();
     } else {
+        // The connect task will release Opus as part of its cancellation
+        // path. Let it nudge the minimized services only after that release,
+        // instead of racing it for the radio decoder's contiguous block.
+        xz_restore_home_on_task_exit = true;
         ESP_LOGI(kTag, "xiaozhi exit: connect task still unwinding");
     }
     // 退出小智 = 回到首页/菜单的最小化层: 由框架统一恢复桥接与收音机。

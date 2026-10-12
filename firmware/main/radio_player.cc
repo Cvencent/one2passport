@@ -514,9 +514,25 @@ void radio_player_ensure_pool(void) {
         // 池在但可能没预热(例如上次预热失败) -> 补一次。
         if (!s_pool_warmed.load(std::memory_order_acquire)) {
             warm_pool_decoder("ensure");
+            // A failed warmup can leave the MP3 decoder handle unusable
+            // (ESP_MP3_DEC ret 10 on every later stream). Discard it and
+            // rebuild once instead of carrying a poisoned handle forever.
+            if (!s_pool_warmed.load(std::memory_order_acquire)) {
+                ESP_LOGW(kTag, "radio pool warmup failed; rebuilding decoder");
+                if (s_decoder_pool) {
+                    esp_audio_simple_dec_close(s_decoder_pool);
+                    s_decoder_pool = nullptr;
+                }
+                free(s_output_pool);
+                s_output_pool = nullptr;
+                free(s_input_pool);
+                s_input_pool = nullptr;
+            }
         }
-        xSemaphoreGiveRecursive(s_pool_mutex);
-        return;
+        if (s_decoder_pool) {
+            xSemaphoreGiveRecursive(s_pool_mutex);
+            return;
+        }
     }
     s_decoder_pool = open_mp3_decoder();
     s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
@@ -541,6 +557,28 @@ void radio_player_ensure_pool(void) {
              (int)s_pool_warmed.load(std::memory_order_acquire),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     xSemaphoreGiveRecursive(s_pool_mutex);
+}
+
+void radio_player_rewake_after_pool_ready(void) {
+    // A canceled XiaoZhi task can briefly keep the decoder's large internal
+    // block while the home layer is already visible. Warm the pool once more
+    // after that task has returned Opus, then wake the player so a failed
+    // first attempt does not leave it in the long low-memory backoff.
+    radio_player_ensure_pool();
+    if (!s_pool_warmed.load(std::memory_order_acquire)) {
+        // The first warmup can leave the decoder handle in a failed state
+        // (ESP_MP3_DEC ret 10). Keeping that handle makes every later stream
+        // fail even after memory is available, so discard the whole pool and
+        // try one clean rebuild now that Opus has actually been returned.
+        radio_player_release_pool();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        radio_player_ensure_pool();
+    }
+    if (s_player_task.load(std::memory_order_acquire) &&
+        s_wanted_playing.load(std::memory_order_acquire) &&
+        s_pool_warmed.load(std::memory_order_acquire)) {
+        xTaskNotifyGive(s_player_task.load(std::memory_order_acquire));
+    }
 }
 
 uint8_t *radio_player_search_buffer(void) {
@@ -1123,15 +1161,18 @@ void player_task(void *) {
         //      换台反而会在"每个台都失败"之间循环打转, 无限消耗。
         // 对 B 必须: 不换台 + 用**长退避**(默认 60s 起), 并明确提示用户在等内存。
         if (s_last_fail_lowmem.exchange(false, std::memory_order_acq_rel)) {
-            // 内存不足: 不换台, 长退避(至少 60s, 之后翻倍至 120s 封顶)。
-            if (fail_backoff_ms < 60000) fail_backoff_ms = 60000;
+            // The minimized radio keeps its playback intent while a canceled
+            // XiaoZhi task / Wi-Fi teardown is still holding contiguous RAM.
+            // Poll quickly for that block instead of entering the old 60s
+            // penalty, which made a healthy station look permanently dead.
+            if (fail_backoff_ms < 1500) fail_backoff_ms = 1500;
             radio_ui_set_playback(RadioPlaybackState::Error, "内存不足 稍后重试");
             ESP_LOGW(kTag,
                      "stream failed: not enough contiguous heap; "
-                     "hold same station, back off %ums (no station switch)",
+                     "hold same station, retry in %ums (no station switch)",
                      (unsigned)fail_backoff_ms);
             if (!interruptible_delay_ms(fail_backoff_ms, generation, station)) continue;
-            if (fail_backoff_ms < 120000) fail_backoff_ms = 120000;
+            if (fail_backoff_ms < 10000) fail_backoff_ms = 10000;
             continue;
         }
 

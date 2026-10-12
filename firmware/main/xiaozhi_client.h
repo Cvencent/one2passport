@@ -26,7 +26,12 @@ typedef enum {
 bool xiaozhi_client_init(void);          // 建事件队列(可重入)
 bool xiaozhi_client_connect(void);       // OTA+WS连接+hello(阻塞, 慢操作,勿持锁调)
 void xiaozhi_client_close(void);
+bool xiaozhi_client_reset_cancel(void);  // 仅在连接任务空闲时清除取消标志
+bool xiaozhi_client_cancel(void);        // true=当前无连接任务, 已立即关闭
+bool xiaozhi_client_is_cancelled(void);
 void xiaozhi_client_start_listening(void);   // 长按OK: listen start + opus上行
+void xiaozhi_client_stop_listening(void);    // 松开OK: 停上行(任务自动发stop)
+void xiaozhi_client_abort_turn(void);       // 强行打断当前轮(思考超时用); 正常结束不要调用
 void xiaozhi_client_stop_listening(void);    // 松开OK: 停上行(任务自动发stop)
 bool xiaozhi_client_is_open(void);
 const char *xiaozhi_client_stt(void);        // 最近识别文本

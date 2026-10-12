@@ -779,22 +779,40 @@ static bool ws_connect_and_hello(void)
     return s_ws_open;
 }
 
+// Protocol messages, matching FoloToy-AI-Passport v0.2.0-rc.10 exactly.
+//
+// The official firmware emits exactly three JSON messages and nothing else:
+//   {"type":"hello","version":N,...,"audio_params":{...}}
+//   ,"type":"listen","state":"start","mode":"auto"}
+//   ,"type":"abort"}
+//
+// There is deliberately NO "listen state:stop". This build used to send one,
+// which is not a message the server knows: it gets ignored, so under mode:auto
+// the turn never receives an end-of-speech signal and the session wedges. That
+// is the "after a few turns it stops responding and OK does nothing" symptom.
+// Ending a turn is done by sending type:abort instead.
 static void send_listen_state(const char *state)
 {
     if (!s_ws || !s_ws_open) return;
     char msg[160];
-    snprintf(msg, sizeof(msg),
-             "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"%s\",\"mode\":\"manual\"",
-             s_session_id[0] ? s_session_id : ".", state);
-    // close json
-    size_t len = strlen(msg);
-    snprintf(msg + len, sizeof(msg) - len, "}");
-    esp_websocket_client_send_text(s_ws, msg, strlen(msg), pdMS_TO_TICKS(2000));
+    int n;
+    if (strcmp(state, "abort") == 0) {
+        n = snprintf(msg, sizeof(msg),
+            "{\"session_id\":\"%s\",\"type\":\"abort\"}",
+            s_session_id[0] ? s_session_id : ".");
+    } else {
+        n = snprintf(msg, sizeof(msg),
+            "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"%s\",\"mode\":\"auto\"}",
+            s_session_id[0] ? s_session_id : ".", state);
+    }
+    if (n <= 0) return;
+    esp_websocket_client_send_text(s_ws, msg, (size_t)n, pdMS_TO_TICKS(2000));
+    ESP_LOGI(TAG, "sent %s", msg);
 }
 
 void xiaozhi_client_close(void)
 {
-    if (s_listening) send_listen_state("stop");
+    if (s_listening) send_listen_state("abort");
     s_listening = false;
     if (s_ws) {
         esp_websocket_client_stop(s_ws);
@@ -812,6 +830,13 @@ void xiaozhi_client_close(void)
 // opus_encoder_get_size()/opus_encoder_init(), so the encoder lives in one
 // aligned static arena and never allocates from the heap.
 #define XZ_CHUNK_SAMPLES 960   // 60ms @16k
+#define XZ_OPUS_FRAME_MAX 1024  // 上行单帧 Opus 上限
+// ⚠⚠ 曾经的致命 bug(2026-10-12): encode 的输出缓冲大小写成了
+//   sizeof(s_mic_opus)。s_mic_opus 是 uint8_t*, 所以 sizeof 拿到的是
+//   **指针大小(C3 上 4 字节)**, 而不是它指向的 1024 字节缓冲。
+//   结果每一帧 Opus 都被塞进 4 字节, 音频被截断成无法解码的碎片,
+//   云端 ASR 听到的基本只有噪声 —— 于是无论说多久都只返回"我"/"嗯"。
+//   必须用缓冲的**容量**常量, 不能用 sizeof(指针)。
 // ⚠ 这个值必须贴近 opus_encoder_get_size(1) 的实测值(24524), 不要图省事写大:
 //   C3 只有 ~330KB 可用 RAM, 每多占 1KB 静态内存都可能在开机时把 I2S 的
    //   DMA 描述符挤掉 -> "i2s tx 初始化失败: ESP_ERR_NO_MEM"(实测 2026-10-12)。
@@ -821,7 +846,12 @@ void xiaozhi_client_close(void)
 //     phy_init: failed to allocate memory for RF calibration data -> abort()
 //   (实测 2026-10-12: post_audio_init dma 掉到 308 字节时必现, 5748 才安全)
 //   因此这里取 22KB 而非 32KB, 并在录音任务里打印栈高水位实测校准。
-#define XZ_MIC_STACK_WORDS 22528
+// 2026-10-12: 22528 -> 23552. After the uplink Opus buffer was fixed
+//   (see XZ_OPUS_FRAME_MAX), the real encode path ran for the first time,
+//   and 22KB left only 660 bytes of headroom -> "Stack protection fault" on
+//   frame one. The old value had been tuned against the broken path, where
+//   opus_encode bailed out early and never reached the deep SILK/CELT stack.
+#define XZ_MIC_STACK_WORDS 25600
 #define OPUS_OK 0
 // AUDIO(2049) 而非 VOIP(2048): 云端要把这段音频喂给 ASR 做识别, 需要保留
 // 辅音/高频细节; VOIP 会为通话质量 aggressively 砍掉这些, 导致识别率崩塌。
@@ -896,6 +926,11 @@ static bool xz_opus_encoder_init(void)
     opus_encoder_ctl(s_opus_state, OPUS_SET_VBR_REQUEST, 1);
     opus_encoder_ctl(s_opus_state, OPUS_SET_COMPLEXITY_REQUEST, 0);
     opus_encoder_ctl(s_opus_state, OPUS_SET_INBAND_FEC_REQUEST, 0);
+    // DTX must stay OFF (2026-10-12). With DTX=1 Opus emits 1-byte comfort
+    // DTX stays ON, matching the official firmware. I briefly turned it off while
+    // chasing this bug, but the one configuration that actually produced a
+    // correct transcript had DTX=1, so it is part of the working setup.
+    // The 1-byte comfort frames are the silence signalling the cloud VAD expects.
     opus_encoder_ctl(s_opus_state, OPUS_SET_DTX_REQUEST, 1);
     s_encoder_ready = true;
     ESP_LOGI(TAG, "opus static encoder ready: state=%d bytes", s_opus_state_size);
@@ -935,50 +970,75 @@ static void xz_capture_run(int16_t *pcm)
     s_listening = true;
     uint8_t *opus = s_mic_opus;
     uint32_t frames = 0;
-    // 软件自动增益(AGC)。
+    // 自动增益 + 噪声门(2026-10-12 重写)。
     //
-    // 为什么需要: 设备是桌面摆件, 人站在旁边说话, 声压本来就小; ES8311 的模拟
-    // PGA 只有 ~40dB 上限, 光靠硬件增益在嘈杂/安静不同的房间里很难稳定。
-    // 实测未做 AGC 时上行 RMS 仅 147, 云端 ASR 只能从近乎静音的信号里认出"我"。
+    // 为什么旧版 AGC 让识别更糟: 旧逻辑把**每一帧**都归一化到固定 RMS
+    // (2600)。人说话时音节之间 RMS 会剧烈起伏, 而旧版把它压成一条几乎恒定的
+    // 直线 —— 实测日志里 RMS 长期在 2000~3200 小幅抖动, 完全没有语音该有的
+    // 起伏。那不是"音量稳定", 那是把说话和底噪一起放大到同样响, 语音的动态
+    // 范围(ASR 最重要的线索之一)被彻底抹平了。
     //
-    // 做法: 逐帧算 RMS, 把整帧统一缩放到目标 RMS(留峰值余量防削波)。
-    // 统一缩放保留波形形状, 不会破坏 ASR 关心的频谱特征。
-    // 只在偏安静时往上拉(最多 12x), 偏响时不动 —— 避免把噪声一起放大。
-    const double kTargetRms = 2600.0;
-    const double kMaxGain = 12.0;
-    double agc_gain = 1.0;
+    // 新做法:
+    //   1) 先估底噪(本轮见过的最小帧 RMS), 只有明显高于底噪的帧才认为是
+    //      人声 —— 这就是噪声门, 安静房间的底噪不会被猛拉;
+    //   2) 增益只在"确认是人声但偏小"时往上加, 慢起慢落, 响起来立刻松手
+    //      回 1.0, 不做压缩;
+    //   3) 统一缩放保波形, 峰值留余量防削波。
+    //
+    // 关键区别: 目标是"把人声抬到够用的电平", 不是"把每帧拉到同一个值"。
+    const double kVoiceGateRatio = 3.0;   // 高于底噪 3 倍才认为是人声
+    const double kTargetRms    = 5200.0;  // 只对确认的人声生效, 远低于削波
+    const double kMaxGain      = 10.0;
+    const double kRelease      = 0.80;    // 增益回落系数(慢释放)
+    double agc_gain  = 1.0;
+    double noise_rms = 0.0;
+    double frms_min = 0.0, frms_max = 0.0;
     while (s_listening && s_ws_open) {
         if (bsp_audio_read(pcm, XZ_CHUNK_SAMPLES * sizeof(int16_t)) != ESP_OK) break;
-        {
+        {   // 逐帧 RMS: 噪声门判定 + 动态范围统计
             double acc = 0.0;
             for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i)
                 acc += (double)pcm[i] * (double)pcm[i];
             const double rms = __builtin_sqrt(acc / XZ_CHUNK_SAMPLES);
-            if (rms > 40.0 && rms < kTargetRms) {
-                const double want = kTargetRms / rms;
-                agc_gain = agc_gain * 0.7 + (want < kMaxGain ? want : kMaxGain) * 0.3;
-                if (agc_gain > 1.0) {
-                    // 用 double 累加再回写, 避免 16bit 乘法的溢出与截断失真。
-                    for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i) {
-                        const double v = (double)pcm[i] * agc_gain;
-                        if (v > 32767.0) pcm[i] = 32767;
-                        else if (v < -32768.0) pcm[i] = -32768;
-                        else pcm[i] = (int16_t)v;
-                    }
+            if (rms > 0.0) {
+                if (frms_min <= 0.0 || rms < frms_min) frms_min = rms;
+                if (rms > frms_max) frms_max = rms;
+            }
+            // 噪声底跟踪: 取见过的最小值作为底噪估计。
+            if (noise_rms <= 0.0) noise_rms = rms > 1.0 ? rms : 1.0;
+            else if (rms < noise_rms) noise_rms = rms;
+            const bool is_voice = rms > noise_rms * kVoiceGateRatio && rms > 60.0;
+            if (is_voice && rms < kTargetRms) {
+                double want = kTargetRms / rms;
+                if (want > kMaxGain) want = kMaxGain;
+                agc_gain += (want - agc_gain) * 0.25;   // 慢起, 避免首音节炸掉
+            } else {
+                agc_gain *= kRelease;                    // 慢释放, 不硬切
+                if (agc_gain < 1.0) agc_gain = 1.0;
+            }
+            if (agc_gain > 1.01) {
+                // 用 double 累加再回写, 避免 16bit 乘法的溢出与截断失真。
+                for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i) {
+                    const double v = (double)pcm[i] * agc_gain;
+                    if (v > 32767.0) pcm[i] = 32767;
+                    else if (v < -32768.0) pcm[i] = -32768;
+                    else pcm[i] = (int16_t)v;
                 }
-            } else if (rms >= kTargetRms) {
-                agc_gain = 1.0;
             }
         }
         int encoded = opus_encode(s_opus_state, pcm, XZ_CHUNK_SAMPLES,
-                                  opus, (int)sizeof(s_mic_opus));
+                                  opus, (int)XZ_OPUS_FRAME_MAX);
         if (encoded <= 0) {
             ESP_LOGW(TAG, "opus encode failed: %d", encoded);
             break;
         }
+        // 每帧都记录编码字节数: 这是判断"到底有没有把音频送出去"的唯一
+        // 可靠信号。以前每 8 帧才打一次, 结果失败轮次显示 0 帧, 让人误以为
+        // 麦克风没工作, 实际上是编码在第一帧就失败了(见下面的日志)。
+        ESP_LOGI(TAG, "tx frame %lu: %d bytes", (unsigned long)frames, encoded);
         if (s_proto_version >= 3) {
             // BinaryProtocol3: [type=0 audio][reserved=0][payload_size u16BE] + payload
-            static uint8_t tx[4 + 1024];
+            static uint8_t tx[4 + XZ_OPUS_FRAME_MAX];
             tx[0] = 0;
             tx[1] = 0;
             tx[2] = (uint8_t)((unsigned)encoded >> 8);
@@ -990,25 +1050,37 @@ static void xz_capture_run(int16_t *pcm)
             esp_websocket_client_send_bin(s_ws, (const char *)opus,
                                           encoded, pdMS_TO_TICKS(1000));
         }
-        if (++frames % 16 == 0) {  // about once per second (60ms/frame)
-            // 麦克风 RMS 探针: 确认真的在拾音。若长期为 0, 说明 I2S 读回来的
-            // 是静音, 上行给云端的就只是"房间里很安静" —— ASR 自然只能识别出
-            // "我"这种零星噪声。前馈 RMS 是判断"麦克风有没有工作"的唯一可靠信号。
+        if (++frames % 8 == 0) {   // ~0.5s
             {
-                // 用 double 累加: 960 个样本各自可到 32768, 平方后总和会远超
-                // int32 范围(实测打印出 4294967295 就是这里溢出成了 UINT_MAX)。
                 double acc = 0.0;
                 for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i)
                     acc += (double)pcm[i] * (double)pcm[i];
+                const double rms_now = __builtin_sqrt(acc / XZ_CHUNK_SAMPLES);
                 ESP_LOGI(TAG, "opus up: %lu frames rms=%u", (unsigned long)frames,
-                         (unsigned)__builtin_sqrt(acc / XZ_CHUNK_SAMPLES));
-                // DC offset probe (added 2026-10-12). RMS alone cannot tell a
-                // healthy signal from a badly biased one: a large DC offset
-                // inflates RMS while the codec clips or the waveform rides the
-                // rail, and the cloud ASR then reports short junk like "我"
-                // regardless of what was actually said. Print mean and peak
-                // alongside RMS so a bias problem is visible in the log
-                // instead of requiring a scope.
+                         (unsigned)rms_now);
+                // 语音的过零率大致在 0.02~0.35/样本。接近 0 说明信号是停滞的
+                // 直流或单频(不是人声); 明显高于 0.45 说明是削波或纯噪声。
+                // 这一项能证明我们交给 Opus 的确实是有人声的真实音频。
+                {
+                    int zc = 0;
+                    for (int i = 1; i < XZ_CHUNK_SAMPLES; ++i)
+                        if ((pcm[i - 1] >= 0) != (pcm[i] >= 0)) ++zc;
+                    const double zcr = (double)zc / (double)XZ_CHUNK_SAMPLES;
+                    const char *hint = zcr < 0.005 ? "TOO FLAT (near-DC/stalled)"
+                                   : zcr < 0.02   ? "TOO SMOOTH (hum-like)"
+                                   : zcr > 0.45   ? "TOO HOT (clipping/noise)"
+                                                  : "speech-like";
+                    ESP_LOGI(TAG, "zcr=%.3f [%s]", zcr, hint);
+                }
+                // 人说话时音节之间 RMS 会剧烈起伏; 底噪则几乎是直线。
+                // ratio 接近 1 就是"听到的是底噪而不是人声"的特征。
+                ESP_LOGI(TAG, "rms spread: min=%u max=%u ratio=%.1fx gain=%.2f noise=%.0f",
+                         (unsigned)frms_min, (unsigned)frms_max,
+                         frms_min > 0.0 ? (double)frms_max / (double)frms_min : 0.0,
+                         agc_gain, noise_rms);
+                frms_min = 0.0; frms_max = 0.0;
+                // DC offset probe: 大的直流偏置会虚增 RMS, 让波形贴着轨跑,
+                // 云端 ASR 就会稳定地返回"我"这种零星噪声。
                 {
                     double mean = 0.0;
                     int32_t peak = 0;
@@ -1031,7 +1103,18 @@ static void xz_capture_run(int16_t *pcm)
             }
         }
     }
-    send_listen_state("stop");
+    // mode:auto 下**不发任何结束消息**。
+    //
+    // 依据: 对照唯一一次成功的日志(2026-10-12 17:2x), 服务端在
+    //   t=54360 收到 listen/start, t=56853 就自己回了 STT ——
+    //   整个过程我【没有】发过 stop 或 abort, 设备还在录音。
+    // 说明云端用自己的 VAD 判断"说完了", 自己就切到思考并开始回答。
+    //
+    // 之前每轮结束都发 stop 或 abort, 都是在云端已经回答完之后又去干扰它:
+    //   - 发 stop: 服务端不认这个消息, 轮次收不到结束信号;
+    //   - 发 abort: 语义是"打断", 把刚要开始的回答打断掉, 于是第二轮
+    //     就一直卡在"思考中"直到 15s 超时。
+    // 松手只是本地停止采集, 这正是官方固件的行为。
     s_listening = false;
 }
 
@@ -1041,7 +1124,7 @@ static void xz_capture_task(void *arg)
     // 借堆: 录音期间才需要这两块缓冲, 录完立刻还给堆。
     // 进小智时收音机已暂停并释放了解码器池, 此时的堆足以借出 ~2.9KB。
     s_mic_pcm = (int16_t *)malloc(sizeof(int16_t) * XZ_CHUNK_SAMPLES);
-    s_mic_opus = (uint8_t *)malloc(1024);
+    s_mic_opus = (uint8_t *)malloc(XZ_OPUS_FRAME_MAX);
     if (!s_mic_pcm || !s_mic_opus) {
         ESP_LOGE(TAG, "mic buffers alloc failed (pcm=%p opus=%p)",
                  s_mic_pcm, s_mic_opus);
@@ -1172,6 +1255,14 @@ void xiaozhi_client_start_listening(void)
     }
 }
 
+// 强行打断当前轮次并解锁会话。
+// 只有在"已经卡住"时才用(例如思考超时): 官方固件在同样的场景下也是发
+// type:abort。正常说完一轮【不要】调用它 —— 那会让服务端断开连接。
+void xiaozhi_client_abort_turn(void)
+{
+    s_listening = false;
+    send_listen_state("abort");
+}
 void xiaozhi_client_stop_listening(void)
 {
     s_listening = false;   // capture task ������������������ listen stop

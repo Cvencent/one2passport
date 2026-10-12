@@ -186,6 +186,11 @@ static constexpr uint32_t XZ_THINKING_TIMEOUT_MS = 15000;
 // seconds and the user naturally holds OK right after opening XiaoZhi;
 // dropping that press made the first utterance silently do nothing.
 static bool xz_hold_pending;
+// 本轮是否已经收到云端的回答(STT/TTS)。
+// 和 xz_thinking_deadline 分开: deadline 在"开始按住"时就被清零, 不能拿来
+// 判断"这一轮是不是已经有结果了" —— 之前混用导致松手时永远误判成"已回答",
+// 看门狗从来没被 arm 过。
+static bool xz_turn_answered;
 
 static bool xz_cancelled(void) {
     return xz_connect_cancel || xiaozhi_client_is_cancelled();
@@ -237,6 +242,9 @@ static lv_obj_t *xz_box(lv_obj_t *parent, int x, int y, int w, int h, uint32_t c
 }
 
 // 云端事件轮询(30ms LVGL定时器, 在LVGL任务上下文执行UI)
+static void xiaozhi_async_connect_task_start();
+void xiaozhi_async_connect_task(void *);
+
 static void xz_evt_timer_cb(lv_timer_t *) {
     if (!xz_scr) return;
 
@@ -247,6 +255,10 @@ static void xz_evt_timer_cb(lv_timer_t *) {
         ESP_LOGW(kTag, "thinking timed out with no cloud reply");
         // Make sure no mic task is still streaming if the turn wedged midway.
         xiaozhi_client_stop_listening();
+        // 卡住了: 用官方的 type:abort 强行打断这一轮并解锁会话。
+        // 之前这里只 stop_listening(), 服务端那边这一轮仍然挂着, 之后再按 OK
+        // 全部被忽略 —— 表现就是"卡住后再按 OK 完全没用"。
+        xiaozhi_client_abort_turn();
         char buf[400];
         snprintf(buf, sizeof(buf), "问: %s\n答: (无响应, 请重试)",
                  xiaozhi_client_stt()[0] ? xiaozhi_client_stt() : "(未识别)");
@@ -295,19 +307,25 @@ static void xz_evt_timer_cb(lv_timer_t *) {
             snprintf(buf, sizeof(buf), "问: %s\n答: (思考中)", xiaozhi_client_stt());
             if (xz_msg) lv_label_set_text(xz_msg, buf);
             xz_apply_state(2);
-            // Recognition arrived, so the cloud is working on this turn:
-            // give it a fresh full window instead of inheriting the time
-            // already spent waiting for the STT result.
+            // 云端已经认可这一轮了(它靠自己的 VAD 判定"说完了")。
+            // 如果用户还按着 OK, 必须立刻停止采集 —— 否则会继续把音频灌进
+            // 一个已经进入回答状态的轮次, 下一轮就废了(用户看到的"问第二句
+            // 就一直思考中")。
+            if (xz_recording) {
+                xz_recording = false;
+                xiaozhi_client_stop_listening();
+            }
+            // 重新给一个完整窗口: 识别刚到, 云端还在思考。
             xz_thinking_deadline = lv_tick_get() + XZ_THINKING_TIMEOUT_MS;
+            xz_turn_answered = true;
         } else if (ev == XZ_EV_TTS_START) {
             char buf[400];
             snprintf(buf, sizeof(buf), "问: %s\n答: %s",
                      xiaozhi_client_stt(), xiaozhi_client_tts());
             if (xz_msg) lv_label_set_text(xz_msg, buf);
             xz_apply_state(3);
-            // The cloud answered, so the turn is alive: cancel the watchdog.
-            // Without this a long answer would still trip the deadline
-            // mid-playback and cut the user off while the pet is speaking.
+            // 云端已经回答, 这一轮结束了。
+            xz_turn_answered = true;
             xz_thinking_deadline = 0;
         } else if (ev == XZ_EV_TTS_STOP) {
             xz_thinking_deadline = 0;
@@ -316,7 +334,18 @@ static void xz_evt_timer_cb(lv_timer_t *) {
             xz_thinking_deadline = 0;
             xz_connecting = false;
             xz_recording = false;
-            xz_apply_state(5);
+            xz_recording = false;
+            // 掉线后自动重连, 而不是把用户锁死在这一页。
+            // 之前这里只切到"连接失败", 之后无论怎么按 OK 都不会再建立连接
+            // —— 这是"卡住之后再按 OK 完全没用"的另一半原因。
+            if (xz_cancelled()) {
+                xz_apply_state(5);          // 正在退出, 不重连
+            } else {
+                ESP_LOGW(kTag, "link lost, reconnecting");
+                xz_connecting = true;
+                xz_apply_state(4);
+                xiaozhi_async_connect_task_start();
+            }
         }
     }
 }
@@ -428,16 +457,23 @@ bool xiaozhi_app_enter(void) {
     { xz_ui_event_t stale; while (xQueueReceive(xiaozhi_client_events(), &stale, 0) == pdTRUE) {} }
     if (!can_start_connect) return true;
     ESP_LOGI(kTag, "xiaozhi page ready, starting connect task");
-    extern void xiaozhi_async_connect_task(void *);
+    xiaozhi_async_connect_task_start();
+    return true;
+}
+
+// 启动(或重连)连接任务。抽成函数是因为进页面和掉线重连都要用它,
+// 而且必须防止两个任务同时跑 —— OTA+TLS 很吃内存, 并发会直接失败。
+static void xiaozhi_async_connect_task_start() {
+    if (xz_connect_task_alive) return;
     xz_connect_task_alive = true;
+    ESP_LOGI(kTag, "starting connect task");
     if (xTaskCreate((TaskFunction_t)xiaozhi_async_connect_task, "xz_conn", 6144,
                     nullptr, 4, nullptr) != pdPASS) {
         xz_connect_task_alive = false;
-        ESP_LOGE("xiaozhi", "xz_conn task create failed (heap?)");
+        ESP_LOGE(kTag, "xz_conn task create failed (heap?)");
         xz_connecting = false;
         xz_apply_state(5);
     }
-    return true;
 }
 
 // 连接任务(OTA+WS+hello, 完成后经事件队列通知UI)
@@ -527,6 +563,7 @@ void xiaozhi_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
         if (xz_recording || !xiaozhi_client_is_open()) return;
         xz_recording = true;
         xz_thinking_deadline = 0;
+        xz_turn_answered = false;
         xiaozhi_client_start_listening();
         xz_apply_state(1);
         return;
@@ -537,13 +574,20 @@ void xiaozhi_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
         if (!xz_recording) return;
         xz_recording = false;
         xiaozhi_client_stop_listening();
-        // Show 思考中 immediately; if the cloud never answers, the watchdog in
-        // xz_evt_timer_cb breaks us out instead of hanging forever.
-        xz_thinking_deadline = lv_tick_get() + XZ_THINKING_TIMEOUT_MS;
-        xz_apply_state(2);
+        // mode:auto 下云端靠自己的 VAD 结束这一轮, 松手不用通知它。
+        // 但如果回答/STT 在我还按着的时候就已经到了, 就【不要】再 arm 看门狗 ——
+        // 否则等于给一个已经完成的轮次重新计时, 界面会莫名其妙卡住 15 秒。
+        // 判断依据: 本轮已经收到过 STT 或 TTS(由事件回调清零)。
+        if (xz_turn_answered) {
+            // 云端已经回答过了(它靠自己的 VAD 判定说完, 回答在我松手前就到了)。
+            // 这种情况下不要再 arm 看门狗, 也不要覆盖界面状态。
+            ESP_LOGI(kTag, "release: turn already answered");
+        } else {
+            xz_thinking_deadline = lv_tick_get() + XZ_THINKING_TIMEOUT_MS;
+            xz_apply_state(2);
+        }
         return;
     }
-
     if (ev == BSP_BTN_CLICK && xz_recording) {
         // Defensive: a very short hold can surface as CLICK instead of RELEASE.
         xz_recording = false;

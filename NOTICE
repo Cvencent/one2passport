@@ -1,0 +1,16 @@
+FoloOS AI Passport
+
+This repository contains an unofficial community-derived firmware for
+FoloToy AI Passport. It is not an official FoloToy release and is not
+endorsed or supported by FoloToy.
+
+The PC-side Codex bridge is maintained separately:
+- https://github.com/Cvencent/CodexBridge
+
+Official upstream projects and documentation:
+- https://github.com/FoloToy/ai-passport
+- https://github.com/FoloToy/folo-ai-passport-xiaozhi
+- https://docs.folotoy.com/zh/docs/web-tool/
+
+The firmware is licensed under MIT; see firmware/LICENSE. Third-party assets
+and dependencies remain subject to their own licenses.

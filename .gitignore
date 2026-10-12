@@ -4,12 +4,6 @@ firmware/build-*/
 firmware/managed_components/
 firmware/sdkconfig.old
 
-# Windows client build output and caches
-windows-client/build/
-windows-client/dist/
-windows-client/**/__pycache__/
-windows-client/**/*.pyc
-
 # Local logs, captures, and credentials
 *.log
 *.pyc

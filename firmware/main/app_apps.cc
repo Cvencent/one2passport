@@ -173,6 +173,13 @@ static bool xz_connecting;
 static volatile bool xz_connect_cancel;
 static volatile bool xz_connect_task_alive;
 
+// 连接任务栈改静态(2026-10-12 第二轮修复): 二次进入小智时堆只剩 ~14KB、
+// largest 5.6KB, xTaskCreate 6KB 动态栈必然失败 -> 连接任务没起来, 旧 WS 死了
+// 4096 实测不够(TLS 握手在 xz_conn 里把栈踩穿 -> Stack protection fault),
+// 恢复 6144。省内存靠 TTS 栈 12288->10240, 那边实测只用 8KB。
+static StackType_t s_xz_conn_stack[6144];
+static StaticTask_t s_xz_conn_tcb;
+
 // Watchdog for "思考中…": 2026-10-12. Once we send listen stop we wait for the
 // cloud STT+TTS. If nothing arrives the UI used to sit on 思考中… forever
 // (a dead socket or a silent cloud turn looks exactly like this). This deadline
@@ -467,8 +474,9 @@ static void xiaozhi_async_connect_task_start() {
     if (xz_connect_task_alive) return;
     xz_connect_task_alive = true;
     ESP_LOGI(kTag, "starting connect task");
-    if (xTaskCreate((TaskFunction_t)xiaozhi_async_connect_task, "xz_conn", 6144,
-                    nullptr, 4, nullptr) != pdPASS) {
+    if (xTaskCreateStatic((TaskFunction_t)xiaozhi_async_connect_task, "xz_conn",
+                          6144, nullptr, 4,
+                          s_xz_conn_stack, &s_xz_conn_tcb) == NULL) {
         xz_connect_task_alive = false;
         ESP_LOGE(kTag, "xz_conn task create failed (heap?)");
         xz_connecting = false;

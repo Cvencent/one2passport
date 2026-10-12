@@ -403,7 +403,8 @@ static bool s_decoder_ready;
 //   所以 12288 就是 12KB 栈, 不是 12K words。
 //   实测阶梯: 3KB(websocket_task 原值)必崩; 8KB 仍在 silk_decode_frame 崩;
 //   故给到 12KB, 再由下面的 high water 日志实测校准到"够用且不浪费"。
-#define XZ_TTS_STACK_WORDS 12288
+// 2026-10-12: 12288 -> 10240. 实测 high water 4212(=用了 8076), 10240 留 2164 余量; // 省下的 2KB 还给开机 DMA(RF 校准差 ~100B 就会 abort 死循环)。
+#define XZ_TTS_STACK_WORDS 10240
 //   2026-10-12: 原为 6("高于 WS 保证下行不积压"), 这是错的。TTS 任务在
 //   i2s_channel_write(阻塞, 超时1000ms) 里连续写, 优先级一旦高于 websocket 任务,
 //   持 client->lock 做阻塞读的 ws 任务就彻底让不出 CPU —— 锁被扣到读超时
@@ -462,6 +463,11 @@ void xz_opus_decoder_release(void)
 }
 
 // 播放任务: 从队列取 Opus 帧 -> 解码 -> 写 I2S。栈独占给 silk/celt 用。
+// TTS 观测计数(2026-10-12): 旧日志只打前 2 帧/前 3 次播放, 第二回合之后
+// 到底有没有收到音频完全不可见。现在每 8 帧打一次进度, TTS_STOP 时打汇总。
+static volatile int s_tts_frames_rx;
+static volatile int s_tts_frames_played;
+
 static void xz_tts_play_task(void *arg)
 {
     (void)arg;
@@ -489,9 +495,10 @@ static void xz_tts_play_task(void *arg)
         if (samples <= 0) continue;           // 静音/结束帧返回 0, 不是错误
         const size_t bytes = (size_t)samples * sizeof(short);
         if (bsp_audio_write(s_tts_pcm, bytes) == ESP_OK) {
-            if (++played <= 3) {
-                ESP_LOGI(TAG, "tts frame decoded+played: samples=%d bytes=%u (n=%u)",
-                         samples, (unsigned)bytes, (unsigned)played);
+            ++s_tts_frames_played;
+            if (s_tts_frames_played <= 3 || (s_tts_frames_played % 20) == 0) {
+                ESP_LOGI(TAG, "tts frame decoded+played: samples=%d bytes=%u (n=%d)",
+                         samples, (unsigned)bytes, s_tts_frames_played);
             }
         }
     }
@@ -572,7 +579,9 @@ static bool xz_tts_enqueue_opus_frame(const uint8_t *data, int len)
     memcpy(item.data, data, (size_t)len);
     // 0 tick: 队列满就丢这一帧。阻塞在 WS 回调里会导致整条 WS 停止收包,
     // 反而把后续所有帧都拖死(丢一帧只是 60ms 音频轻微卡顿)。
-    return xQueueSend(s_tts_queue, &item, 0) == pdTRUE;
+    const bool ok = xQueueSend(s_tts_queue, &item, 0) == pdTRUE;
+    if (ok) ++s_tts_frames_rx;
+    return ok;
 }
 
 static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -689,6 +698,9 @@ static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data
                     xz_ui_event_t ev = XZ_EV_TTS_START;
                     xQueueSend(s_event_queue, &ev, 0);
                 } else if (strcmp(s, "stop") == 0) {
+                    ESP_LOGI(TAG, "tts summary: rx=%d played=%d",
+                             s_tts_frames_rx, s_tts_frames_played);
+                    s_tts_frames_rx = 0; s_tts_frames_played = 0;
                     xz_ui_event_t ev = XZ_EV_TTS_STOP;
                     xQueueSend(s_event_queue, &ev, 0);
                 }
@@ -1047,10 +1059,23 @@ static void xz_capture_run(int16_t *pcm)
             if (noise_rms <= 0.0) noise_rms = rms > 1.0 ? rms : 1.0;
             else if (rms < noise_rms) noise_rms = rms;
             const bool is_voice = rms > noise_rms * kVoiceGateRatio && rms > 60.0;
+            // 2026-10-12 削波修复: 上一版 AGC 在 TTS 声音很近的情况下会把
+            // gain 拉到 2.69, 音频直接打满 32768 -> 云端收到削波后的方波,
+            // 根本识别不出内容。加一个硬性安全网: 当前帧峰值已接近满幅时
+            // 本帧强制 gain=1.0, 不再往上加。
             if (is_voice && rms < kTargetRms) {
-                double want = kTargetRms / rms;
-                if (want > kMaxGain) want = kMaxGain;
-                agc_gain += (want - agc_gain) * 0.25;   // 慢起, 避免首音节炸掉
+                int32_t peak = 0;
+                for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i) {
+                    const int32_t a = pcm[i] < 0 ? -(int32_t)pcm[i] : (int32_t)pcm[i];
+                    if (a > peak) peak = a;
+                }
+                if (peak > 26000) {  // close to full scale: force gain 1
+                    agc_gain = 1.0;
+                } else {
+                    double want = kTargetRms / rms;
+                    if (want > kMaxGain) want = kMaxGain;
+                    agc_gain += (want - agc_gain) * 0.08;
+                }
             } else {
                 agc_gain *= kRelease;                    // 慢释放, 不硬切
                 if (agc_gain < 1.0) agc_gain = 1.0;
@@ -1204,6 +1229,17 @@ static void xz_capture_task(void *arg)
 // ---- public API ----
 bool xiaozhi_client_connect(void)
 {
+    // 2026-10-12 二次修复: 重进小智时上一轮的 s_ws 可能还挂着(退出时 cancel
+    // 走的是"由连接任务负责关闭"路径, 但如果那时任务已经死了, handle 就泄漏,
+    // 下次进来看到的 transport_poll_write(0) 都是那个僵尸 WS 的。这里兜底销毁,
+    // 否则 UI 卡"回答中", 用户必须重启设备。
+    if (s_ws) {
+        ESP_LOGW(TAG, "stale ws handle detected, closing before reconnect");
+        esp_websocket_client_stop(s_ws);
+        esp_websocket_client_destroy(s_ws);
+        s_ws = NULL;
+    }
+    s_ws_open = false; s_ws_connected = false; s_listening = false;
     if (s_ws_open) return true;
     if (!xz_connect_begin()) return false;
     bool success = false;

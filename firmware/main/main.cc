@@ -26,7 +26,6 @@
 #include "esp_heap_caps.h"   // catalog 搜索前报告可用连续堆
 
 extern "C" void xz_heap_report(const char *tag);  // xiaozhi_client.c 临时heap诊断
-extern "C" bool xiaozhi_opus_prewarm(void);       // 启动早期预分配 opus 编码器内存
 #include "esp_netif_sntp.h"
 #include "lwip/inet.h"
 #include "freertos/FreeRTOS.h"
@@ -238,6 +237,7 @@ static void serial_key_inject(char c) {
         case 'u': msg = {BSP_BTN_UP,   BSP_BTN_CLICK}; break;
         case 'd': msg = {BSP_BTN_DOWN, BSP_BTN_CLICK}; break;
         case 'o': msg = {BSP_BTN_OK,   BSP_BTN_CLICK}; break;
+        case 'j': msg = {BSP_BTN_DOWN, BSP_BTN_LONG};  break;
         case 'l': msg = {BSP_BTN_OK,   BSP_BTN_LONG};  break;
         case 'k': msg = {BSP_BTN_UP,   BSP_BTN_LONG};  break;
         default: return;
@@ -782,12 +782,10 @@ void wifi_event(WifiEvent event, const std::string &data) {
             radio_ui_set_station(radio_player_station_index(),
                                  radio_player_station_count(),
                                  radio_player_station(radio_player_station_index()));
-            // ⚠⚠ 必须 PERFORMANCE(省电全关) —— 2026-10-10 踩坑还原:
-            // 网络电台是**实时音频流**, 对延迟极敏感。MIN_MODEM 省电会让 WiFi
-            // 周期性进 modem-sleep, 每次唤醒前射频短暂停顿 -> 音频**周期性卡顿**
-            // (用户实测"一卡一卡")。原始可工作版本一直用 PERFORMANCE。
-            // 发热与省电无关, 别拿音频流畅性换那点功耗。
-            manager.SetPowerSaveLevel(WifiPowerSaveLevel::PERFORMANCE);
+            // ⚠⚠ 连网默认 BALANCED(MIN_MODEM): 射频周期性休眠, 明显降温。
+            // 网络电台是实时音频流, 播放时才由 radio_player 调
+            // radio_wifi_set_streaming(true) 临时切 PERFORMANCE, 停止再切回。
+            manager.SetPowerSaveLevel(WifiPowerSaveLevel::BALANCED);
             start_sntp_once();
             radio_player_set_network(true);
             if (app_framework_level() == APP_LEVEL_APP &&
@@ -898,6 +896,15 @@ void app_radio_show_saved_wifi(void) {
 }
 }
 
+// 实时音频流(全速)与空闲态(射频休眠)之间切换 WiFi 省电级别。
+// 由 radio_player 在开始/停止播放时调用; 首页/Codex/待机保持 BALANCED 降温。
+void radio_wifi_set_streaming(bool streaming) {
+    auto &manager = WifiManager::GetInstance();
+    if (!manager.IsConnected()) return;
+    manager.SetPowerSaveLevel(streaming ? WifiPowerSaveLevel::PERFORMANCE
+                                        : WifiPowerSaveLevel::BALANCED);
+}
+
 extern "C" void app_main(void) {
     esp_err_t error = nvs_flash_init();
     if (error == ESP_ERR_NVS_NO_FREE_PAGES || error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -907,9 +914,19 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(error);
 
     xz_heap_report("t0_boot");
-    // 收音机 MP3 解码器内存池: 在最早期(此时堆 largest≈114KB)抢下, 否则
-    // WiFi 连接后堆碎片化(largest 仅 ~7.6KB)会导致解码器分配失败、收音机无声。
-    radio_player_prewarm();
+
+    // 开机预热收音机解码器池 —— 必须在**任何**大块内存被占用之前完成:
+    // 此时 heap largest=114688。HANDOFF 第 6 节把这一步列在 LVGL/UI 初始化
+    // 之前是有原因的: LVGL + V6 框架对象树会吃掉约 46KB, 等框架建完再预热
+    // 就只剩 90KB 可用, 且 WiFi/音频/桥接随后再层层分割, 最终播放期
+    // largest 掉到 2~3KB —— socket() 拿不到内部 RAM, 每 ~18s 重试一次, 满载发热。
+    //
+    // 2026-10-12 回归修复: 这个调用曾被整体删掉, 解码器改到 radio_app_enter()
+    // 才在碎片堆上抢占, 实测 DMA 可用仅剩 60~184 字节 -> 收音机永远连不上。
+    if (!radio_player_prewarm()) {
+        ESP_LOGW(kTag, "Radio prewarm failed; decoder will be allocated lazily");
+    }
+    xz_heap_report("post_radio_prewarm");
     ESP_ERROR_CHECK(bsp_display_init());
     if (!bsp_lvgl_init()) {
         ESP_LOGE(kTag, "Display initialization failed");
@@ -933,12 +950,55 @@ extern "C" void app_main(void) {
         lv_timer_create(ui_flush_timer_cb, 30, nullptr);
         bsp_lvgl_unlock();
     }
-    xz_heap_report("t1_before_radio");
+    // Create input before the WiFi driver takes its internal buffers. The
+    // remaining contiguous heap after WiFi init is too small for this task.
+    s_key_queue = xQueueCreate(10, sizeof(KeyMessage));
+    // 切换到 iot_button 组件回调驱动(原厂同路径): 修复三键失灵。
+    // 轮询 button_task 的 oneshot 读数恒 2984mV 且按键无变化, 原因未明,
+    // 组件驱动(连续采样+组件消抖)是原厂验证过的路径。
+    if (!s_key_queue) {
+        ESP_LOGE(kTag, "Key queue create failed");
+        return;
+    }
+    ESP_ERROR_CHECK(bsp_button_init(button_event_bridge, nullptr));
+    if (xTaskCreate(input_task, "radio_input", 3072, nullptr, 5, nullptr) != pdPASS) {
+        ESP_LOGE(kTag, "Input task create failed");
+        return;
+    }
+
+    // The V6 home screen owns most LVGL objects. Build it before the WiFi
+    // driver takes its internal buffers; otherwise LVGL's malloc assertion
+    // halts app_main on the remaining ~27KB and the task watchdog fires.
+    app_framework_init();
+    xz_heap_report("post_framework_pre_wifi");
+
+    xz_heap_report("pre_wifi_init");
+    auto &manager = WifiManager::GetInstance();
+    WifiManagerConfig config;
+    config.ssid_prefix = "LEO Radio";
+    config.fixed_ap_ssid = "LEO Radio";
+    config.language = "zh-CN";
+    config.station_hostname = "ai-radio";
+    config.station_scan_min_interval_seconds = 5;
+    config.station_scan_max_interval_seconds = 30;
+    if (!manager.Initialize(config)) {
+        ESP_LOGE(kTag, "Wi-Fi driver initialization failed");
+        return;
+    }
+    xz_heap_report("post_wifi_init");
+    // WiFi driver is already initialized before the radio decoder pool.
+    manager.SetEventCallback(wifi_event);
+
+    // I2S DMA and the ES8311 codec need a contiguous internal-RAM block.
+    // Wi-Fi init must claim its buffers first; afterward the reduced 4x128
+    // DMA pool fits in the remaining largest block.
     if (!radio_player_init()) {
         radio_ui_set_playback(RadioPlaybackState::Error, "音频初始化失败");
         ESP_LOGE(kTag, "Audio player initialization failed");
         return;
     }
+    xz_heap_report("post_audio_init");
+
     // ---- 小智 opus 编码器: 不在此预热 ----
     // 编码器(25KB 连续块)与收音机 MP3 解码器互斥: 开机预热会让收音机
     // 报 "There is no memory for MP3 required" 完全播不了。改为进小智 app
@@ -955,43 +1015,6 @@ extern "C" void app_main(void) {
         ESP_LOGW(kTag, "Sleep timer initialization failed");
     }
 
-    s_key_queue = xQueueCreate(10, sizeof(KeyMessage));
-    // 切换到 iot_button 组件回调驱动(原厂同路径): 修复三键失灵。
-    // 轮询 button_task 的 oneshot 读数恒 2984mV 且按键无变化, 原因未明,
-    // 组件驱动(连续采样+组件消抖)是原厂验证过的路径。
-    if (!s_key_queue) {
-        ESP_LOGE(kTag, "Key queue create failed");
-        return;
-    }
-    ESP_ERROR_CHECK(bsp_button_init(button_event_bridge, nullptr));
-    if (xTaskCreate(input_task, "radio_input", 4096, nullptr, 5, nullptr) != pdPASS) {
-        ESP_LOGE(kTag, "Input task create failed");
-        return;
-    }
-
-    // ---- V6 框架: 首页桌面+应用菜单 ----
-    app_framework_init();
-
-    auto &manager = WifiManager::GetInstance();
-    WifiManagerConfig config;
-    config.ssid_prefix = "LEO Radio";
-    config.fixed_ap_ssid = "LEO Radio";
-    config.language = "zh-CN";
-    config.station_hostname = "ai-radio";
-    config.station_scan_min_interval_seconds = 5;
-    config.station_scan_max_interval_seconds = 30;
-    if (!manager.Initialize(config)) {
-        radio_ui_set_playback(RadioPlaybackState::Error, "无线网络初始化失败");
-        return;
-    }
-    manager.SetEventCallback(wifi_event);
-
-    // The existing screenshot task owns USB and connection timeout checks.
-    // Start monitoring on the homepage after reserving the radio decoder pool.
-    esp_err_t bridge_result = coding_bridge_init();
-    if (bridge_result != ESP_OK) {
-        ESP_LOGW(kTag, "Codex bridge startup failed: %s", esp_err_to_name(bridge_result));
-    }
 
     auto &ssid_manager = SsidManager::GetInstance();
     const auto &saved_networks = ssid_manager.GetSsidList();
@@ -1006,8 +1029,27 @@ extern "C" void app_main(void) {
         manager.StartStation();
     }
 
-    if (xTaskCreate(connection_watchdog_task, "radio_wifi_guard", 3072, nullptr, 4,
-                    nullptr) != pdPASS) {
+    // WiFi station setup allocates event nodes and netif state. Start the
+    // bridge only after those allocations so the bridge task cannot starve
+    // the WiFi event loop during boot.
+    // 只装 USB 侧: 无线 socket 桥(TCP 8765 + UDP 8764 + 5KB 任务栈)实测常驻
+    // ~15KB 内部 RAM, 开机就常驻会把收音机解码池挤到碎片上(见 FEATURE_STATUS
+    // "Codex 桥接: 从开机启动改为进入 Codex 应用时初始化")。无线侧改由
+    // coding_bridge_start_wireless() 在进 Codex 应用时按需拉起。
+    esp_err_t bridge_result = coding_bridge_init_usb_only();
+    xz_heap_report("post_coding_bridge");
+    if (bridge_result != ESP_OK) {
+        ESP_LOGW(kTag, "Codex USB bridge startup failed: %s", esp_err_to_name(bridge_result));
+    }
+
+    // 用静态栈创建: 这条任务负责"30s 拿不到网就开配网门户", 属于兜底安全网,
+    // 绝不能因为开机瞬间堆紧张而静默消失(实测 post_coding_bridge 时
+    // largest 仅 1024 字节, xTaskCreate(2048) 直接失败 -> "Wi-Fi watchdog task
+    // failed", 于是断网后永远进不了配网页)。
+    static StackType_t s_wifi_guard_stack[2048];
+    static StaticTask_t s_wifi_guard_tcb;
+    if (xTaskCreateStatic(connection_watchdog_task, "radio_wifi_guard", 2048,
+                          nullptr, 4, s_wifi_guard_stack, &s_wifi_guard_tcb) == NULL) {
         ESP_LOGE(kTag, "Wi-Fi watchdog task failed");
     }
     ESP_LOGI(kTag, "Internet radio ready");

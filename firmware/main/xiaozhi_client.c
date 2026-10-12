@@ -16,6 +16,8 @@
 #include "cJSON.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "xiaozhi_connect_guard.h"
+#include "xiaozhi_client.h"
 
 #include "bsp_audio.h"
 #include "esp_wifi.h"
@@ -38,19 +40,17 @@ void xz_heap_report(const char *tag) {
 #define XZ_WS_URL_DEFAULT "wss://api.tenclass.net/xiaozhi/v1/"
 // ---- 诊断开关(默认全 0; 排查时按需置 1) ----
 #define RELAY_MODE 0               // 1=经电脑中继 TCP1443 转发 443
-#define PLAIN_WS_TEST 0            // 1=连本地明文 WS(8089)抓包
+#define PLAIN_WS_TEST 0            // 1=本机假服务器联调; 发布固件必须为 0
 #define RELAY_MODE_OTA_BIGTEST 0   // 1=OTA 走电脑本地 8080 大响应
-// 诊断用：改成运行中继/抓包脚本的那台电脑的局域网 IP（下面三个开关默认关闭）
-#define XZ_RELAY_HOST "192.168.1.100"
 
 #if RELAY_MODE_OTA_BIGTEST
-#define XZ_OTA_URL      "http://" XZ_RELAY_HOST ":8080/xiaozhi/ota/"   // 大响应接收实验
+#define XZ_OTA_URL      "http://192.168.0.35:8080/xiaozhi/ota/"   // 大响应接收实验
 #else
 // ⚠ 必须用**正式服** xiaozhi.me, 不能用公共测试服 api.tenclass.net:
 //   测试服对任何 MAC 都直接返回 websocket 配置, **永不返回 activation**,
 //   因此设备码永远出不来(用户"打开什么都没有"的根因)。
 //   正式服 https://xiaozhi.me/api/ota/ 在设备未绑定时返回:
-//     {"activation":{"code":"961572","message":"xiaozhi.me",
+//     {"activation":{"code":"961572","message":"xiaozhi.me
 //                    "challenge":"<uuid>"}}
 //   用户拿 code 去 xiaozhi.me 绑定后, 后续请求即返回 websocket 配置。
 //   用 https(会 301 到 https, disable_auto_redirect=false 自动跟随); OTA 发生
@@ -65,6 +65,9 @@ static volatile bool s_listening;
 static char s_session_id[64];
 static char s_client_id[40];    // UUIDv4, NVS 持久化(参考固件 xiaozhi_store 做法)
 static int  s_proto_version = 3; // OTA 返回的协议版本
+// 重组后的单个 WS 帧最大字节数。60ms@16k Opus 远小于此, 留足余量。
+// 放在 .bss: 必须在 WS 回调里做分片拼装, 但绝不能在栈上开这么大缓冲。
+#define XZ_WS_FRAME_MAX 512
 static char s_url[256];
 static char s_token[192];
 static char s_stt_text[256];     // last recognized text
@@ -74,17 +77,66 @@ static char s_tts_text[256];     // last tts sentence
 static char s_activation_code[32];
 static char s_activation_msg[192];
 static bool s_activated;         // 已激活(OTA 未返回 activation 段)
+static bool s_config_cached;     // OTA 成功过: 已缓存 ws url/token, 重连时可跳过 TLS OTA
+static int  s_cached_ver = 3;   // 缓存的协议版本
 static QueueHandle_t s_event_queue;   // ui events: enum xz_ui_event + text ptr
 
-typedef enum {
-    XZ_EV_WS_OPENED = 0,
-    XZ_EV_WS_CLOSED,
-    XZ_EV_STT,          // user speech recognized -> s_stt_text
-    XZ_EV_TTS_START,    // answer start -> s_tts_text
-    XZ_EV_TTS_STOP,
-    XZ_EV_ERROR,
-    XZ_EV_ACTIVATION,   // device needs activation -> s_activation_code
-} xz_ui_event_t;
+// The UI task can request exit while the blocking connect task is inside OTA
+// or WebSocket setup. Keep the ownership decision in one tiny state machine:
+// only the task that owns the connection is allowed to close it.
+static xz_connect_guard_t s_connect_guard;
+static portMUX_TYPE s_connect_guard_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool xz_cancel_requested(void)
+{
+    portENTER_CRITICAL(&s_connect_guard_mux);
+    const bool requested = xz_connect_guard_is_cancelled(&s_connect_guard);
+    portEXIT_CRITICAL(&s_connect_guard_mux);
+    return requested;
+}
+
+static bool xz_connect_begin(void)
+{
+    portENTER_CRITICAL(&s_connect_guard_mux);
+    const bool begun = xz_connect_guard_begin(&s_connect_guard);
+    portEXIT_CRITICAL(&s_connect_guard_mux);
+    return begun;
+}
+
+static bool xz_connect_finish(void)
+{
+    portENTER_CRITICAL(&s_connect_guard_mux);
+    const bool cancelled = xz_connect_guard_finish(&s_connect_guard);
+    portEXIT_CRITICAL(&s_connect_guard_mux);
+    return cancelled;
+}
+
+
+bool xiaozhi_client_reset_cancel(void)
+{
+    portENTER_CRITICAL(&s_connect_guard_mux);
+    const bool idle = !xz_connect_guard_is_active(&s_connect_guard);
+    if (idle) xz_connect_guard_reset(&s_connect_guard);
+    portEXIT_CRITICAL(&s_connect_guard_mux);
+    return idle;
+}
+
+bool xiaozhi_client_cancel(void)
+{
+    portENTER_CRITICAL(&s_connect_guard_mux);
+    const bool close_now = xz_connect_guard_request_cancel(&s_connect_guard);
+    portEXIT_CRITICAL(&s_connect_guard_mux);
+
+    // If a connect task owns the handle, it must perform the close itself.
+    // Closing from here while OTA/WebSocket is using the handle is a UAF race.
+    if (close_now) xiaozhi_client_close();
+    return close_now;
+}
+
+bool xiaozhi_client_is_cancelled(void)
+{
+    return xz_cancel_requested();
+}
 
 bool xiaozhi_client_is_open(void) { return s_ws_open; }
 const char *xiaozhi_client_stt(void) { return s_stt_text; }
@@ -154,6 +206,10 @@ static bool ota_fetch_config(void)
     cfg.max_redirection_count = 4;
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) return false;
+    if (xz_cancel_requested()) {
+        esp_http_client_cleanup(c);
+        return false;
+    }
     esp_http_client_set_header(c, "Content-Type", "application/json");
     esp_http_client_set_header(c, "Accept", "application/json");
     esp_http_client_set_header(c, "Accept-Language", "zh-CN");
@@ -167,6 +223,10 @@ static bool ota_fetch_config(void)
         esp_http_client_cleanup(c);
         return false;
     }
+    if (xz_cancel_requested()) {
+        esp_http_client_cleanup(c);
+        return false;
+    }
     esp_http_client_write(c, post, strlen(post));
     esp_http_client_fetch_headers(c);
     const int status = esp_http_client_get_status_code(c);
@@ -175,6 +235,7 @@ static bool ota_fetch_config(void)
     memset(buf, 0, sizeof(buf));
     int read_total = 0;
     while (read_total < (int)sizeof(buf) - 1) {
+        if (xz_cancel_requested()) break;
         int n = esp_http_client_read(c, buf + read_total, sizeof(buf) - 1 - read_total);
         if (n <= 0) break;
         read_total += n;
@@ -182,6 +243,7 @@ static bool ota_fetch_config(void)
     buf[read_total] = 0;
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
+    if (xz_cancel_requested()) return false;
     ESP_LOGW(TAG, "OTA_BIGTEST: body %d bytes", read_total);
     if (read_total <= 0) { ESP_LOGE(TAG, "OTA no response"); return false; }
 
@@ -271,19 +333,21 @@ static bool ota_fetch_config(void)
         ESP_LOGW(TAG, "TLS-free mode: ws url=%.60s", s_url);
     }
 #if RELAY_MODE
-    snprintf(s_url, sizeof(s_url), "wss://" XZ_RELAY_HOST ":1443/xiaozhi/v1/");
+#endif
+#if RELAY_MODE
+    snprintf(s_url, sizeof(s_url), "wss://192.168.0.35:1443/xiaozhi/v1/");
     ESP_LOGW(TAG, "RELAY_MODE: url=%s", s_url);
 #endif
 #if PLAIN_WS_TEST
-    snprintf(s_url, sizeof(s_url), "ws://" XZ_RELAY_HOST ":8089/xiaozhi/v1/");
+    snprintf(s_url, sizeof(s_url), "ws://192.168.0.33:8799/xiaozhi/v1/");
     ESP_LOGW(TAG, "PLAIN_WS_TEST url=%s", s_url);
 #endif
     ESP_LOGI(TAG, "OTA ok: url=%.60s token=%d chars", s_url, (int)strlen(s_token));
+    s_config_cached = true;
     return true;
 }
 
 // ---- WS events ----
-static bool opus_encoder_init(void);   // 前置声明(WS 连上后预热用)
 
 static void xiaozhi_send_client_hello(void)
 {
@@ -298,6 +362,210 @@ static void xiaozhi_send_client_hello(void)
     ESP_LOGI(TAG, "client hello sent: %d bytes", sent);
 }
 
+/* ---- TTS 下行: Opus 解码 ----
+ * 服务器的语音回复是**二进制** websocket 帧(op_code 0x2), 载荷是 Opus。
+ * 原实现只处理文本帧(0x1), 因此设备能听懂、能显示文字, 但永远不出声。
+ * libopus 的编码器/解码器同处一个库(esp_audio_codec), 解码器函数此前
+ * 因无人调用被链接器裁掉, 补上声明即可。
+ * 与编码器同样用静态 arena: 解码器 state 在 C3 上也要 ~20KB, 堆碎了拿不到。
+ */
+extern int opus_decoder_get_size(int channels);
+extern int opus_decoder_init(void *st, int Fs, int channels, int *error);
+extern int opus_decode(void *st, const unsigned char *data, int len,
+                       short *pcm, int frame_size, int decode_fec);
+// 解码器 state 按需分配(见上方说明), 首次 TTS 帧到达时才从堆里取。
+static bool s_decoder_ready;
+
+/* ---- TTS 下行: Opus 解码 + 播放 ----
+ * 一帧服务器 Opus -> 16kHz 单声道 PCM -> I2S。frame_duration 在 hello 里
+ * 协商为 60ms, 即每帧 960 采样(与上行 XZ_CHUNK_SAMPLES 对称)。
+ *
+ * ⚠⚠ 为什么必须有独立播放任务(这是"小智不出声"的真正原因, 2026-10-12 定位):
+ *   opus_decode() 内部走 silk_decode_frame(), 其栈需求远超 3KB。之前直接
+ *   在 websocket 事件回调里解码, 实测必崩:
+ *     Guru Meditation: Stack protection fault
+ *     Detected in task "websocket_task" ... Stack bounds: 0x3fcd9d50-0x3fcda940
+ *     MEPC: 0x42096926 (silk_decode_frame)
+ *   websocket 任务的栈只有 3072 字节(cfg.task_stack), 第一帧就踩穿栈保护区。
+ *   把栈调大到 20KB+ 会重演开机 RAM 墙(WiFi ESP_ERR_NO_MEM), 因此改为:
+ *     websocket 回调只做"收包 + 拷贝", 解码/写 I2S 交给下面这个**静态栈**
+ *     任务, 它的栈足够 silk/celt 跑, 且不跟 WiFi 抢大块连续堆。
+ */
+#define OPUS_DEC_OK 0
+// 60ms@16k = 960 采样; 给到 1152(2.3KB) 足够容纳服务端偶发的 120ms 帧。
+#define XZ_TTS_PCM_CAPACITY 1152
+#define XZ_TTS_QUEUE_DEPTH 4          // 约 0.24s 缓冲, 抗网络抖动
+#define XZ_TTS_MAX_OPUS 256           // 单帧上限; 60ms@24kbps ≈ 180B
+// ⚠ 单位是"字节": 本平台 portSTACK_TYPE == uint8_t(见 RISC-V portmacro.h),
+//   所以 12288 就是 12KB 栈, 不是 12K words。
+//   实测阶梯: 3KB(websocket_task 原值)必崩; 8KB 仍在 silk_decode_frame 崩;
+//   故给到 12KB, 再由下面的 high water 日志实测校准到"够用且不浪费"。
+#define XZ_TTS_STACK_WORDS 12288
+#define XZ_TTS_PRIO 6                 // 高于 WS(5), 保证下行不积压; 低于 LVGL 主循环压力可控
+
+typedef struct {
+    int len;                 // 有效字节数 (<= 0 表示停止标记)
+    uint8_t data[XZ_TTS_MAX_OPUS];
+} xz_tts_item_t;
+
+static short s_tts_pcm[XZ_TTS_PCM_CAPACITY];
+static QueueHandle_t s_tts_queue;
+static StackType_t s_tts_stack_storage[XZ_TTS_STACK_WORDS];
+static StaticTask_t s_tts_tcb;
+static TaskHandle_t s_tts_task;
+static volatile bool s_tts_running;
+
+static void *s_opus_dec_state;
+
+static bool xz_opus_decoder_ensure(void)
+{
+    if (s_decoder_ready) return true;
+    const int need = opus_decoder_get_size(1);
+    if (need <= 0) {
+        ESP_LOGE(TAG, "opus decoder size invalid: %d", need);
+        return false;
+    }
+    void *st = heap_caps_malloc((size_t)need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!st) {
+        ESP_LOGW(TAG, "opus decoder alloc failed (need=%d, largest=%u)", need,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return false;
+    }
+    int err = 0;
+    if (opus_decoder_init(st, 16000, 1, &err) != OPUS_DEC_OK) {
+        ESP_LOGE(TAG, "opus decoder init failed: %d", err);
+        free(st);
+        return false;
+    }
+    s_opus_dec_state = st;
+    s_decoder_ready = true;
+    ESP_LOGI(TAG, "opus decoder ready: state=%d bytes", need);
+    return true;
+}
+
+void xz_opus_decoder_release(void)
+{
+    if (!s_decoder_ready) return;
+    // libopus 解码器没有额外堆资源, 直接归还 state 内存。
+    free(s_opus_dec_state);
+    s_opus_dec_state = NULL;
+    s_decoder_ready = false;
+}
+
+// 播放任务: 从队列取 Opus 帧 -> 解码 -> 写 I2S。栈独占给 silk/celt 用。
+static void xz_tts_play_task(void *arg)
+{
+    (void)arg;
+    bool fmt_ready = false;
+    uint32_t played = 0;
+    ESP_LOGI(TAG, "tts task stack: %u bytes free of %d (high water at start)",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL), XZ_TTS_STACK_WORDS);
+    for (;;) {
+        xz_tts_item_t item;
+        if (xQueueReceive(s_tts_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+        if (item.len <= 0) break;              // 停止标记
+        if (!xz_opus_decoder_ensure()) continue;
+        if (!fmt_ready) {
+            // 每轮播报只在这里 set 一次格式: 每帧调 set_format 会反复
+            // close/open codec, 既爆音又把播放切成碎片。
+            if (bsp_audio_set_format(16000, 16, 1) != ESP_OK) {
+                ESP_LOGE(TAG, "tts audio format failed");
+                continue;
+            }
+            fmt_ready = true;
+        }
+        // decode_fec=0: 不做前向纠错(下行是完整帧)。
+        const int samples = opus_decode(s_opus_dec_state, item.data, item.len,
+                                        s_tts_pcm, XZ_TTS_PCM_CAPACITY, 0);
+        if (samples <= 0) continue;           // 静音/结束帧返回 0, 不是错误
+        const size_t bytes = (size_t)samples * sizeof(short);
+        if (bsp_audio_write(s_tts_pcm, bytes) == ESP_OK) {
+            if (++played <= 3) {
+                ESP_LOGI(TAG, "tts frame decoded+played: samples=%d bytes=%u (n=%u)",
+                         samples, (unsigned)bytes, (unsigned)played);
+            }
+        }
+    }
+    // 打印栈高水位: 用来把 XZ_TTS_STACK_WORDS 调到"够用且不浪费"的实测值,
+    // 而不是靠猜。0 = 从未溢出, 数字 = 剩余字节数。
+    ESP_LOGI(TAG, "tts task stack high water: %u bytes free of %d",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL), XZ_TTS_STACK_WORDS);
+    s_tts_running = false;
+    fmt_ready = false;
+    s_tts_task = NULL;
+    vTaskDelete(NULL);
+}
+
+// 供 WS 回调调用: 启动播放任务(懒启动, 只在真有语音时占用栈)。
+static void xz_tts_play_start(void)
+{
+    if (s_tts_task) return;
+    if (!s_tts_queue) {
+        s_tts_queue = xQueueCreate(XZ_TTS_QUEUE_DEPTH, sizeof(xz_tts_item_t));
+        if (!s_tts_queue) {
+            ESP_LOGE(TAG, "tts queue create failed");
+            return;
+        }
+    }
+    s_tts_running = true;
+    s_tts_task = xTaskCreateStatic(xz_tts_play_task, "xz_tts", XZ_TTS_STACK_WORDS,
+                                   NULL, XZ_TTS_PRIO, s_tts_stack_storage, &s_tts_tcb);
+    if (!s_tts_task) {
+        ESP_LOGE(TAG, "tts task create failed");
+        s_tts_running = false;
+    }
+}
+
+// 只丢弃还没播的帧, 不动播放任务本身。
+// 用于 WS 断开这类"随时可能再来新帧"的场景: 绝不能在这里阻塞等任务退出,
+// 也不能释放解码器 state —— 那两件事由 xz_tts_play_stop 在真正的会话收尾时做。
+static void xz_tts_play_discard(void)
+{
+    if (s_tts_queue) xQueueReset(s_tts_queue);
+}
+
+// 停止播放任务并清空残留帧。会话结束/退出小智时调用。
+// ⚠ 必须等任务真正退出后才能释放解码器 state, 否则任务里的 opus_decode
+//   会用到已 free 的内存(实测表现为随机 HardFault)。
+void xz_tts_play_stop(void)
+{
+    xz_tts_play_discard();
+    if (!s_tts_task) return;
+    const xz_tts_item_t stop = {.len = 0};
+    xQueueSend(s_tts_queue, &stop, pdMS_TO_TICKS(200));
+    for (int i = 0; i < 100 && s_tts_task; ++i) vTaskDelay(pdMS_TO_TICKS(20));
+    if (s_tts_task) {
+        // 极端情况下任务没在 2s 内退出: 放弃释放解码器, 宁可泄漏 17KB 也不能
+        // 制造 use-after-free。下次进小智会重新分配(见 xz_opus_decoder_ensure)。
+        ESP_LOGW(TAG, "tts task did not exit in time; keep decoder state");
+        return;
+    }
+    xz_opus_decoder_release();
+}
+
+// 把一个二进制 Opus 帧排队给播放任务。返回是否收下。
+static bool xz_tts_enqueue_opus_frame(const uint8_t *data, int len)
+{
+    if (data == NULL || len <= 0) return false;
+    if (len > XZ_TTS_MAX_OPUS) {
+        // 超长帧直接丢, 不截断: 截断后的 Opus 数据必然解不出正确音频。
+        static int oversize = 0;
+        if (++oversize <= 3)
+            ESP_LOGW(TAG, "tts opus frame too large: %d bytes (max=%d)", len, XZ_TTS_MAX_OPUS);
+        return false;
+    }
+    xz_tts_play_start();
+    if (!s_tts_queue) return false;
+    // 静态: 本函数跑在 3KB 的 websocket_task 上, 400 字节的局部变量会
+    // 进一步压缩它本就不够用的栈。只有 WS 回调这一个写者, 无需加锁。
+    static xz_tts_item_t item;
+    item.len = len;
+    memcpy(item.data, data, (size_t)len);
+    // 0 tick: 队列满就丢这一帧。阻塞在 WS 回调里会导致整条 WS 停止收包,
+    // 反而把后续所有帧都拖死(丢一帧只是 60ms 音频轻微卡顿)。
+    return xQueueSend(s_tts_queue, &item, 0) == pdTRUE;
+}
+
 static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     esp_websocket_event_data_t *e = (esp_websocket_event_data_t *)data;
@@ -310,6 +578,70 @@ static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data
         s_ws_connected = true;         // 只置标志; hello 由连接任务在正常上下文发送
         break;
     case WEBSOCKET_EVENT_DATA: {
+        // ---- 二进制帧: 服务器下发的 TTS 语音(Opus)。此前完全没处理, 所以
+        // 小智"能听懂但不说话"。协议头见官方 main/protocols/protocol.h:
+        //   v3: type(1) reserved(1) payload_size(2 BE) payload[]
+        //   v2: version(2 BE) type(2 BE) reserved(4) timestamp(4) size(4 BE)
+        //
+        // ⚠ 这里只做"重组 + 拷贝", 绝不碰 opus_decode: 本回调跑在 3KB 栈的
+        //   websocket_task 上, silk 解码会踩穿栈(见 xz_tts_play_task 上方说明)。
+        // ⚠ 超过 buffer_size 的帧会被 esp_websocket_client 拆成多次 DATA 事件,
+        //   必须按 payload_offset 拼回完整帧再解析, 否则长度字段必然对不上。
+        if (e->op_code == 0x2 && e->data_ptr && e->data_len > 0) {   // binary
+            const uint8_t *p = (const uint8_t *)e->data_ptr;
+            int len = e->data_len;
+            // 分片重组: 累积到一个静态缓冲, fin 时才解析。
+            static uint8_t s_bin_buf[XZ_WS_FRAME_MAX];
+            static int s_bin_len;
+            if (e->payload_offset == 0) s_bin_len = 0;   // 新帧开始
+            if (s_bin_len < 0 || s_bin_len + len > XZ_WS_FRAME_MAX) {
+                // 单帧超出上限: 丢弃并等下一个 fin, 避免越界写。
+                if (e->fin) s_bin_len = 0;
+            } else {
+                memcpy(s_bin_buf + s_bin_len, p, (size_t)len);
+                s_bin_len += len;
+            }
+            if (!e->fin) break;      // 等后续分片
+            if (s_bin_len <= 0) break;
+            const int flen = s_bin_len;
+            s_bin_len = 0;
+            const uint8_t *f = s_bin_buf;
+
+            const uint8_t *payload = NULL;
+            int payload_len = 0;
+            int frame_type = -1;
+            if (s_proto_version >= 3) {
+                if (flen >= 4) {
+                    frame_type = f[0];
+                    payload_len = (int)(((uint16_t)f[2] << 8) | f[3]);
+                    payload = f + 4;
+                    if (payload_len <= 0 || payload_len > flen - 4) payload = NULL;
+                }
+            } else {
+                if (flen >= 16) {
+                    frame_type = (int)(((uint16_t)f[2] << 8) | f[3]);
+                    uint32_t size = ((uint32_t)f[12] << 24) | ((uint32_t)f[13] << 16) |
+                                   ((uint32_t)f[14] << 8) | (uint32_t)f[15];
+                    payload = f + 16;
+                    payload_len = (int)size;
+                    if (payload_len <= 0 || payload_len > flen - 16) payload = NULL;
+                }
+            }
+            // type 0 = OPUS 音频, 1 = JSON 控制消息(走文本通道处理)
+            if (payload && frame_type == 0) {
+                static int tts_seen = 0;
+                if (++tts_seen <= 2)
+                    ESP_LOGI(TAG, "tts binary frame: %d payload=%d (proto v%d)",
+                             flen, payload_len, s_proto_version);
+                xz_tts_enqueue_opus_frame(payload, payload_len);
+            } else if (payload == NULL && flen > 16) {
+                static int bad = 0;
+                if (++bad <= 3)
+                    ESP_LOGW(TAG, "tts binary frame malformed: total=%d declared=%d (proto v%d)",
+                             flen, payload_len, s_proto_version);
+            }
+            break;
+        }
         if (e->op_code == 0x1 && e->data_ptr && e->data_len > 0) {   // text
             char *tmp = malloc(e->data_len + 1);
             if (!tmp) break;
@@ -359,6 +691,9 @@ static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data
     case WEBSOCKET_EVENT_CLOSED:
         s_ws_open = false;
         s_listening = false;
+        // 连接断了就丢弃还没播的语音帧, 免得断线后还冒出半句。
+        // 这里只丢帧不停任务: 本回调跑在 websocket_task 上, 不能阻塞等任务退出。
+        xz_tts_play_discard();
         ESP_LOGW(TAG, "WS closed");
         break;
     case WEBSOCKET_EVENT_ERROR:
@@ -372,7 +707,7 @@ static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data
 // ---- connect / hello / close ----
 static bool ws_connect_and_hello(void)
 {
-    if (!s_url[0]) return false;
+    if (!s_url[0] || xz_cancel_requested()) return false;
     // 认证头必须在 init 前经 cfg.headers 传入(握手前 set_headers 无效, 会返回 INVALID_ARG)
     char headers[384];
     char dev_id[18];
@@ -412,21 +747,30 @@ static bool ws_connect_and_hello(void)
     s_ws = esp_websocket_client_init(&cfg);
     xz_heap_report("ws_post_init");
     if (!s_ws) return false;
+    if (xz_cancel_requested()) return false;
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_cb, NULL);
     xz_heap_report("ws_pre_start");
     s_ws_connected = false;
+    if (xz_cancel_requested()) return false;
     if (esp_websocket_client_start(s_ws) != ESP_OK) return false;
     // 等 WS 真正进入 CONNECTED 状态(事件回调早于状态更新, 必须用 is_connected 轮询)
     for (int i = 0; i < 150; ++i) {
+        if (xz_cancel_requested()) return false;
         if (esp_websocket_client_is_connected(s_ws)) { s_ws_connected = true; break; }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    if (xz_cancel_requested()) return false;
     if (!s_ws_connected) { ESP_LOGW(TAG, "ws connect timeout"); return false; }
     vTaskDelay(pdMS_TO_TICKS(50));   // 让 ws 任务完成状态切换
     // 在正常上下文发客户端 hello(官方 xiaozhi-esp32 同款顺序)
+    if (xz_cancel_requested()) return false;
     xiaozhi_send_client_hello();
     // 等服务器 hello
-    for (int i = 0; i < 120 && !s_ws_open; ++i) vTaskDelay(pdMS_TO_TICKS(100));
+    for (int i = 0; i < 120 && !s_ws_open; ++i) {
+        if (xz_cancel_requested()) return false;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (xz_cancel_requested()) return false;
     if (!s_ws_open) { ESP_LOGW(TAG, "no server hello within 12s"); return false; }
     return s_ws_open;
 }
@@ -457,141 +801,156 @@ void xiaozhi_client_close(void)
     s_ws_connected = false;
 }
 
-// ---- mic capture: 16k PCM -> opus -> ws binary ----
-// (v1 ������: ������ hello ��������� opus; ������60ms=960������, ������320���������3���������? 
-//  ������������: ������������ PCM ��������� ��� ������������ opus������ esp_audio_codec ��� opus enc)
-#include "esp_audio_enc.h"
-#include "esp_opus_enc.h"
-#include "esp_audio_enc_default.h"
+// ---- mic capture: 16k PCM -> Opus -> ws binary ----
+// The xiaozhi wire protocol always carries Opus.  Do not allocate the encoder
+// state from the fragmented heap: after TLS/radio activity ESP32-C3 often has
+// only ~11KB contiguous, while Opus needs a ~25KB state block.  libopus exposes
+// opus_encoder_get_size()/opus_encoder_init(), so the encoder lives in one
+// aligned static arena and never allocates from the heap.
+#define XZ_CHUNK_SAMPLES 960   // 60ms @16k
+// ⚠ 这个值必须贴近 opus_encoder_get_size(1) 的实测值(24524), 不要图省事写大:
+//   C3 只有 ~330KB 可用 RAM, 每多占 1KB 静态内存都可能在开机时把 I2S 的
+   //   DMA 描述符挤掉 -> "i2s tx 初始化失败: ESP_ERR_NO_MEM"(实测 2026-10-12)。
+#define XZ_OPUS_STATE_CAPACITY 24576
+// ⚠ 这块静态栈 + TTS 播放栈是全局 .bss 的最大头。C3 只有 ~330KB RAM,
+//   每多占 1KB 都会在开机时被 WiFi 的 RF 校准抢不到 DMA 而死循环:
+//     phy_init: failed to allocate memory for RF calibration data -> abort()
+//   (实测 2026-10-12: post_audio_init dma 掉到 308 字节时必现, 5748 才安全)
+//   因此这里取 22KB 而非 32KB, 并在录音任务里打印栈高水位实测校准。
+#define XZ_MIC_STACK_WORDS 22528
+#define OPUS_OK 0
+#define OPUS_APPLICATION_VOIP 2048
+#define OPUS_SET_BITRATE_REQUEST 4002
+#define OPUS_SET_VBR_REQUEST 4006
+#define OPUS_SET_COMPLEXITY_REQUEST 4010
+#define OPUS_SET_INBAND_FEC_REQUEST 4012
+#define OPUS_SET_DTX_REQUEST 4016
 
-static esp_audio_enc_handle_t s_opus_enc;
-static uint8_t s_opus_out[1024];   // 10ms@24kbps opus 单帧 <<100B, 1KB 足够
+extern int opus_encoder_get_size(int channels);
+extern int opus_encoder_init(void *st, int Fs, int channels, int application);
+extern int opus_encoder_ctl(void *st, int request, ...);
+extern int opus_encode(void *st, const short *pcm, int frame_size,
+                       unsigned char *data, int max_data_bytes);
+
+static uint8_t s_opus_state[XZ_OPUS_STATE_CAPACITY] __attribute__((aligned(4)));
+static int s_opus_state_size;
 static bool s_encoder_ready;
-static bool s_encoder_gave_up;     // 本轮初始化失败后不再重试(防反复分配失败发热)
+static bool s_encoder_gave_up;
 
-// mic 任务栈:**随 opus 编码器一起预分配**(进小智时, 此时收音机池已释放,
-// 堆还有大连续块)。若等到长按录音时再分配, 堆已被 opus(25KB)切碎,
-// 18KB 连续块拿不到 -> "mic task create failed"(实测)。
-#define XZ_MIC_STACK_WORDS 18432   // 18KB, SILK 栈深实测需 >=17.2KB
+// Opus CELT stack use exceeds 18KB; keep the capture task on static storage so
+// it also cannot fail because of heap fragmentation.
 static StackType_t s_mic_stack_storage[XZ_MIC_STACK_WORDS];
-static StackType_t *s_mic_stack = s_mic_stack_storage; // 静态栈，避免和 Opus 抢连续堆
 static StaticTask_t s_mic_tcb;
+static TaskHandle_t s_mic_task;
 
-// 供 main 调用(当前 main 不再开机预热, 保留接口以兼容)
-bool xiaozhi_opus_prewarm(void) {
-    // 先抢 mic 栈(18KB 连续块), 再抢 opus 编码器(25KB): 顺序反了会因
-    // opus 造成的碎片导致 mic 栈分配失败。
-    // 录音任务栈使用静态存储，Opus 可以独占 OTA 后的连续堆块。
-    return opus_encoder_init();
-}
-
-// 释放编码器内存: 小智与收音机互斥(编码器 25KB 会让收音机 MP3 解码器
-// 无内存可用 -> "There is no memory for MP3 required")。退出小智即释放,
-// 把内存还给收音机; 下次进小智(此时收音机已暂停)再申请。
-void xiaozhi_opus_release(void)
-{
-    if (s_opus_enc) {
-        esp_audio_enc_close(s_opus_enc);
-        s_opus_enc = NULL;
-    }
-    // mic 栈是静态存储，不随会话释放；仅释放 Opus 堆资源。
-    s_encoder_ready = false;
-    s_encoder_gave_up = false;
-    ESP_LOGI(TAG, "opus encoder released; free=%u largest=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-}
-
-static bool opus_encoder_init(void)
+static bool xz_opus_encoder_init(void)
 {
     if (s_encoder_ready) return true;
-    if (s_encoder_gave_up) return false;   // 已放弃: 不再反复 open 造成内存抖动
-    // 使用官方协议的 60ms Opus 帧；当前 ESP32-C3 编码器对 10ms 配置返回
-    // ESP_ERR_NOT_SUPPORTED(ret:-7)，导致连接成功但永远没有音频上行。
-    esp_opus_enc_config_t cfg = {
-        .sample_rate = 16000,
-        .channel = 1,
-        .bits_per_sample = ESP_AUDIO_BIT16,
-        .bitrate = ESP_OPUS_BITRATE_AUTO,
-        .frame_duration = ESP_OPUS_ENC_FRAME_DURATION_60_MS,
-        .application_mode = ESP_OPUS_ENC_APPLICATION_AUDIO,
-        .complexity = 0,
-        .enable_fec = false,
-        .enable_dtx = true,
-        .enable_vbr = true,
-    };
-    esp_audio_err_t reg_ret = esp_opus_enc_register();
-    ESP_LOGI(TAG, "opus register ret=%d", reg_ret);
-    esp_audio_enc_frame_info_t fi = {0};
-    ESP_LOGI(TAG, "opus cfg info ret=%d", esp_opus_enc_get_frame_info_by_cfg(&cfg, &fi));
-    if (esp_opus_enc_open(&cfg, sizeof(cfg), (void **)&s_opus_enc) != ESP_AUDIO_ERR_OK) {
-        ESP_LOGE(TAG, "opus enc open failed (heap?), give up this session");
+    if (s_encoder_gave_up) return false;
+
+    s_opus_state_size = opus_encoder_get_size(1);
+    if (s_opus_state_size <= 0 || s_opus_state_size > (int)sizeof(s_opus_state)) {
+        ESP_LOGE(TAG, "opus state too large: need=%d capacity=%u",
+                 s_opus_state_size, (unsigned)sizeof(s_opus_state));
         s_encoder_gave_up = true;
         return false;
     }
+    memset(s_opus_state, 0, (size_t)s_opus_state_size);
+    int ret = opus_encoder_init(s_opus_state, 16000, 1, OPUS_APPLICATION_VOIP);
+    if (ret != OPUS_OK) {
+        ESP_LOGE(TAG, "opus static init failed: %d", ret);
+        s_encoder_gave_up = true;
+        return false;
+    }
+    opus_encoder_ctl(s_opus_state, OPUS_SET_BITRATE_REQUEST, 24000);
+    opus_encoder_ctl(s_opus_state, OPUS_SET_VBR_REQUEST, 0);
+    opus_encoder_ctl(s_opus_state, OPUS_SET_COMPLEXITY_REQUEST, 0);
+    opus_encoder_ctl(s_opus_state, OPUS_SET_INBAND_FEC_REQUEST, 0);
+    opus_encoder_ctl(s_opus_state, OPUS_SET_DTX_REQUEST, 0);
     s_encoder_ready = true;
+    ESP_LOGI(TAG, "opus static encoder ready: state=%d bytes", s_opus_state_size);
     return true;
 }
 
-#define XZ_CHUNK_SAMPLES 960   // 60ms @16k
-static void xz_capture_run(int16_t *pcm);   // 前置声明
-static TaskHandle_t      s_mic_task;
+// Compatibility API used by app exit and startup call sites.
+bool xiaozhi_opus_prewarm(void) { return xz_opus_encoder_init(); }
+
+void xiaozhi_opus_release(void)
+{
+    s_encoder_ready = false;
+    s_encoder_gave_up = false;
+    // 先停播放任务(它会自己收尾), 再归还 TTS 解码器 state。
+    // play_stop 内部也会释放解码器, 这里再调一次是幂等的。
+    xz_tts_play_stop();
+    xz_opus_decoder_release();
+}
+
+static void xz_capture_run(int16_t *pcm)
+{
+    xz_heap_report("capture_start");
+    if (!xz_opus_encoder_init()) {
+        xz_ui_event_t ev = XZ_EV_ERROR;
+        xQueueSend(s_event_queue, &ev, 0);
+        return;
+    }
+    bool fmt_ok = (bsp_audio_set_format(16000, 16, 1) == ESP_OK);
+    xz_heap_report(fmt_ok ? "after_audio_fmt" : "audio_fmt_fail");
+    if (!fmt_ok) {
+        xz_ui_event_t ev = XZ_EV_ERROR;
+        xQueueSend(s_event_queue, &ev, 0);
+        return;
+    }
+
+    send_listen_state("start");
+    s_listening = true;
+    uint8_t opus[1024];
+    uint32_t frames = 0;
+    while (s_listening && s_ws_open) {
+        if (bsp_audio_read(pcm, XZ_CHUNK_SAMPLES * sizeof(int16_t)) != ESP_OK) break;
+        int encoded = opus_encode(s_opus_state, pcm, XZ_CHUNK_SAMPLES,
+                                  opus, (int)sizeof(opus));
+        if (encoded <= 0) {
+            ESP_LOGW(TAG, "opus encode failed: %d", encoded);
+            break;
+        }
+        if (s_proto_version >= 3) {
+            // BinaryProtocol3: [type=0 audio][reserved=0][payload_size u16BE] + payload
+            static uint8_t tx[4 + 1024];
+            tx[0] = 0;
+            tx[1] = 0;
+            tx[2] = (uint8_t)((unsigned)encoded >> 8);
+            tx[3] = (uint8_t)((unsigned)encoded & 0xFF);
+            memcpy(tx + 4, opus, (size_t)encoded);
+            esp_websocket_client_send_bin(s_ws, (const char *)tx,
+                                          4 + encoded, pdMS_TO_TICKS(1000));
+        } else {
+            esp_websocket_client_send_bin(s_ws, (const char *)opus,
+                                          encoded, pdMS_TO_TICKS(1000));
+        }
+        if (++frames % 16 == 0)   // about once per second (60ms/frame)
+            ESP_LOGI(TAG, "opus up: %lu frames", (unsigned long)frames);
+    }
+    send_listen_state("stop");
+    s_listening = false;
+}
 
 static void xz_capture_task(void *arg)
 {
     (void)arg;
     int16_t pcm[XZ_CHUNK_SAMPLES];
     xz_capture_run(pcm);
+    ESP_LOGI(TAG, "mic task stack high water: %u bytes free of %d",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL), XZ_MIC_STACK_WORDS);
     s_mic_task = NULL;
-    vTaskDelete(NULL);   // 自删, 栈内存由 xiaozhi_opus_release 释放
-}
-
-static void xz_capture_run(int16_t *pcm)
-{
-    xz_heap_report("capture_start");
-    bool fmt_ok = (bsp_audio_set_format(16000, 16, 1) == ESP_OK);
-    xz_heap_report(fmt_ok ? "after_audio_fmt" : "audio_fmt_fail");
-    if (!fmt_ok || !opus_encoder_init()) {
-        xz_ui_event_t ev = XZ_EV_ERROR;
-        xQueueSend(s_event_queue, &ev, 0);
-        return;   // 常驻任务: 不能自杀, 下次长按仍可重试
-    }
-    send_listen_state("start");
-    s_listening = true;
-    const size_t kFrameBytes = XZ_CHUNK_SAMPLES * sizeof(int16_t);   // 60ms@16k = 1920 字节
-    uint32_t frames = 0;
-    while (s_listening && s_ws_open) {
-        if (bsp_audio_read(pcm, kFrameBytes) != ESP_OK) break;
-        esp_audio_enc_in_frame_t in = { .buffer = (uint8_t *)pcm, .len = kFrameBytes };
-        esp_audio_enc_out_frame_t out = { .buffer = s_opus_out, .len = sizeof(s_opus_out) };
-        if (esp_audio_enc_process(s_opus_enc, &in, &out) != ESP_OK) { ESP_LOGE(TAG, "opus process failed"); break; }
-        if (out.encoded_bytes > 0) {
-            if (s_proto_version >= 3) {
-                // BinaryProtocol3: [type=0 opus][reserved=0][payload_size u16BE] + payload
-                // 裸发会被服务器当坏帧丢弃(与官方 websocket_protocol.cc 对齐, PC 已实测)
-                static uint8_t tx[4 + sizeof(s_opus_out)];
-                tx[0] = 0; tx[1] = 0;
-                tx[2] = (uint8_t)(out.encoded_bytes >> 8);
-                tx[3] = (uint8_t)(out.encoded_bytes & 0xFF);
-                memcpy(tx + 4, s_opus_out, out.encoded_bytes);
-                esp_websocket_client_send_bin(s_ws, (const char *)tx,
-                                              4 + out.encoded_bytes, pdMS_TO_TICKS(1000));
-            } else {
-                esp_websocket_client_send_bin(s_ws, (const char *)s_opus_out,
-                                              out.encoded_bytes, pdMS_TO_TICKS(1000));
-            }
-            if (++frames % 16 == 0)   // 每约1s一条日志(60ms/帧)
-                ESP_LOGI(TAG, "opus up: %lu frames", (unsigned long)frames);
-        }
-    }
-    send_listen_state("stop");
-    s_listening = false;
+    vTaskDelete(NULL);
 }
 
 // ---- public API ----
 bool xiaozhi_client_connect(void)
 {
     if (s_ws_open) return true;
+    if (!xz_connect_begin()) return false;
+    bool success = false;
     s_activation_code[0] = 0;
     s_activation_msg[0] = 0;
     // 连接前先停收音机并等它释放 HTTP/解码缓冲, 否则 heap 碎片不足(TLS 需连续 ~10K)
@@ -612,11 +971,18 @@ bool xiaozhi_client_connect(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     // 网关 DNS 不稳(getaddrinfo 202 间歇全挂): 显式设置主备公共 DNS
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    extern esp_netif_t *wifi_manager_get_station_netif(void);
+    extern int wifi_manager_is_connected(void);
+    extern const char *wifi_manager_get_ip_address(void);
+    ESP_LOGI(TAG, "wifi state connected=%d ip=%s",
+             wifi_manager_is_connected(), wifi_manager_get_ip_address());
+    esp_netif_t *netif = wifi_manager_get_station_netif();
+    if (!netif) netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    ESP_LOGI(TAG, "DNS target netif=%p", netif);
     if (netif) {
         esp_netif_dns_info_t dns = {};
 #if RELAY_MODE
-        dns.ip.u_addr.ip4.addr = ipaddr_addr(XZ_RELAY_HOST);  // 中继/电脑接管DNS
+        dns.ip.u_addr.ip4.addr = ipaddr_addr("192.168.0.35");  // 中继/电脑接管DNS
 #else
         dns.ip.u_addr.ip4.addr = ipaddr_addr("223.5.5.5");
 #endif
@@ -635,6 +1001,7 @@ bool xiaozhi_client_connect(void)
         if (now < 1700000000) {   // 2023-11 之前 = 未同步
             ESP_LOGW(TAG, "system time invalid (%ld), waiting SNTP up to 8s", (long)now);
             for (int i = 0; i < 80; ++i) {
+                if (xz_cancel_requested()) break;
                 vTaskDelay(pdMS_TO_TICKS(100));
                 time(&now);
                 if (now >= 1700000000) break;
@@ -644,42 +1011,48 @@ bool xiaozhi_client_connect(void)
             ESP_LOGI(TAG, "system time ok: %ld", (long)now);
         }
     }
+    if (xz_cancel_requested()) goto done;
     xz_heap_report("xz_connect_pre");
-    if (!ota_fetch_config()) return false;
-    // OTA 完成(TLS 已用完并释放), 此时一次性预留录音任务栈并初始化 Opus。
-    // xiaozhi_client_start_listening() 使用这块静态栈创建采集任务；只初始化
-    // 编码器而不预留栈会让按键路径直接命中 "mic stack not reserved"，
-    // 既不会发送 listen start，也不会上传任何语音帧。
-    xiaozhi_opus_prewarm();
-    ESP_LOGI(TAG, "opus enc post-OTA: ready=%d free=%u largest=%u", s_encoder_ready,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    if (!ws_connect_and_hello()) {
+    // Static Opus state no longer competes with TLS for heap. Keep OTA first
+    // so the session token is fresh, then initialize the encoder in place.
+    if (!ota_fetch_config()) goto done;
+    s_cached_ver = s_proto_version;
+    if (xz_cancel_requested()) goto done;
+    if (!xiaozhi_opus_prewarm()) goto done;
+    if (!ws_connect_and_hello()) goto done;
+    success = true;
+
+done:
+    if (!success || xz_cancel_requested()) {
         xiaozhi_client_close();
+    }
+    if (xz_connect_finish()) {
+        // Cancellation may have arrived just before ownership was released.
+        xiaozhi_client_close();
+        xiaozhi_opus_release();
         return false;
     }
-    return true;
+    return success;
 }
 
 void xiaozhi_client_start_listening(void)
 {
     if (!s_ws_open || s_listening) return;
+    if (!xz_opus_encoder_init()) {
+        xz_ui_event_t ev = XZ_EV_ERROR;
+        xQueueSend(s_event_queue, &ev, 0);
+        return;
+    }
     xz_heap_report("pre_mic_create");
-    // 用预分配的静态栈建任务(栈内存随 opus 一起在进小智时抢下);
-    // 任务结束自删, 栈内存由 xiaozhi_opus_release 统一释放。
     if (!s_mic_task) {
-        if (!s_mic_stack) {
-            ESP_LOGE(TAG, "mic stack not reserved");
-            return;
-        }
         s_mic_task = xTaskCreateStatic(xz_capture_task, "xz_mic",
                                        XZ_MIC_STACK_WORDS, NULL, 5,
-                                       s_mic_stack, &s_mic_tcb);
+                                       s_mic_stack_storage, &s_mic_tcb);
         if (!s_mic_task) {
             ESP_LOGE(TAG, "mic task create failed");
             return;
         }
-        ESP_LOGI(TAG, "mic task created (reserved stack)");
+        ESP_LOGI(TAG, "mic task created (static stack)");
     }
 }
 

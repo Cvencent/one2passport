@@ -295,12 +295,20 @@ static void xz_evt_timer_cb(lv_timer_t *) {
             snprintf(buf, sizeof(buf), "问: %s\n答: (思考中)", xiaozhi_client_stt());
             if (xz_msg) lv_label_set_text(xz_msg, buf);
             xz_apply_state(2);
+            // Recognition arrived, so the cloud is working on this turn:
+            // give it a fresh full window instead of inheriting the time
+            // already spent waiting for the STT result.
+            xz_thinking_deadline = lv_tick_get() + XZ_THINKING_TIMEOUT_MS;
         } else if (ev == XZ_EV_TTS_START) {
             char buf[400];
             snprintf(buf, sizeof(buf), "问: %s\n答: %s",
                      xiaozhi_client_stt(), xiaozhi_client_tts());
             if (xz_msg) lv_label_set_text(xz_msg, buf);
             xz_apply_state(3);
+            // The cloud answered, so the turn is alive: cancel the watchdog.
+            // Without this a long answer would still trip the deadline
+            // mid-playback and cut the user off while the pet is speaking.
+            xz_thinking_deadline = 0;
         } else if (ev == XZ_EV_TTS_STOP) {
             xz_thinking_deadline = 0;
             xz_apply_state(0);

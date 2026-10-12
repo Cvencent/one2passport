@@ -17,3 +17,5 @@ t*_*.log
 soak_*.log
 r_*.log
 final_*.log
+*.bak
+temp_pristine_*.cc

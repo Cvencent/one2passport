@@ -173,6 +173,20 @@ static bool xz_connecting;
 static volatile bool xz_connect_cancel;
 static volatile bool xz_connect_task_alive;
 
+// Watchdog for "思考中…": 2026-10-12. Once we send listen stop we wait for the
+// cloud STT+TTS. If nothing arrives the UI used to sit on 思考中… forever
+// (a dead socket or a silent cloud turn looks exactly like this). This deadline
+// makes that state self-healing: on expiry we clear the stale flags, tell the
+// user something useful, and return to idle so the next hold can retry.
+static uint32_t xz_thinking_deadline;
+static constexpr uint32_t XZ_THINKING_TIMEOUT_MS = 15000;
+
+// 2026-10-12: a hold that starts while the socket is still handshaking is
+// remembered here and replayed on WS_OPENED. The handshake takes several
+// seconds and the user naturally holds OK right after opening XiaoZhi;
+// dropping that press made the first utterance silently do nothing.
+static bool xz_hold_pending;
+
 static bool xz_cancelled(void) {
     return xz_connect_cancel || xiaozhi_client_is_cancelled();
 }
@@ -202,6 +216,7 @@ static void xz_apply_state(int st) {
     else if (st == 5) { c = 0xFF9E9E; txt = "连接失败 · 退出重试"; }
     else if (st == 6) { c = 0xFFD27A; txt = "待激活 · 输入下方设备码"; }
     else if (st == 7) { c = 0xFFD27A; txt = "需重新绑定 · 查看下方提示"; }
+    else if (st == 8) { c = 0xFFB86E; txt = "无响应 · 再按住 OK 重试"; }
     lv_obj_set_style_bg_color(xz_pet_body, lv_color_hex(c), 0);
     lv_label_set_text(xz_status, txt);
     const bool big = (st == 1);
@@ -224,14 +239,39 @@ static lv_obj_t *xz_box(lv_obj_t *parent, int x, int y, int w, int h, uint32_t c
 // 云端事件轮询(30ms LVGL定时器, 在LVGL任务上下文执行UI)
 static void xz_evt_timer_cb(lv_timer_t *) {
     if (!xz_scr) return;
+
+    // 思考中 watchdog: fires only when a turn was started and nothing came back.
+    if (xz_thinking_deadline && (int32_t)(lv_tick_get() - xz_thinking_deadline) >= 0) {
+        xz_thinking_deadline = 0;
+        xz_recording = false;
+        ESP_LOGW(kTag, "thinking timed out with no cloud reply");
+        // Make sure no mic task is still streaming if the turn wedged midway.
+        xiaozhi_client_stop_listening();
+        char buf[400];
+        snprintf(buf, sizeof(buf), "问: %s\n答: (无响应, 请重试)",
+                 xiaozhi_client_stt()[0] ? xiaozhi_client_stt() : "(未识别)");
+        if (xz_msg) lv_label_set_text(xz_msg, buf);
+        xz_apply_state(8);
+    }
+
     xz_ui_event_t ev;
     while (xQueueReceive(xiaozhi_client_events(), &ev, 0) == pdTRUE) {
         if (ev == XZ_EV_WS_OPENED) {
             xz_connecting = false;
+            xz_thinking_deadline = 0;
             xz_apply_state(0);
             // 激活完成/已激活: 收起设备码, 恢复对话区提示
             if (xz_code_label) lv_obj_add_flag(xz_code_label, LV_OBJ_FLAG_HIDDEN);
             if (xz_msg) lv_label_set_text(xz_msg, "长按 OK 说话");
+            // Replay a hold that began while the socket was still handshaking.
+            if (xz_hold_pending) {
+                xz_hold_pending = false;
+                if (!xz_recording && xiaozhi_client_is_open()) {
+                    xz_recording = true;
+                    xiaozhi_client_start_listening();
+                    xz_apply_state(1);
+                }
+            }
         } else if (ev == XZ_EV_ACTIVATION) {
             // 设备未激活: 大字显示设备码, 提示去 xiaozhi.me 绑定。
             // (官方固件 rc.10 同款流程: OTA 返回 activation.code -> 用户输入)
@@ -262,8 +302,10 @@ static void xz_evt_timer_cb(lv_timer_t *) {
             if (xz_msg) lv_label_set_text(xz_msg, buf);
             xz_apply_state(3);
         } else if (ev == XZ_EV_TTS_STOP) {
+            xz_thinking_deadline = 0;
             xz_apply_state(0);
         } else if (ev == XZ_EV_WS_CLOSED || ev == XZ_EV_ERROR) {
+            xz_thinking_deadline = 0;
             xz_connecting = false;
             xz_recording = false;
             xz_apply_state(5);
@@ -273,8 +315,15 @@ static void xz_evt_timer_cb(lv_timer_t *) {
 
 bool xiaozhi_app_enter(void) {
     ESP_LOGI(kTag, "xiaozhi enter begin");
+    xz_thinking_deadline = 0;
+    xz_hold_pending = false;
     xz_recording = false;
     xz_connecting = true;
+    // 2026-10-12: keep the screen on while XiaoZhi is the active app. The WS
+    // handshake takes several seconds and auto-blank would eat the user's
+    // hold-to-talk press as a "wake" keypress during that window; the
+    // conversation UI is useless once the screen is dark anyway.
+    app_power_hold_awake(true);
     const bool can_start_connect =
         !xz_connect_task_alive && xiaozhi_client_reset_cancel();
     xz_connect_cancel = !can_start_connect;
@@ -420,6 +469,9 @@ void xiaozhi_async_connect_task(void *) {
 void xiaozhi_app_exit(void) {
     // 小智不后台驻留: 退出后禁止连接任务继续重试，并立即关闭当前 WS。
     xz_connect_cancel = true;
+    app_power_hold_awake(false);   // release the keep-awake taken on enter
+    xz_thinking_deadline = 0;
+    xz_hold_pending = false;
     xz_connecting = false;
     if (xz_recording) {
         xiaozhi_client_stop_listening();
@@ -446,15 +498,45 @@ void xiaozhi_app_exit(void) {
 }
 
 void xiaozhi_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
-    if (btn != BSP_BTN_OK || xz_connecting) return;
-    if (ev == BSP_BTN_LONG && !xz_recording) {
-        if (!xiaozhi_client_is_open()) return;
+    if (btn != BSP_BTN_OK) return;
+
+    // Hold-to-talk: hold OK -> listen start, release OK -> listen stop.
+    // The stop MUST be driven by BSP_BTN_RELEASE. After a long press the button
+    // component emits LONG_PRESS_START then LONG_PRESS_UP; it never emits
+    // SINGLE_CLICK, so keying the stop off CLICK meant a held button recorded
+    // forever (cloud heard silence -> "我", UI stuck on 思考中…).
+    if (ev == BSP_BTN_LONG) {
+        if (xz_connecting) {
+            // Socket still handshaking. Remember it and replay on WS_OPENED so
+            // the user's hold is not silently swallowed.
+            xz_hold_pending = true;
+            return;
+        }
+        if (xz_recording || !xiaozhi_client_is_open()) return;
         xz_recording = true;
+        xz_thinking_deadline = 0;
         xiaozhi_client_start_listening();
         xz_apply_state(1);
-    } else if (ev == BSP_BTN_CLICK && xz_recording) {
+        return;
+    }
+
+    if (ev == BSP_BTN_RELEASE) {
+        xz_hold_pending = false;
+        if (!xz_recording) return;
         xz_recording = false;
         xiaozhi_client_stop_listening();
+        // Show 思考中 immediately; if the cloud never answers, the watchdog in
+        // xz_evt_timer_cb breaks us out instead of hanging forever.
+        xz_thinking_deadline = lv_tick_get() + XZ_THINKING_TIMEOUT_MS;
+        xz_apply_state(2);
+        return;
+    }
+
+    if (ev == BSP_BTN_CLICK && xz_recording) {
+        // Defensive: a very short hold can surface as CLICK instead of RELEASE.
+        xz_recording = false;
+        xiaozhi_client_stop_listening();
+        xz_thinking_deadline = lv_tick_get() + XZ_THINKING_TIMEOUT_MS;
         xz_apply_state(2);
     }
 }

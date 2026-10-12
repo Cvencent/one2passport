@@ -43,6 +43,17 @@ static void component_event_bridge(void *handle, void *usr_data) {
         s_user_cb((bsp_btn_t)idx, BSP_BTN_CLICK, s_user_arg);
     } else if (ev == BUTTON_LONG_PRESS_START) {
         s_user_cb((bsp_btn_t)idx, BSP_BTN_LONG, s_user_arg);
+    } else if (ev == BUTTON_LONG_PRESS_UP) {
+        // Must forward this (2026-10-12 fix: XiaoZhi heard only "我" and stuck on 思考中).
+        // A long press is LONG_PRESS_START (at long_press_time) -> held ->
+        // LONG_PRESS_UP (release). The component emits NO SINGLE_CLICK on that path;
+        // single click only fires when press duration < long_press_time.
+        //
+        // This was dropped, so a long press ended at BSP_BTN_LONG with no follow-up.
+        // XiaoZhi stop-recording waits for BSP_BTN_CLICK, which never arrives ->
+        // recording never ends, the cloud hears a long silent stream and answers "我",
+        // and the UI waits forever for a TTS that cannot arrive.
+        s_user_cb((bsp_btn_t)idx, BSP_BTN_RELEASE, s_user_arg);
     }
     // PRESS_UP/PRESS_DOWN/HOLD 等事件上层不需要, 不转发
 }
@@ -93,6 +104,8 @@ esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user) {
         iot_button_register_cb(s_btn[i], BUTTON_SINGLE_CLICK, NULL,
                                component_event_bridge, (void *)(intptr_t)i);
         iot_button_register_cb(s_btn[i], BUTTON_LONG_PRESS_START, NULL,
+                               component_event_bridge, (void *)(intptr_t)i);
+        iot_button_register_cb(s_btn[i], BUTTON_LONG_PRESS_UP, NULL,
                                component_event_bridge, (void *)(intptr_t)i);
     }
 

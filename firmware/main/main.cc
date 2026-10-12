@@ -228,7 +228,13 @@ static void button_event_bridge(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
             msg = {btn, BSP_BTN_LONG, -1};
             xQueueSend(s_key_queue, &msg, 0);
             break;
-        default:  // PRESS/RELEASE/DOUBLE 走现有逻辑不需要
+        case BSP_BTN_RELEASE:
+            // 2026-10-12: forward the long-press release. XiaoZhi needs this to end
+            // a hold-to-talk recording; without it recording never stops.
+            msg = {btn, BSP_BTN_RELEASE, -1};
+            xQueueSend(s_key_queue, &msg, 0);
+            break;
+        default:  // PRESS/DOUBLE 走现有逻辑不需要
             break;
     }
 }
@@ -244,6 +250,7 @@ static void serial_key_inject(char c) {
         case 'o': msg = {BSP_BTN_OK,   BSP_BTN_CLICK, -1}; break;
         case 'j': msg = {BSP_BTN_DOWN, BSP_BTN_LONG, -1};  break;
         case 'l': msg = {BSP_BTN_OK,   BSP_BTN_LONG, -1};  break;
+        case 'r': msg = {BSP_BTN_OK,   BSP_BTN_RELEASE, -1}; break;  // long-press release (hold-to-talk stop)
         case 'k': msg = {BSP_BTN_UP,   BSP_BTN_LONG, -1};  break;
         case '1': case '2': case '3': case '4':
             serial_app_jump_request(c - '1');

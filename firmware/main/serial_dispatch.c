@@ -18,10 +18,9 @@ void serial_dispatch_feed(serial_dispatch_t *parser, char character,
     if (parser->dropping) return;
     if (parser->used == 0) {
         if (character == ' ' || character == '\t') return;
-        // '1'..'4' 是自动化测试的应用跳转命令(收音机/Codex/小智AI/设置)。
-        // 必须和按键字符一起在这里被识别, 否则会被当成普通文本攒进 line,
-        // 命令永远到不了 serial_key_inject。
-        if (strchr("udoljk1234", character)) {
+        // '1'..'4' are the automated app-jump commands (radio/Codex/XiaoZhi/settings).
+        // 2026-10-12: added 'r' = OK long-press release (hold-to-talk stop for XiaoZhi).
+        if (strchr("udolrjk1234", character)) {
             if (key) key(character);
             return;
         }

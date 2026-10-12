@@ -1002,6 +1002,24 @@ static void xz_capture_run(int16_t *pcm)
                     acc += (double)pcm[i] * (double)pcm[i];
                 ESP_LOGI(TAG, "opus up: %lu frames rms=%u", (unsigned long)frames,
                          (unsigned)__builtin_sqrt(acc / XZ_CHUNK_SAMPLES));
+                // DC offset probe (added 2026-10-12). RMS alone cannot tell a
+                // healthy signal from a badly biased one: a large DC offset
+                // inflates RMS while the codec clips or the waveform rides the
+                // rail, and the cloud ASR then reports short junk like "我"
+                // regardless of what was actually said. Print mean and peak
+                // alongside RMS so a bias problem is visible in the log
+                // instead of requiring a scope.
+                {
+                    double mean = 0.0;
+                    int32_t peak = 0;
+                    for (int i = 0; i < XZ_CHUNK_SAMPLES; ++i) {
+                        mean += (double)pcm[i];
+                        const int32_t a = pcm[i] < 0 ? -(int32_t)pcm[i] : (int32_t)pcm[i];
+                        if (a > peak) peak = a;
+                    }
+                    mean /= XZ_CHUNK_SAMPLES;
+                    ESP_LOGI(TAG, "mic dc=%.0f peak=%ld", mean, (long)peak);
+                }
             }
             // 栈余量自检: SILK 编码路径实测会吃 20KB+, 余量低于 1KB 时
             // 提前告警。下次再有人调大编码器复杂度, 日志能直接指出问题,

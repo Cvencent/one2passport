@@ -12,3 +12,8 @@ sdkconfig.old
 # Never commit device credentials or flash dumps
 nvs_backup*
 *.nvs
+serial_*.log
+t*_*.log
+soak_*.log
+r_*.log
+final_*.log

@@ -394,14 +394,23 @@ static bool s_decoder_ready;
 #define OPUS_DEC_OK 0
 // 60ms@16k = 960 采样; 给到 1152(2.3KB) 足够容纳服务端偶发的 120ms 帧。
 #define XZ_TTS_PCM_CAPACITY 1152
-#define XZ_TTS_QUEUE_DEPTH 4          // 约 0.24s 缓冲, 抗网络抖动
-#define XZ_TTS_MAX_OPUS 256           // 单帧上限; 60ms@24kbps ≈ 180B
+#define XZ_TTS_QUEUE_DEPTH 8          // ~0.5s 缓冲; 4 太浅, 网络抖动就丢帧
+#define XZ_TTS_MAX_OPUS 512          // 单帧上限(见下方说明)
+// 2026-10-12: 单帧上限 256 -> 512, 队列深度 4 -> 8。实测云端下发的 TTS
+// 帧有 257 字节, 超过原来的 256 上限被整帧丢弃(日志 "tts opus frame too
+// large"), 表现为回答只播一半就没了。
 // ⚠ 单位是"字节": 本平台 portSTACK_TYPE == uint8_t(见 RISC-V portmacro.h),
 //   所以 12288 就是 12KB 栈, 不是 12K words。
 //   实测阶梯: 3KB(websocket_task 原值)必崩; 8KB 仍在 silk_decode_frame 崩;
 //   故给到 12KB, 再由下面的 high water 日志实测校准到"够用且不浪费"。
 #define XZ_TTS_STACK_WORDS 12288
-#define XZ_TTS_PRIO 6                 // 高于 WS(5), 保证下行不积压; 低于 LVGL 主循环压力可控
+//   2026-10-12: 原为 6("高于 WS 保证下行不积压"), 这是错的。TTS 任务在
+//   i2s_channel_write(阻塞, 超时1000ms) 里连续写, 优先级一旦高于 websocket 任务,
+//   持 client->lock 做阻塞读的 ws 任务就彻底让不出 CPU —— 锁被扣到读超时
+//   (实测 26 秒), 期间 mic 任务的 listen start/stop 全发不出去, 于是"第一轮能答,"
+//   之后再也识别不到"。降回同级 5: I2S DMA 自身有缓冲, 同级轮转下 60ms 一帧的
+//   写入不会丢; 真要靠队列兜住抖动, 应该调大 XZ_TTS_QUEUE_DEPTH 而不是抬优先级。
+#define XZ_TTS_PRIO 5                 // 必须【不高于】ws 任务(prio 5)
 
 typedef struct {
     int len;                 // 有效字节数 (<= 0 表示停止标记)
@@ -739,7 +748,17 @@ static bool ws_connect_and_hello(void)
     // 不连(实测 ws_pre_start 后既无 connected 也无 timeout)。3072 够跑明文 WS。
     cfg.task_stack = 3072;
     cfg.task_prio = 5;      // 与 LVGL/radio 同级, 避免饿死 UI 任务(防 taskLVGL 看门狗)
-    cfg.network_timeout_ms = 20000;  // C3上TLS握手慢, 10s不够
+    // network_timeout_ms 必须【小】。这是 2026-10-12 "第一轮能答, 第二轮就再也
+    // 识别不到" 的真凶(串口日志 serial_conv.log 第 1445-1487 行):
+    //   esp_websocket_client_recv() 持着 client->lock 做阻塞读
+    //   (esp_websocket_client.c:1085), 读超时就是这个值。
+    //   TTS 一开播, xz_tts 任务(prio 6)高于 ws 任务(prio 5), 又在
+    //   i2s_channel_write(超时1000ms) 里连续写, 持锁的 ws 任务被彻底饿死,
+    //   锁最长被扣 network_timeout_ms。期间 mic 任务发 listen start/stop 全都
+    //   拿不到锁 -> "Could not lock ws-client within 2000 timeout" -> 音频没送
+    //   出去 -> 云端等超时 -> WS 断开。实测 20000ms 时锁被扣住了 26 秒。
+    // 取 1000ms: 明文 ws:// 收包是即时的, 锁最坏只被扣 1 秒。
+    cfg.network_timeout_ms = 1000;
 #if !PLAIN_WS_TEST
     cfg.crt_bundle_attach = esp_crt_bundle_attach;   // 21:40 实测可用
 #endif
@@ -791,9 +810,9 @@ static bool ws_connect_and_hello(void)
 // the turn never receives an end-of-speech signal and the session wedges. That
 // is the "after a few turns it stops responding and OK does nothing" symptom.
 // Ending a turn is done by sending type:abort instead.
-static void send_listen_state(const char *state)
+static bool send_listen_state(const char *state)
 {
-    if (!s_ws || !s_ws_open) return;
+    if (!s_ws || !s_ws_open) return false;
     char msg[160];
     int n;
     if (strcmp(state, "abort") == 0) {
@@ -805,9 +824,19 @@ static void send_listen_state(const char *state)
             "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"%s\",\"mode\":\"auto\"}",
             s_session_id[0] ? s_session_id : ".", state);
     }
-    if (n <= 0) return;
-    esp_websocket_client_send_text(s_ws, msg, (size_t)n, pdMS_TO_TICKS(2000));
+    if (n <= 0) return false;
+
+    // ⚠ 发送结果必须【检查】。esp_websocket_client_send_text 拿不到锁或连接已断时
+    //   返回 -1, 而旧代码完全忽略返回值, 照样打印 "sent ..." —— 日志里一串
+    //   漂亮的 "sent" 其实全是失败的假象, 排查时被彻底带偏(2026-10-12 踩过)。
+    //   失败时明确报错并返回 false, 上层据此知道这一轮音频根本没送出去。
+    if (esp_websocket_client_send_text(s_ws, msg, (size_t)n,
+                                       pdMS_TO_TICKS(2000)) < 0) {
+        ESP_LOGE(TAG, "FAILED to send %s (ws send returned -1)", msg);
+        return false;
+    }
     ESP_LOGI(TAG, "sent %s", msg);
+    return true;
 }
 
 void xiaozhi_client_close(void)
@@ -969,6 +998,9 @@ static void xz_capture_run(int16_t *pcm)
     send_listen_state("start");
     s_listening = true;
     uint8_t *opus = s_mic_opus;
+    // 音频上行的连续失败计数: 发送失败说明链路已经死了, 别再空转。
+    int sent = 0;
+    static int s_tx_fail = 0;
     uint32_t frames = 0;
     // 自动增益 + 噪声门(2026-10-12 重写)。
     //
@@ -994,6 +1026,13 @@ static void xz_capture_run(int16_t *pcm)
     double noise_rms = 0.0;
     double frms_min = 0.0, frms_max = 0.0;
     while (s_listening && s_ws_open) {
+        // bsp_audio_read -> i2s_channel_read(超时1000ms) 是阻塞的, 本任务 prio 5
+        // 与 ws 任务同级, 同级轮转不会饿死对方。真正要防的是"持锁方被高优先级
+        // 任务压住": xz_tts 曾是 prio 6, 它连续写 I2S 时, 持 client->lock 做
+        // 阻塞读的 ws 任务(prio 5)让不出 CPU, 锁一直被扣到读超时 ——
+        // 这就是"第一轮答完, 之后按 OK 全都没反应"的直接原因。
+        // 已在两处根治: (1) SEPARATE_TX_LOCK=y, 发送路径不再抢这把读锁;
+        //              (2) network_timeout_ms 20000 -> 1000, 锁最坏只扣 1 秒。
         if (bsp_audio_read(pcm, XZ_CHUNK_SAMPLES * sizeof(int16_t)) != ESP_OK) break;
         {   // 逐帧 RMS: 噪声门判定 + 动态范围统计
             double acc = 0.0;
@@ -1044,11 +1083,27 @@ static void xz_capture_run(int16_t *pcm)
             tx[2] = (uint8_t)((unsigned)encoded >> 8);
             tx[3] = (uint8_t)((unsigned)encoded & 0xFF);
             memcpy(tx + 4, opus, (size_t)encoded);
-            esp_websocket_client_send_bin(s_ws, (const char *)tx,
-                                          4 + encoded, pdMS_TO_TICKS(1000));
+            sent = esp_websocket_client_send_bin(s_ws, (const char *)tx,
+                                               4 + encoded, pdMS_TO_TICKS(1000));
         } else {
-            esp_websocket_client_send_bin(s_ws, (const char *)opus,
-                                          encoded, pdMS_TO_TICKS(1000));
+            sent = esp_websocket_client_send_bin(s_ws, (const char *)opus,
+                                               encoded, pdMS_TO_TICKS(1000));
+        }
+        // ⚠ 音频上行也必须检查返回值。连接已经断了 / 拿不到锁时 send_bin 返回 -1,
+        //   旧代码当无事发生继续录, 于是 UI 上还显示"正在听", 用户以为在说话,
+        //   实际上一个字都没送出去 —— 这正是"想了很久然后未识别"的假象。
+        //   连续失败 3 次就判定链路已死, 停止本轮并让上层走重连。
+        if (sent < 0) {
+            if (++s_tx_fail < 3) {
+                ESP_LOGW(TAG, "audio tx failed (%d/%d), frame=%lu len=%d",
+                         s_tx_fail, 3, (unsigned long)frames, encoded);
+            } else {
+                ESP_LOGE(TAG, "audio tx failed 3x in a row, giving up this turn");
+                s_listening = false;
+                break;
+            }
+        } else if (s_tx_fail) {
+            s_tx_fail = 0;
         }
         if (++frames % 8 == 0) {   // ~0.5s
             {
@@ -1103,18 +1158,20 @@ static void xz_capture_run(int16_t *pcm)
             }
         }
     }
-    // mode:auto 下**不发任何结束消息**。
+    // 说完一轮后必须发 listen state:stop。
     //
-    // 依据: 对照唯一一次成功的日志(2026-10-12 17:2x), 服务端在
-    //   t=54360 收到 listen/start, t=56853 就自己回了 STT ——
-    //   整个过程我【没有】发过 stop 或 abort, 设备还在录音。
-    // 说明云端用自己的 VAD 判断"说完了", 自己就切到思考并开始回答。
-    //
-    // 之前每轮结束都发 stop 或 abort, 都是在云端已经回答完之后又去干扰它:
-    //   - 发 stop: 服务端不认这个消息, 轮次收不到结束信号;
-    //   - 发 abort: 语义是"打断", 把刚要开始的回答打断掉, 于是第二轮
-    //     就一直卡在"思考中"直到 15s 超时。
-    // 松手只是本地停止采集, 这正是官方固件的行为。
+    // 2026-10-12 踩过的坑, 记下来免得再犯两次:
+    //   1) 最初这里发 stop, 但同时还在发别的东西, 表现为"第一轮能答,
+    //      第二轮开始一直思考中到超时"。
+    //   2) 中间我对照反编译的官方固件, 以为 mode:auto 不用发结束消息
+    //      (硬编码里只看到 "start" 那一条格式串), 于是把 stop 去掉了 ——
+    //      结果更糟: 云端收不到任何结束信号, 一直等到超时, 界面显示"未识别"。
+    //      stop 用的确实是另一条格式串, 官方固件里有, 我第一次搜索漏了。
+    //   3) 也试过只发 type:abort, 那是"打断"语义, 会把云端正在生成的回答
+    //      切掉, 同样表现为第二轮卡死。
+    // 结论: 正常收尾发 stop; type:abort 只留给"思考超时"强行解锁。
+    // 兜底: 若采集循环是自行退出的(而不是 UI 调 stop_listening), 这里补发 stop。
+    if (s_listening) send_listen_state("stop");
     s_listening = false;
 }
 
@@ -1263,9 +1320,16 @@ void xiaozhi_client_abort_turn(void)
     s_listening = false;
     send_listen_state("abort");
 }
+// 停止本轮采集并发送 listen state:stop。
+//
+// stop 必须发出去 —— 云端靠它才知道"音频到此为止", 否则会一直等到超时,
+// 表现为"未识别"。这里主动发, 而不是只置个标志让采集任务自己收尾,
+// 因为 STT 可能在用户还按着 OK 时就到了, 那条路径不会再回到采集循环的收尾处。
 void xiaozhi_client_stop_listening(void)
 {
-    s_listening = false;   // capture task ������������������ listen stop
+    if (!s_listening) return;
+    s_listening = false;
+    send_listen_state("stop");
 }
 
 QueueHandle_t xiaozhi_client_events(void) { return s_event_queue; }

@@ -73,3 +73,12 @@ CONFIG_LWIP_TCP_WND_DEFAULT=2880
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=4
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=4
 CONFIG_LWIP_TCP_SNDMBOX_SIZE=4
+
+# ---- ESP WebSocket: separate tx lock (2026-10-12) ----
+# Without this, esp_websocket_client_recv() holds client->lock while doing a
+# blocking read of up to network_timeout_ms. The xiaozhi TTS playback task
+# (higher prio than the websocket task) then starves the lock holder and every
+# send times out - "first turn OK, then no more recognition". Separate tx lock
+# decouples sends from the receive path.
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000

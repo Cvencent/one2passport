@@ -108,8 +108,31 @@ bool radio_display_note_activity() {
     const bool was_on = s_screen_on.exchange(true, std::memory_order_acq_rel);
     if (!was_on) {
         bsp_display_backlight(s_brightness.load(std::memory_order_acquire));
+        ESP_LOGI(kTag, "screen woke by activity");
     }
     return was_on;
+}
+
+// 本次按键是否只是"把息屏的屏幕点亮"。
+//
+// ⚠ 曾经的 bug: input_task 写成 if (!radio_display_note_activity()) continue;,
+//   而 note_activity() 返回的是"屏幕之前是否已经亮着"。于是息屏后第一次按键
+//   返回 false -> 被 continue 吞掉 -> 屏幕亮了但按键没生效, 用户只按一下就
+//   感觉"唤不醒"。现在改成显式的两段语义, 不再靠取反猜。
+bool radio_display_was_blanked() {
+    return !s_screen_on.load(std::memory_order_acquire);
+}
+
+// 唤醒后给 UI 一点"别立刻再息屏"的缓冲: 用户唤醒后往往马上要继续操作,
+// 若沿用息屏前剩余的那点计时, 屏幕会在几秒内二次熄灭, 同样像"唤不醒"。
+void radio_display_grace_after_wake(uint32_t ms) {
+    const TickType_t grace = pdMS_TO_TICKS(ms);
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t last = s_last_activity.load(std::memory_order_acquire);
+    if ((now - last) < grace) {
+        // 把活动时间戳往回拨, 等价于"刚刚才有过活动"。
+        s_last_activity.store(now - grace, std::memory_order_release);
+    }
 }
 
 uint8_t radio_display_brightness() {

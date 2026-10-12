@@ -324,6 +324,10 @@ bool xiaozhi_app_enter(void) {
     // hold-to-talk press as a "wake" keypress during that window; the
     // conversation UI is useless once the screen is dark anyway.
     app_power_hold_awake(true);
+    // keep_awake only prevents *future* blanking; it does not relight a screen
+    // that is already dark. Entering with the screen off would otherwise eat
+    // the user's first hold-to-talk press as a wake keypress.
+    app_power_activity();
     const bool can_start_connect =
         !xz_connect_task_alive && xiaozhi_client_reset_cancel();
     xz_connect_cancel = !can_start_connect;

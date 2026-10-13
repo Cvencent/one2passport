@@ -636,10 +636,9 @@ constexpr std::size_t kNetworkBlocks = 28;
 // 欠载后把"恢复阈值"翻倍(见 stream_station 里的 wait_bytes), 但上限必须
 // 明显小于环容量: 27KB 环里等 20KB 再出声会在源端断续时制造 1.5s 以上的
 // 静音, 而且剩余空间不足以吸收下一段突发(实测 rebuffers 连续累积)。
-// 2026-10-13: 2KB/4KB 起播都会在首个 10s 窗口内欠载一次; 8KB 在真机上
-// 已消除这一轮空转, 代价是慢源首响多等一点。真遇到源端停顿仍会按下面的
-// 倍率提高恢复阈值。
-constexpr std::size_t kPrebufferTarget = 8 * 1024;
+// 2026-10-13: 4KB 起播首响更快, 但真机首个 10s 窗口仍欠载一次; 8KB 已能
+// 消除这一轮空转。取 6KB 折中, 临界源端若仍欠载, 恢复阈值会继续翻倍。
+constexpr std::size_t kPrebufferTarget = 6 * 1024;
 constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
 
 // network_feed_task 的栈**静态分配**: 它要求一块 2048B **连续**堆, 而

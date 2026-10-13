@@ -539,7 +539,6 @@ static void xz_tts_play_task(void *arg)
 {
     (void)arg;
     bool fmt_ready = false;
-    uint32_t played = 0;
     ESP_LOGI(TAG, "tts task stack: %u bytes free of %d (high water at start)",
              (unsigned)uxTaskGetStackHighWaterMark(NULL), XZ_TTS_STACK_WORDS);
     for (;;) {
@@ -616,7 +615,10 @@ static void xz_tts_play_discard(void)
 //   会用到已 free 的内存(实测表现为随机 HardFault)。
 static bool xz_tts_play_stop(void)
 {
-    xz_tts_play_discard();
+    // A server TTS "stop" usually arrives while the final frames are still
+    // queued (the WS callback runs at the same priority as the I2S writer).
+    // Clearing the queue here clipped the last words of every answer. Queue
+    // the stop marker and let the playback task drain what it already has.
     if (s_tts_task) {
         const xz_tts_item_t stop = {.len = 0};
         xQueueSend(s_tts_queue, &stop, pdMS_TO_TICKS(200));

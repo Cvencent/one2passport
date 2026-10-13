@@ -338,6 +338,15 @@ static void background_read_state_changed(const char *message_id)
 void coding_bridge_set_foreground_ui(bool active)
 {
     s_allow_foreground_ui = active;
+
+    /* The bridge can come online or drop while the Codex page sits in the
+     * background; that path only updates background state and never touches the
+     * foreground state machine. Reconcile once the page reaches the foreground,
+     * otherwise it keeps showing a stale OFFLINE (not connected) or ONLINE. */
+    if (active && bsp_lvgl_lock(500)) {
+        app_coding_bridge_connected(s_connected);
+        bsp_lvgl_unlock();
+    }
 }
 
 bool coding_bridge_foreground_ui_active(void)
@@ -858,6 +867,7 @@ static void process_wireless_line(const char *line)
             s_background_state.connected = true;
             s_last_message_us = esp_timer_get_time();
             home_codex_state_changed();
+
             if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
                 app_coding_bridge_connected(true);
                 bsp_lvgl_unlock();

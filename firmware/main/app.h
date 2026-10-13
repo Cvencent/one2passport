@@ -49,6 +49,8 @@ uint8_t app_settings_sfx_volume(void);
 // 由 coding_bridge 在收到电脑端事件时回调,推送状态到界面。
 void app_coding_set_audio_available(bool available);
 void app_coding_bridge_connected(bool connected);
+// 前台页面当前是否已按 已连接渲染(供桥接层判断是否需要补播连接)。
+bool app_coding_is_connected(void);
 void app_coding_bridge_transcript(const char *text);
 void app_coding_bridge_task_queued(const char *text);
 void app_coding_bridge_task_status(const char *text);

@@ -1099,8 +1099,14 @@ void app_coding_set_audio_available(bool available)
     s_audio_available = available;
 }
 
+bool app_coding_is_connected(void)
+{
+    return s_flow.connected;
+}
+
 void app_coding_bridge_connected(bool connected)
 {
+
     app_power_activity();
     ensure_initialized();
     s_pet_state.connected = connected;

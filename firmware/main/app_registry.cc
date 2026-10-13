@@ -665,16 +665,15 @@ static void enter_app(app_id_t id) {
     // 当前活动屏已由空屏承接，应用创建时不再与菜单树争用堆。
     if (!app.enter()) {
         ESP_LOGE(kTag, "app %s enter failed", app.name);
-        if (bsp_lvgl_lock(1500)) {
-            ensure_menu();
-            bsp_lvgl_unlock();
-        }
+        ensure_menu();
+        bsp_lvgl_unlock();
         if (app.audio_resume) app.audio_resume();
         return;
     }
     xz_heap_report("enter_app_after_enter");
     s_active = id;
     s_level = APP_LEVEL_APP;
+    bsp_lvgl_unlock();
     xz_heap_report("enter_app_out");
 }
 

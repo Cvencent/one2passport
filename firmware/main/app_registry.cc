@@ -792,8 +792,8 @@ void radio_app_pause(void)  {
     radio_player_set_playing(false);
     // HTTP 流请求最长等待 7s；必须等网络 worker 完整退出再让 radio_app_enter
     // 重新抢占解码池，否则会与旧 worker 并发持有缓冲，触发低内存/看门狗。
-    if (!radio_player_wait_idle(10000)) {
-        ESP_LOGW(kTag, "radio pause timed out before app switch");
+    if (!radio_player_wait_idle(2000)) {
+        ESP_LOGW(kTag, "radio pause timed out before app switch (worker still winding down)");
     }
 }
 void radio_app_resume(void) { /* 不自动恢复播放; 用户回收音机应用自行按OK */ }
@@ -801,7 +801,10 @@ void radio_app_resume(void) { /* 不自动恢复播放; 用户回收音机应用
 void app_framework_minimize_services(bool restore_radio) {
     if (s_level != APP_LEVEL_HOME && s_level != APP_LEVEL_MENU) return;
     if (s_defer_minimized_services) {
-        app_framework_restore_minimized_services_ordered();
+        // A cancelled XiaoZhi connect worker is still winding down and may
+        // hold the Opus arena / TLS buffers. Pulling the radio decoder or the
+        // Codex bridge back now would fight it for the same contiguous heap.
+        // app_apps.cc restores services from the worker after Opus is freed.
         return;
     }
 
@@ -834,8 +837,11 @@ void app_framework_defer_minimized_services_restore(void) {
 }
 
 void app_framework_restore_minimized_services_ordered(void) {
-    if (s_level != APP_LEVEL_HOME && s_level != APP_LEVEL_MENU) return;
+    // Clear the defer flag first: the restore may be requested from the
+    // XiaoZhi worker after the user has already entered another app, and a
+    // stuck flag would block every later home/menu restore.
     s_defer_minimized_services = false;
+    if (s_level != APP_LEVEL_HOME && s_level != APP_LEVEL_MENU) return;
     // Rebuild the MP3 decoder first: the minimized Codex bridge allocates its
     // own task/socket state and can reduce the largest contiguous block below
     // the decoder's 20KB first-frame requirement.

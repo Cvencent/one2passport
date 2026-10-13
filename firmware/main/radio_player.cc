@@ -75,7 +75,7 @@ constexpr std::size_t kLevelCount = 18;
 // 在 C3 上可接受)。
 constexpr std::size_t kMaxStations = 14;
 // Consecutive silent failures tolerated before moving to the next station.
-constexpr uint8_t kMaxFailedAttempts = 3;
+constexpr uint8_t kMaxFailedAttempts = 2;
 
 // These national streams are not tied to one local transmitter, so they carry
 // no dial frequency and the needle spreads them across the scale by position.
@@ -624,8 +624,8 @@ constexpr std::size_t kNetworkBlocks = 28;
 // 欠载后把“恢复阈值”翻倍(见 stream_station 里的 wait_bytes), 但上限必须
 // 明显小于环容量: 27KB 环里等 20KB 再出声会在源端断续时制造 1.5s 以上的
 // 静音, 而且剩余空间不足以吸收下一段突发(实测 rebuffers 连续累积)。
-constexpr std::size_t kPrebufferTarget = 16 * 1024;
-constexpr std::size_t kMaxResumePrebuffer = 20 * 1024;
+constexpr std::size_t kPrebufferTarget = 6 * 1024;
+constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
 
 // network_feed_task 的栈**静态分配**: 它要求一块 2048B **连续**堆, 而
 // 播放时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 动态申请必然失败
@@ -699,7 +699,12 @@ bool stream_station(std::size_t station, uint32_t generation) {
 
     esp_http_client_config_t config = {};
     config.url = preset.url;
-    config.timeout_ms = 7000;
+    // Keep the connect phase short: when the user switches stations the old
+    // worker can still be blocked in HTTP connect/read, and a 7s timeout made
+    // every switch feel like "wait forever" (the new request could not start
+    // until the old one returned). 1.5s is enough for a healthy TCP+DNS+header
+    // exchange; a station that needs longer is retried by the outer loop.
+    config.timeout_ms = 1500;
     // ⚠ 2026-10-13 修正(推翻 2026-10-10 的结论):
     //   当时"降到 1024 就卡"的真正原因是网络环形缓冲只有 3~6KB, 而不是
     //   HTTP 接收缓冲本身。现在环形缓冲已有 27KB(借用小智空闲麦克风栈),
@@ -1086,6 +1091,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
                 raw.len -= raw.consumed;
 
                 if (frame.decoded_size > 0) {
+                    s_pool_warmed.store(true, std::memory_order_release);
                     esp_audio_simple_dec_info_t info = {};
                     if (!format_ready &&
                         esp_audio_simple_dec_get_info(decoder, &info) == ESP_AUDIO_ERR_OK) {
@@ -1198,7 +1204,7 @@ void player_task(void *) {
     // 连续失败升级冷却: 坏流(如目录里不可解码的电台)会被反复重试, 固定 10s
     // 冷却等于每 10s 烧一轮 CPU+解码风暴(实测发热)。按连续失败次数指数退避,
     // 上限 120s, 使坏流状态下 CPU 占用可忽略。
-    uint32_t fail_backoff_ms = 1500;   // 首次短退避: 让堆有时间合并出解码器所需连续块
+    uint32_t fail_backoff_ms = 500;    // 首次短退避: 让堆有时间合并出解码器所需连续块
     while (true) {
         if (!s_wanted_playing.load(std::memory_order_acquire)) {
             radio_ui_set_playback(RadioPlaybackState::Stopped, "已暂停");
@@ -1261,7 +1267,7 @@ void player_task(void *) {
             // XiaoZhi task / Wi-Fi teardown is still holding contiguous RAM.
             // Poll quickly for that block instead of entering the old 60s
             // penalty, which made a healthy station look permanently dead.
-            if (fail_backoff_ms < 1500) fail_backoff_ms = 1500;
+            if (fail_backoff_ms < 500) fail_backoff_ms = 500;
             radio_ui_set_playback(RadioPlaybackState::Error, "内存不足 稍后重试");
             ESP_LOGW(kTag,
                      "stream failed: not enough contiguous heap; "
@@ -1279,12 +1285,11 @@ void player_task(void *) {
         // 而原来固定 10s 首次退避会让用户干等 10 秒才出声, 体感就是"卡在缓冲
         // 一直出不来"。之后仍按指数退避(×2, 上限 120s)防止坏台烧 CPU。
         if (!interruptible_delay_ms(fail_backoff_ms, generation, station)) continue;
-        if (fail_backoff_ms < 120000) {
-            // 首轮 1.5s -> 下一轮起按 10s 起步再翻倍
-            fail_backoff_ms = (fail_backoff_ms < 10000)
-                                  ? 10000
-                                  : (fail_backoff_ms > 60000 ? 120000
-                                                             : fail_backoff_ms * 2);
+        // Interactive station switching should not inherit the old 10s
+        // heat-protection ramp. Keep retries bounded to 3s while the user is
+        // cycling stations; low-memory failures still use the longer path above.
+        if (fail_backoff_ms < 3000) {
+            fail_backoff_ms = fail_backoff_ms < 1000 ? 1000 : fail_backoff_ms * 2;
         }
 
         ++failed_attempts;
@@ -1296,7 +1301,6 @@ void player_task(void *) {
                      static_cast<unsigned>(station));
             radio_ui_set_playback(RadioPlaybackState::Error,
                                   "电台无法播放 已换台");
-            interruptible_delay_ms(1200, generation, station);
             failed_attempts = 0;
             radio_player_select_relative(1);
             continue;

@@ -413,10 +413,13 @@ bool xiaozhi_app_enter(void) {
     xz_connect_cancel = !can_start_connect;
     // 小智需要大块连续内存(opus 25KB + mic 栈 18KB + TLS ~20KB), 先释放收音机池
     // (此时收音机已暂停)。退出小智时 radio_player_ensure_pool() 会重新抢占。
-    radio_player_set_playing(false);
-    // HTTP 流任务自身的 socket 超时为 7s；1.5s 只停掉播放器状态，
-    // 网络任务仍可能持有缓冲和任务栈，随后释放池会与它并发抢内存。
-    const bool radio_idle = radio_player_wait_idle(10000);
+    //
+    // 框架的 enter_app() 已经调用过 radio_app_pause()（停流 + 最多等 2s）。
+    // 这里不要再等 10s：worker 若正卡在 esp_http_client 内部的 DNS 解析，
+    // 第二次长等待只会让 LVGL/输入任务再卡十秒。只做一次很短的兜底确认，
+    // 超时就保留解码池，避免与仍在收尾的 worker 并发释放。
+    const bool radio_idle = !radio_player_is_stream_active() ||
+                            radio_player_wait_idle(1000);
     if (!radio_idle) {
         ESP_LOGW(kTag, "radio did not become idle before XiaoZhi; keep pool intact");
     } else {

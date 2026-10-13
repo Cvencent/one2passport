@@ -105,3 +105,9 @@ CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000
 
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=1024
+
+# DNS servers: cap at two to bound resolution latency. The device has shown
+# intermittent EAI_FAIL on every DNS server even with plenty of free heap, and
+# lwIP retries each server on a 1+2+3+4s schedule. A third DHCP-provided server
+# can push one getaddrinfo() to roughly 30s and block the radio worker.
+CONFIG_LWIP_DNS_MAX_SERVERS=2

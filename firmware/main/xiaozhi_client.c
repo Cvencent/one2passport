@@ -168,6 +168,64 @@ static void load_or_create_client_id(void)
     }
 }
 
+// ---- cached OTA result (NVS) ----
+// The OTA endpoint hands back a WebSocket URL and a bearer token. That pair is
+// stable across reboots until the binding/token is revoked, so paying a full
+// HTTPS/TLS round trip on every re-entry made "enter XiaoZhi" take ~5s longer
+// than necessary. Cache it, try WS first, and fall back to OTA on any failure.
+static void xz_cache_load(void)
+{
+    if (s_config_cached && s_url[0]) return;
+    s_url[0] = 0;
+    s_token[0] = 0;
+    nvs_handle_t h;
+    if (nvs_open("xiaozhi", NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = sizeof(s_url);
+    if (nvs_get_str(h, "ws_url", s_url, &len) != ESP_OK || !s_url[0]) {
+        s_url[0] = 0;
+        nvs_close(h);
+        return;
+    }
+    len = sizeof(s_token);
+    if (nvs_get_str(h, "ws_token", s_token, &len) != ESP_OK) s_token[0] = 0;
+    uint8_t proto = 3;
+    if (nvs_get_u8(h, "proto_ver", &proto) == ESP_OK && proto > 0) {
+        s_proto_version = proto;
+    }
+    nvs_close(h);
+    s_config_cached = true;
+    ESP_LOGI(TAG, "cached OTA config: url=%.60s token=%d chars proto=%d",
+             s_url, (int)strlen(s_token), s_proto_version);
+}
+
+static void xz_cache_save(void)
+{
+    if (!s_url[0]) return;
+    nvs_handle_t h;
+    if (nvs_open("xiaozhi", NVS_READWRITE, &h) != ESP_OK) return;
+    esp_err_t e = nvs_set_str(h, "ws_url", s_url);
+    if (e == ESP_OK) e = nvs_set_str(h, "ws_token", s_token);
+    if (e == ESP_OK) e = nvs_set_u8(h, "proto_ver", (uint8_t)s_proto_version);
+    if (e == ESP_OK) e = nvs_commit(h);
+    if (e != ESP_OK) ESP_LOGW(TAG, "cached OTA save failed: %s", esp_err_to_name(e));
+    nvs_close(h);
+    s_config_cached = true;
+}
+
+static void xz_cache_clear(void)
+{
+    s_config_cached = false;
+    s_url[0] = 0;
+    s_token[0] = 0;
+    nvs_handle_t h;
+    if (nvs_open("xiaozhi", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_erase_key(h, "ws_url");
+    nvs_erase_key(h, "ws_token");
+    nvs_erase_key(h, "proto_ver");
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 // ---- OTA: fetch websocket url+token ----
 static bool ota_fetch_config(void)
 {
@@ -343,7 +401,7 @@ static bool ota_fetch_config(void)
     ESP_LOGW(TAG, "PLAIN_WS_TEST url=%s", s_url);
 #endif
     ESP_LOGI(TAG, "OTA ok: url=%.60s token=%d chars", s_url, (int)strlen(s_token));
-    s_config_cached = true;
+    xz_cache_save();
     return true;
 }
 
@@ -1381,7 +1439,7 @@ bool xiaozhi_client_connect(void)
         extern void app_wifi_xiaozhi_mode(bool active);
         app_wifi_xiaozhi_mode(true);
     }
-    s_url[0] = 0; s_token[0] = 0; s_session_id[0] = 0;
+    s_session_id[0] = 0;
     s_encoder_gave_up = false;   // 新会话: 允许再次尝试初始化编码器
     // 证书有效期校验需要正确的系统时间; 若 SNTP 未完成则等待(最多 8s)
     {
@@ -1406,11 +1464,32 @@ bool xiaozhi_client_connect(void)
     // 桥接已停, 此刻连续块最富余。若让 OTA 先跑, TLS 会把这块切碎, Opus
     // 往往就再也拿不到(实测曾固定卡在 largest 20480 < 24524 失败)。
     if (!xiaozhi_opus_prewarm()) goto done;
-    if (!ota_fetch_config()) goto done;
-    s_cached_ver = s_proto_version;
-    if (xz_cancel_requested()) goto done;
-    if (!ws_connect_and_hello()) goto done;
-    success = true;
+
+    // Fast path: reuse the last OTA result. The token and WS endpoint are
+    // stable until the device is re-bound, so a normal re-entry should go
+    // straight to the WebSocket handshake instead of repeating HTTPS OTA.
+    xz_cache_load();
+    if (s_config_cached && s_url[0]) {
+        ESP_LOGI(TAG, "trying cached WS config first");
+        if (ws_connect_and_hello()) {
+            success = true;
+        } else {
+            if (xz_cancel_requested()) goto done;
+            ESP_LOGW(TAG, "cached WS failed; refreshing OTA config");
+            xiaozhi_client_close();
+            xz_cache_clear();
+        }
+    }
+
+    // Cold path / cached-token fallback: fetch a fresh OTA config, then
+    // connect once. If the server is rotating configs this also refreshes NVS.
+    if (!success) {
+        if (!ota_fetch_config()) goto done;
+        s_cached_ver = s_proto_version;
+        if (xz_cancel_requested()) goto done;
+        if (!ws_connect_and_hello()) goto done;
+        success = true;
+    }
 
 done:
     if (!success || xz_cancel_requested()) {

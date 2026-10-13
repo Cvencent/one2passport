@@ -19,6 +19,11 @@ static i2s_chan_handle_t      s_tx, s_rx;
 static uint32_t s_hz;
 static uint8_t  s_bits, s_ch;
 static bool     s_opened;
+// Keep the requested volume in the driver. esp_codec_dev_open() re-applies
+// its cached volume, but the codec is rebuilt when the sample format changes,
+// and the new codec starts from 0. Remembering the value here lets every open
+// restore the user's level instead of silently muting until the next write.
+static uint8_t  s_volume = 55;
 // 串行化 codec 的开关与读写。
 //
 // 【为什么必需】收音机(radio_player)与 Codex 页(ui_sfx 提示音、coding_bridge
@@ -35,6 +40,16 @@ static inline void audio_lock(void) {
 
 static inline void audio_unlock(void) {
     if (s_lock) xSemaphoreGiveRecursive(s_lock);
+}
+
+// Prime the DAC path with a short block of digital silence after the codec is
+// opened. Station changes force close+open because the sample rate changes;
+// on this directly-coupled ES8311 output the open transient is audible as a
+// brief tick/hiss. A silent write lets the DMA/PA settle before real PCM.
+static void prime_output(void) {
+    if (!s_dev || !s_opened) return;
+    int16_t silence[128] = {};
+    (void)esp_codec_dev_write(s_dev, silence, sizeof(silence));
 }
 
 static esp_err_t i2s_full_duplex_init(void) {
@@ -195,8 +210,10 @@ esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch) {
     //   ES8311 的模拟 PGA 上限约 40dB, 留 0dB 余量给驱动内部做防削波处理。
     //   麦克风离喇叭较远时 30dB 明显不够(设备是桌面摆件, 人站在旁边说话)。
     esp_codec_dev_set_in_gain(s_dev, 40.0f);
+    esp_codec_dev_set_out_vol(s_dev, s_volume);
 
     s_opened = true; s_hz = hz; s_bits = bits; s_ch = ch;
+    prime_output();
     ESP_LOGI(TAG, "codec 打开 %luHz/%ubit/%uch", (unsigned long)hz, bits, ch);
     audio_unlock();
     return ESP_OK;
@@ -220,8 +237,9 @@ esp_err_t bsp_audio_read(void *pcm, size_t bytes) {
 }
 
 void bsp_audio_set_volume(uint8_t percent) {
+    s_volume = percent > 100 ? 100 : percent;
     if (!s_dev) return;
     audio_lock();
-    esp_codec_dev_set_out_vol(s_dev, percent);
+    esp_codec_dev_set_out_vol(s_dev, s_volume);
     audio_unlock();
 }

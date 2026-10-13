@@ -93,6 +93,12 @@ CONFIG_LWIP_TCP_WND_DEFAULT=5760
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=4
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=4
 CONFIG_LWIP_TCP_SNDMBOX_SIZE=4
+# A radio stream is intentionally torn down when the user changes station.
+# Normal close leaves the old PCB and its RX buffers in TIME_WAIT for TCP_MSL.
+# Three quick station changes then consume nearly all DMA-capable heap, and the
+# next DNS lookup fails with getaddrinfo()=202. Allow radio_player to set
+# SO_LINGER=0 so its deliberate stream cancellation closes immediately.
+CONFIG_LWIP_SO_LINGER=y
 
 # ---- ESP WebSocket: separate tx lock (2026-10-12) ----
 # Without this, esp_websocket_client_recv() holds client->lock while doing a

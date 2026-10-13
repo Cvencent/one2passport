@@ -62,6 +62,13 @@ static char s_token[TOKEN_MAX + 1];
 static char s_ip[16];
 static volatile bool s_task_stop_requested;
 static TaskHandle_t s_task_handle;
+/* The bridge task is long-lived and its 7KB stack was one of the large heap
+ * allocations that left the minimized home screen starved while the radio was
+ * streaming. XiaoZhi's idle microphone stack is already reserved static RAM;
+ * xiaozhi_bridge_stack() lends the lower half to this task whenever XiaoZhi is
+ * closed, keeping the heap free for DNS/HTTP work. */
+static StaticTask_t s_task_tcb;
+extern uint8_t *xiaozhi_bridge_stack(size_t *size);
 
 static esp_err_t save_token(const char *token);
 
@@ -76,8 +83,19 @@ static void client_replace(int new_fd)
         return;
     }
     if (s_client_fd >= 0) {
-        shutdown(s_client_fd, SHUT_RDWR);
+        const size_t free_before =
+            heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const size_t dma_before = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        struct linger linger = { .l_onoff = 1, .l_linger = 0 };
+        const int linger_result = setsockopt(s_client_fd, SOL_SOCKET, SO_LINGER,
+                                             &linger, sizeof(linger));
         close(s_client_fd);
+        ESP_LOGW(TAG,
+                 "client close: linger=%d free=%u->%u dma=%u->%u",
+                 linger_result, (unsigned)free_before,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)dma_before,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
     }
     s_client_fd = new_fd;
     s_client_authenticated = false;
@@ -432,8 +450,17 @@ esp_err_t wireless_bridge_init(wireless_bridge_line_cb_t line_cb,
 
     if (s_task_handle != NULL) return ESP_OK;
     s_task_stop_requested = false;
-    if (xTaskCreate(network_task, "wireless_bridge", NETWORK_TASK_STACK,
-                    NULL, 4, &s_task_handle) != pdPASS) {
+    size_t stack_size = 0;
+    uint8_t *stack = xiaozhi_bridge_stack(&stack_size);
+    if (stack == NULL || stack_size < NETWORK_TASK_STACK) {
+        ESP_LOGE(TAG, "idle stack unavailable for bridge (size=%u)",
+                 (unsigned)stack_size);
+        return ESP_ERR_NO_MEM;
+    }
+    s_task_handle = xTaskCreateStatic(network_task, "wireless_bridge",
+                                      NETWORK_TASK_STACK, NULL, 4,
+                                      (StackType_t *)stack, &s_task_tcb);
+    if (s_task_handle == NULL) {
         s_task_handle = NULL;
         return ESP_ERR_NO_MEM;
     }

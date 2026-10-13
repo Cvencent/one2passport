@@ -867,16 +867,53 @@ void wifi_event(WifiEvent event, const std::string &data) {
             ESP_LOGI(kTag, "Wi-Fi connected: %s, IP=%s", data.c_str(),
                      manager.GetIpAddress().c_str());
             esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            // Resolve through the LAN gateway first. The PC on this network
+            // resolves every radio host through the router instantly, while
+            // both the old 223.5.5.5 override and the DHCP-supplied 114
+            // resolver intermittently returned getaddrinfo()=202 from the
+            // device. The DHCP resolver stays as a portable backup.
+            esp_netif_dns_info_t dhcp_dns = {};
+            const bool have_dhcp_dns =
+                netif &&
+                esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dhcp_dns) == ESP_OK &&
+                dhcp_dns.ip.type == ESP_IPADDR_TYPE_V4 &&
+                dhcp_dns.ip.u_addr.ip4.addr != 0;
+            esp_netif_ip_info_t ip_info = {};
+            const bool have_gateway =
+                netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK &&
+                ip_info.gw.addr != 0;
             esp_netif_dns_info_t dns = {};
             dns.ip.type = ESP_IPADDR_TYPE_V4;
-            dns.ip.u_addr.ip4.addr = ipaddr_addr("223.5.5.5");
+            if (have_gateway) {
+                dns.ip.u_addr.ip4 = ip_info.gw;
+            } else if (have_dhcp_dns) {
+                dns.ip.u_addr.ip4 = dhcp_dns.ip.u_addr.ip4;
+            } else {
+                dns.ip.u_addr.ip4.addr = ipaddr_addr("223.5.5.5");
+            }
+            char primary_dns[16] = {};
+            esp_ip4addr_ntoa(&dns.ip.u_addr.ip4, primary_dns, sizeof(primary_dns));
             for (int attempt = 0; attempt < 3 && netif; ++attempt) {
                 esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
                 vTaskDelay(pdMS_TO_TICKS(250));
             }
-            dns.ip.u_addr.ip4.addr = ipaddr_addr("223.6.6.6");
-            if (netif) esp_netif_set_dns_info(netif, ESP_NETIF_DNS_BACKUP, &dns);
-            ESP_LOGI(kTag, "radio DNS: 223.5.5.5 / 223.6.6.6");
+            esp_netif_dns_info_t backup = {};
+            backup.ip.type = ESP_IPADDR_TYPE_V4;
+            if (have_dhcp_dns &&
+                dhcp_dns.ip.u_addr.ip4.addr != dns.ip.u_addr.ip4.addr) {
+                backup.ip.u_addr.ip4 = dhcp_dns.ip.u_addr.ip4;
+            } else if (dns.ip.u_addr.ip4.addr != ipaddr_addr("223.5.5.5")) {
+                backup.ip.u_addr.ip4.addr = ipaddr_addr("223.5.5.5");
+            } else {
+                backup.ip.u_addr.ip4.addr = ipaddr_addr("114.114.114.114");
+            }
+            if (netif) esp_netif_set_dns_info(netif, ESP_NETIF_DNS_BACKUP, &backup);
+            char backup_dns[16] = {};
+            esp_ip4addr_ntoa(&backup.ip.u_addr.ip4, backup_dns, sizeof(backup_dns));
+            ESP_LOGI(kTag, "radio DNS: %s / %s (gateway=%d dhcp=%d)",
+                     primary_dns[0] ? primary_dns : "unknown",
+                     backup_dns[0] ? backup_dns : "unknown",
+                     (int)have_gateway, (int)have_dhcp_dns);
             s_connected.store(true);
             s_config_mode.store(false);
             s_config_can_cancel.store(false);

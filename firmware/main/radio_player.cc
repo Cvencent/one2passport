@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/sockets.h"
 #include "nvs.h"
 #include "radio_ui.h"
 #include "radio_stream_buffer.h"
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -75,7 +77,10 @@ constexpr std::size_t kLevelCount = 18;
 // 在 C3 上可接受)。
 constexpr std::size_t kMaxStations = 14;
 // Consecutive silent failures tolerated before moving to the next station.
-constexpr uint8_t kMaxFailedAttempts = 2;
+// Public directories are full of dead entries; retrying the same address just
+// makes every "next station" press feel frozen. Move on after the first
+// terminal failure, while low-memory failures still hold the same station.
+constexpr uint8_t kMaxFailedAttempts = 1;
 
 // These national streams are not tied to one local transmitter, so they carry
 // no dial frequency and the needle spreads them across the scale by position.
@@ -132,6 +137,13 @@ SemaphoreHandle_t s_station_mutex;
 SemaphoreHandle_t s_pool_mutex;
 std::atomic<uint32_t> s_playback_revision{0};
 RadioStation s_stations[kMaxStations] = {};
+
+// The stream worker lives for the whole session (it is only suspended while
+// paused). Like the bridge task, its 4.6KB stack was permanently taken from
+// the heap; putting it in .bss leaves the allocator enough contiguous room for
+// DNS/HTTP setup while the minimized radio and bridge run together on home.
+static StaticTask_t s_player_task_tcb;
+static StackType_t s_player_task_stack[4608];
 
 // ---- MP3 解码器内存池(开机预分配) ----
 // C3 上 WiFi 连上后堆碎片化(largest 仅 ~7.6KB), 现场 open 解码器(需 ~19KB
@@ -621,10 +633,13 @@ namespace {
 // 27KB 环形缓冲；heap 分配只作为 borrow 不可用时的兜底。
 constexpr std::size_t kNetworkBlocks = 28;
 // 启动预缓冲 2KB: 切台后尽快出声。实测源端会周期性停顿 0.5~2s, 所以每次
-// 欠载后把“恢复阈值”翻倍(见 stream_station 里的 wait_bytes), 但上限必须
+// 欠载后把"恢复阈值"翻倍(见 stream_station 里的 wait_bytes), 但上限必须
 // 明显小于环容量: 27KB 环里等 20KB 再出声会在源端断续时制造 1.5s 以上的
 // 静音, 而且剩余空间不足以吸收下一段突发(实测 rebuffers 连续累积)。
-constexpr std::size_t kPrebufferTarget = 6 * 1024;
+// 2026-10-13: 2KB/4KB 起播都会在首个 10s 窗口内欠载一次; 8KB 在真机上
+// 已消除这一轮空转, 代价是慢源首响多等一点。真遇到源端停顿仍会按下面的
+// 倍率提高恢复阈值。
+constexpr std::size_t kPrebufferTarget = 8 * 1024;
 constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
 
 // network_feed_task 的栈**静态分配**: 它要求一块 2048B **连续**堆, 而
@@ -699,12 +714,17 @@ bool stream_station(std::size_t station, uint32_t generation) {
 
     esp_http_client_config_t config = {};
     config.url = preset.url;
-    // Keep the connect phase short: when the user switches stations the old
-    // worker can still be blocked in HTTP connect/read, and a 7s timeout made
-    // every switch feel like "wait forever" (the new request could not start
-    // until the old one returned). 1.5s is enough for a healthy TCP+DNS+header
-    // exchange; a station that needs longer is retried by the outer loop.
-    config.timeout_ms = 1500;
+    // esp_http_client timeout_ms covers connect + first-header wait. 1.5s was
+    // too aggressive for a cold DNS/TLS/ICY handshake and caused healthy
+    // stations to report "HTTP status -1" exactly when the user switched:
+    // they then waited through the outer retry backoff ("switch takes ages").
+    // Give the connect phase a realistic budget here; after the headers arrive
+    // the code below tightens the live read timeout to 1000ms so pause/switch
+    // still cancels quickly.
+    // 3.5s: enough for DNS + TCP + ICY headers on a healthy stream, but not so
+    // long that a dead directory entry feels like a frozen dial. Live reads are
+    // re-armed to 1000ms after the headers arrive (see below).
+    config.timeout_ms = 3500;
     // ⚠ 2026-10-13 修正(推翻 2026-10-10 的结论):
     //   当时"降到 1024 就卡"的真正原因是网络环形缓冲只有 3~6KB, 而不是
     //   HTTP 接收缓冲本身。现在环形缓冲已有 27KB(借用小智空闲麦克风栈),
@@ -730,6 +750,46 @@ bool stream_station(std::size_t station, uint32_t generation) {
         ESP_LOGE(kTag, "HTTP client allocation failed");
         return false;
     }
+    const auto close_client = [client]() {
+        // This is a one-shot live stream. When the user changes station, wait
+        // no longer applies and a graceful FIN leaves the old receive buffers
+        // in TIME_WAIT for CONFIG_LWIP_TCP_MSL (~60s). Rapid switching then
+        // exhausts DMA-capable heap and DNS starts returning getaddrinfo()=202.
+        // Force an abortive close for this deliberately canceled stream so the
+        // socket/PCB and its buffers are reclaimed immediately.
+        const std::size_t free_before =
+            heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const std::size_t dma_before =
+            heap_caps_get_free_size(MALLOC_CAP_DMA);
+        const int fd = esp_http_client_get_socket(client);
+        // lwIP only turns SO_LINGER=0 into an immediate RST when unsent or
+        // unacknowledged data exists. A slow station may have no data queued,
+        // in which case close() still sends FIN and leaves TIME_WAIT behind.
+        // Queue one harmless byte after enabling linger: close() then takes
+        // the abort path deterministically and reclaims the PCB immediately.
+        int linger_result = -1;
+        int abort_tx = -1;
+        if (fd >= 0) {
+            struct linger linger = {};
+            linger.l_onoff = 1;
+            linger.l_linger = 0;
+            linger_result = setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger,
+                                       sizeof(linger));
+            if (linger_result == 0) {
+                const char abort_byte = 0;
+                abort_tx = send(fd, &abort_byte, sizeof(abort_byte), MSG_DONTWAIT);
+            }
+        }
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        ESP_LOGW(kTag,
+                 "tcp close: fd=%d abort_tx=%d linger=%d errno=%d free=%u->%u dma=%u->%u",
+                 fd, abort_tx, linger_result, linger_result ? errno : 0,
+                 (unsigned)free_before,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)dma_before,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    };
     // 请求 ICY 元数据: 必须发 1, 服务器才会在响应头返回 icy-metaint,
     // 我们据此剥离插入的元数据块(见 IcyStripper)。
     // ⚠ 发 0 时服务器**依然**周期性插入元数据, 只是不告诉我们间隔 -> 无解,
@@ -781,8 +841,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
     }
     if (!input || !output) {
         ESP_LOGE(kTag, "stream buffers unavailable");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
+        close_client();
         xSemaphoreGiveRecursive(s_pool_mutex);
         return false;
     }
@@ -921,6 +980,10 @@ bool stream_station(std::size_t station, uint32_t generation) {
         int64_t last_write_end = 0;
         uint32_t max_read_us = 0, max_gap_us = 0, slow_gaps = 0;
         uint32_t pcm_samples = 0, pcm_clipped = 0, sample_rate = 0;
+        // Signal diagnostics: sum absolute 16-bit samples so we can tell
+        // normal programme material apart from a low-level codec/PA floor.
+        uint64_t pcm_abs_sum = 0;
+        uint16_t pcm_peak = 0;
         uint8_t applied_volume = 0;
         IcyStripper icy;              // ICY 元数据剥离器(见 struct 定义)
         {
@@ -1129,22 +1192,33 @@ bool stream_station(std::size_t station, uint32_t generation) {
                         }
                         const auto *samples = reinterpret_cast<const int16_t *>(frame.buffer);
                         for (std::size_t i = 0; i < mono_bytes / 2; ++i) {
-                            if (samples[i] >= 32760 || samples[i] <= -32760) ++pcm_clipped;
+                            const int32_t value = samples[i];
+                            if (value >= 32760 || value <= -32760) ++pcm_clipped;
+                            const uint32_t magnitude =
+                                static_cast<uint32_t>(value < 0 ? -value : value);
+                            pcm_abs_sum += magnitude;
+                            if (magnitude > pcm_peak) {
+                                pcm_peak = static_cast<uint16_t>(magnitude);
+                            }
                         }
                         pcm_samples += mono_bytes / 2;
                         if (bsp_audio_write(frame.buffer, mono_bytes) != ESP_OK) continue;
                         last_write_end = esp_timer_get_time();
                         if (last_write_end - stats_start >= 10000000) {
                             max_read_us = feed.max_read_us.exchange(0);
-                            ESP_LOGI(kTag, "audio stats: wall=%ums pcm=%ums read_max=%ums gap_max=%ums gaps30=%u clipped=%u rebuffers=%u queued=%u stack_free=%u",
+                            ESP_LOGI(kTag, "audio stats: wall=%ums pcm=%ums read_max=%ums gap_max=%ums gaps30=%u clipped=%u rms=%u peak=%u rebuffers=%u queued=%u stack_free=%u",
                                      (unsigned)((last_write_end - stats_start) / 1000),
                                      (unsigned)(pcm_samples * 1000ULL / sample_rate),
                                      (unsigned)(max_read_us / 1000), (unsigned)(max_gap_us / 1000),
                                      (unsigned)slow_gaps, (unsigned)pcm_clipped,
+                                     pcm_samples ? (unsigned)(pcm_abs_sum / pcm_samples) : 0,
+                                     (unsigned)pcm_peak,
                                      (unsigned)rebuffers, (unsigned)ring.available(),
                                      (unsigned)uxTaskGetStackHighWaterMark(nullptr));
                             stats_start = last_write_end;
                             max_read_us = max_gap_us = slow_gaps = pcm_samples = pcm_clipped = 0;
+                            pcm_abs_sum = 0;
+                            pcm_peak = 0;
                             rebuffers = 0;
                         }
                         calculate_levels(frame.buffer, mono_bytes, 1);
@@ -1192,8 +1266,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
         free(output);
         free(input);
     }
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
+    close_client();
     xSemaphoreGiveRecursive(s_pool_mutex);
     return played_audio;
 }
@@ -1278,24 +1351,10 @@ void player_task(void *) {
             continue;
         }
 
-        // 未播出: 冷却。首次用**短退避(1.5s)**而非 10s ——
-        // 实测"退出收音机再进来点继续"时, 首次 stream_station 常因堆尚未整理
-        // 而解码器 init 失败(ESP_MP3_DEC ret 10); 堆在 1~2 秒内即可合并出
-        // 连续块(largest 7680 -> 19456), 短退避后重试即成功。
-        // 而原来固定 10s 首次退避会让用户干等 10 秒才出声, 体感就是"卡在缓冲
-        // 一直出不来"。之后仍按指数退避(×2, 上限 120s)防止坏台烧 CPU。
-        if (!interruptible_delay_ms(fail_backoff_ms, generation, station)) continue;
-        // Interactive station switching should not inherit the old 10s
-        // heat-protection ramp. Keep retries bounded to 3s while the user is
-        // cycling stations; low-memory failures still use the longer path above.
-        if (fail_backoff_ms < 3000) {
-            fail_backoff_ms = fail_backoff_ms < 1000 ? 1000 : fail_backoff_ms * 2;
-        }
-
+        // 未播出: 连接/首包失败按"该目录项已失效"处理, 见上面 kMaxFailedAttempts
+        // 的说明; 内存不足的场景已在更早的分支单独处理, 不会走到这里。
         ++failed_attempts;
         const std::size_t count = radio_player_station_count();
-        // Public directories keep dead entries around. After a few silent
-        // failures, move on instead of retrying the same address forever.
         if (failed_attempts >= kMaxFailedAttempts && count > 1) {
             ESP_LOGW(kTag, "Station %u unreachable, skipping to the next one",
                      static_cast<unsigned>(station));
@@ -1307,7 +1366,10 @@ void player_task(void *) {
         }
 
         radio_ui_set_playback(RadioPlaybackState::Error, "连接失败，正在重试");
-        interruptible_delay_ms(2500, generation, station);
+        if (!interruptible_delay_ms(fail_backoff_ms, generation, station)) continue;
+        if (fail_backoff_ms < 3000) {
+            fail_backoff_ms = fail_backoff_ms < 1000 ? 1000 : fail_backoff_ms * 2;
+        }
     }
 }
 
@@ -1317,7 +1379,9 @@ static bool start_player_task_locked() {
     if (s_player_task.load(std::memory_order_acquire)) return true;
     TaskHandle_t task = nullptr;
     s_worker_quiescent = false;
-    if (xTaskCreate(player_task, "radio_stream", 4608, nullptr, 5, &task) != pdPASS) {
+    task = xTaskCreateStatic(player_task, "radio_stream", 4608, nullptr, 5,
+                             s_player_task_stack, &s_player_task_tcb);
+    if (task == nullptr) {
         return false;
     }
     s_player_task.store(task, std::memory_order_release);

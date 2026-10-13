@@ -987,7 +987,16 @@ static bool s_encoder_gave_up;
 
 // Opus CELT stack use exceeds 18KB; keep the capture task on static storage so
 // it also cannot fail because of heap fragmentation.
-static StackType_t s_mic_stack_storage[XZ_MIC_STACK_WORDS];
+// The mic task only runs while XiaoZhi is open. While it is closed this
+// storage is idle static RAM; radio and the minimized Codex bridge share it
+// instead of taking equivalent buffers from the already-tight heap.
+//
+// Layout: [ bridge task stack ][ radio jitter ring ]. The two owners are
+// mutually exclusive with XiaoZhi (entering it stops radio and bridge first),
+// but they run together on home, so the regions must not overlap.
+#define XZ_BRIDGE_STACK_BYTES 7168
+static StackType_t s_mic_stack_storage[XZ_MIC_STACK_WORDS]
+    __attribute__((aligned(16)));
 static StaticTask_t s_mic_tcb;
 static TaskHandle_t s_mic_task;
 
@@ -1554,18 +1563,35 @@ bool xiaozhi_client_init(void)
     return s_event_queue != NULL;
 }
 
-// Radio may borrow the idle microphone stack as jitter buffer. Ownership is
-// exclusive by lifecycle: entering XiaoZhi stops the radio stream first, and
-// this returns NULL while any XiaoZhi task or WS owns the stack.
+static bool xz_mic_stack_is_idle(void)
+{
+    if (s_ws || s_ws_open || s_ws_connected || s_mic_task || s_tts_task ||
+        s_encoder_ready || s_decoder_ready) {
+        return false;
+    }
+    return true;
+}
+
+// Carved out of the idle microphone stack for the always-on minimized bridge.
+// This keeps the bridge's 7KB task stack out of the heap; entering XiaoZhi
+// stops the bridge before the mic task is allowed to reuse the full array.
+uint8_t *xiaozhi_bridge_stack(size_t *size)
+{
+    if (size) *size = 0;
+    if (!xz_mic_stack_is_idle()) return NULL;
+    if (size) *size = XZ_BRIDGE_STACK_BYTES;
+    return s_mic_stack_storage;
+}
+
+// Radio borrows the remainder as a jitter ring. Ownership is exclusive by
+// lifecycle: entering XiaoZhi stops the radio stream first, and this returns
+// NULL while any XiaoZhi task or WS owns the stack.
 uint8_t *xiaozhi_idle_buffer(size_t *size)
 {
     if (size) *size = 0;
-    if (s_ws || s_ws_open || s_ws_connected || s_mic_task || s_tts_task ||
-        s_encoder_ready || s_decoder_ready) {
-        return NULL;
-    }
-    if (size) *size = sizeof(s_mic_stack_storage);
-    return s_mic_stack_storage;
+    if (!xz_mic_stack_is_idle()) return NULL;
+    if (size) *size = sizeof(s_mic_stack_storage) - XZ_BRIDGE_STACK_BYTES;
+    return s_mic_stack_storage + XZ_BRIDGE_STACK_BYTES;
 }
 
 

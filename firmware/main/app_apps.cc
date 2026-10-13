@@ -27,12 +27,14 @@ extern "C" {
 #include "lvgl.h"
 #include "bsp_display.h"
 #include "esp_log.h"
+extern "C" void xz_heap_report(const char *tag);
 
 // ---- main.cc 提供的桥(C 链接) ----
 extern "C" void app_radio_request_catalog(void);
 extern "C" void app_radio_request_city(const char *city, const char *display);
 extern "C" void app_radio_enter_wifi_setup(void);
 extern "C" void app_radio_show_saved_wifi(void);
+extern "C" void app_wifi_xiaozhi_mode(bool active);
 
 static const char *kTag = "app_apps";
 static bool s_settings_open;
@@ -98,7 +100,17 @@ bool radio_app_enter(void) {
     //     task_wdt: Tasks currently running: CPU 0: taskLVGL
     //   实测一次都没打��� ensure_pool 日志就是这么被饿死的。
     //   正确做法: 交给自己新建的 worker 任务去抢池, LVGL 立即返回。
-    radio_request_pool_prewarm();
+    // Entering the full radio from the home layer can happen after XiaoZhi /
+    // Codex released the decoder pool. The pool and the LEO page tree both need
+    // large chunks of the same heap; racing the asynchronous prewarm worker
+    // against build_main() exhausted the heap (33KB -> 68B) and LVGL crashed.
+    // Reclaim the decoder first (if it is missing), then construct the page.
+    xz_heap_report("radio_enter_before_pool");
+    if (!radio_player_has_pool()) {
+        ESP_LOGW("app_apps", "radio pool missing before UI; re-acquiring synchronously");
+        radio_player_ensure_pool();
+    }
+    xz_heap_report("radio_enter_after_pool");
     // ⚠⚠ 先启动播放, 再建 UI(2026-10-12 修复"进收音机一直转圈/不出声"):
     //   播放要连 socket, 而 socket + esp_http_client 缓冲(2048+512)合计需要
     //   ~5KB **连续**内存。若先建 UI, 堆被 LVGL 切碎后 largest 只剩 4608,
@@ -549,6 +561,7 @@ void xiaozhi_async_connect_task(void *) {
 void xiaozhi_app_exit(void) {
     // 小智不后台驻留: 退出后禁止连接任务继续重试，并立即关闭当前 WS。
     xz_connect_cancel = true;
+    app_wifi_xiaozhi_mode(false);
     app_power_hold_awake(false);   // release the keep-awake taken on enter
     xz_thinking_deadline = 0;
     xz_hold_pending = false;

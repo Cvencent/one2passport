@@ -373,8 +373,14 @@ extern int opus_decoder_get_size(int channels);
 extern int opus_decoder_init(void *st, int Fs, int channels, int *error);
 extern int opus_decode(void *st, const unsigned char *data, int len,
                        short *pcm, int frame_size, int decode_fec);
-// 解码器 state 按需分配(见上方说明), 首次 TTS 帧到达时才从堆里取。
+// 解码器与编码器共用同一块 Opus arena。两者在正常轮次里是分时使用的:
+// 录音结束才可能收到 TTS, 播报时麦克风采集任务已经退出。这样不再要求
+// 碎片化堆里额外找出一块 17784B 连续内存。
 static bool s_decoder_ready;
+static bool xz_opus_arena_ensure(void);
+static bool xz_opus_encoder_yield_to_decoder(void);
+static void *s_opus_state;
+static int s_opus_state_size;
 
 /* ---- TTS 下行: Opus 解码 + 播放 ----
  * 一帧服务器 Opus -> 16kHz 单声道 PCM -> I2S。frame_duration 在 hello 里
@@ -430,24 +436,28 @@ static void *s_opus_dec_state;
 static bool xz_opus_decoder_ensure(void)
 {
     if (s_decoder_ready) return true;
+    if (!xz_opus_encoder_yield_to_decoder()) {
+        ESP_LOGE(TAG, "opus decoder deferred: encoder still busy");
+        return false;
+    }
+    if (!xz_opus_arena_ensure()) return false;
     const int need = opus_decoder_get_size(1);
     if (need <= 0) {
         ESP_LOGE(TAG, "opus decoder size invalid: %d", need);
         return false;
     }
-    void *st = heap_caps_malloc((size_t)need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!st) {
-        ESP_LOGW(TAG, "opus decoder alloc failed (need=%d, largest=%u)", need,
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (need > s_opus_state_size) {
+        ESP_LOGE(TAG, "opus arena too small: decoder=%d arena=%d", need,
+                 s_opus_state_size);
         return false;
     }
+    memset(s_opus_state, 0, (size_t)s_opus_state_size);
     int err = 0;
-    if (opus_decoder_init(st, 16000, 1, &err) != OPUS_DEC_OK) {
+    if (opus_decoder_init(s_opus_state, 16000, 1, &err) != OPUS_DEC_OK) {
         ESP_LOGE(TAG, "opus decoder init failed: %d", err);
-        free(st);
         return false;
     }
-    s_opus_dec_state = st;
+    s_opus_dec_state = s_opus_state;
     s_decoder_ready = true;
     ESP_LOGI(TAG, "opus decoder ready: state=%d bytes", need);
     return true;
@@ -456,8 +466,7 @@ static bool xz_opus_decoder_ensure(void)
 void xz_opus_decoder_release(void)
 {
     if (!s_decoder_ready) return;
-    // libopus 解码器没有额外堆资源, 直接归还 state 内存。
-    free(s_opus_dec_state);
+    // arena 由编码器/解码器共用, 会话退出时才统一释放。
     s_opus_dec_state = NULL;
     s_decoder_ready = false;
 }
@@ -487,6 +496,10 @@ static void xz_tts_play_task(void *arg)
                 ESP_LOGE(TAG, "tts audio format failed");
                 continue;
             }
+            // esp_codec_dev_open() 会重新应用内部音量；收音机路径会设，
+            // TTS 路径也必须显式设，否则重开 codec 后可能保持 0 音量。
+            extern uint8_t app_settings_sfx_volume(void);
+            bsp_audio_set_volume(app_settings_sfx_volume());
             fmt_ready = true;
         }
         // decode_fec=0: 不做前向纠错(下行是完整帧)。
@@ -543,20 +556,21 @@ static void xz_tts_play_discard(void)
 // 停止播放任务并清空残留帧。会话结束/退出小智时调用。
 // ⚠ 必须等任务真正退出后才能释放解码器 state, 否则任务里的 opus_decode
 //   会用到已 free 的内存(实测表现为随机 HardFault)。
-void xz_tts_play_stop(void)
+static bool xz_tts_play_stop(void)
 {
     xz_tts_play_discard();
-    if (!s_tts_task) return;
-    const xz_tts_item_t stop = {.len = 0};
-    xQueueSend(s_tts_queue, &stop, pdMS_TO_TICKS(200));
-    for (int i = 0; i < 100 && s_tts_task; ++i) vTaskDelay(pdMS_TO_TICKS(20));
     if (s_tts_task) {
-        // 极端情况下任务没在 2s 内退出: 放弃释放解码器, 宁可泄漏 17KB 也不能
-        // 制造 use-after-free。下次进小智会重新分配(见 xz_opus_decoder_ensure)。
-        ESP_LOGW(TAG, "tts task did not exit in time; keep decoder state");
-        return;
+        const xz_tts_item_t stop = {.len = 0};
+        xQueueSend(s_tts_queue, &stop, pdMS_TO_TICKS(200));
+        for (int i = 0; i < 100 && s_tts_task; ++i) vTaskDelay(pdMS_TO_TICKS(20));
+        if (s_tts_task) {
+            // 极端情况下任务没在 2s 内退出: 绝不能复用 arena。
+            ESP_LOGW(TAG, "tts task did not exit in time; keep decoder state");
+            return false;
+        }
     }
     xz_opus_decoder_release();
+    return true;
 }
 
 // 把一个二进制 Opus 帧排队给播放任务。返回是否收下。
@@ -910,8 +924,6 @@ extern int opus_encoder_ctl(void *st, int request, ...);
 extern int opus_encode(void *st, const short *pcm, int frame_size,
                        unsigned char *data, int max_data_bytes);
 
-static void *s_opus_state;
-static int s_opus_state_size;
 static bool s_encoder_ready;
 static bool s_encoder_gave_up;
 
@@ -935,27 +947,49 @@ static TaskHandle_t s_mic_task;
 static int16_t *s_mic_pcm;
 static uint8_t *s_mic_opus;
 
+static bool xz_opus_arena_ensure(void)
+{
+    if (s_opus_state != NULL) return true;
+    const int encoder_need = opus_encoder_get_size(1);
+    const int decoder_need = opus_decoder_get_size(1);
+    const int need = encoder_need > decoder_need ? encoder_need : decoder_need;
+    if (need <= 0 || need > XZ_OPUS_STATE_CAPACITY) {
+        ESP_LOGE(TAG, "opus arena capacity invalid: need=%d cap=%d",
+                 need, XZ_OPUS_STATE_CAPACITY);
+        return false;
+    }
+    s_opus_state = heap_caps_malloc(XZ_OPUS_STATE_CAPACITY,
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_opus_state == NULL) {
+        ESP_LOGE(TAG, "opus arena alloc failed: need=%d largest=%u",
+                 XZ_OPUS_STATE_CAPACITY,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return false;
+    }
+    s_opus_state_size = XZ_OPUS_STATE_CAPACITY;
+    ESP_LOGI(TAG, "opus shared arena ready: %d bytes (encoder=%d decoder=%d)",
+             s_opus_state_size, encoder_need, decoder_need);
+    return true;
+}
+
 static bool xz_opus_encoder_init(void)
 {
     if (s_encoder_ready) return true;
     if (s_encoder_gave_up) return false;
 
-    s_opus_state_size = opus_encoder_get_size(1);
-    if (s_opus_state_size <= 0) {
-        ESP_LOGE(TAG, "opus state size invalid: %d", s_opus_state_size);
-        s_encoder_gave_up = true;
-        return false;
-    }
-    if (s_opus_state == NULL) {
-        s_opus_state = heap_caps_malloc((size_t)s_opus_state_size,
-                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (s_opus_state == NULL) {
-            ESP_LOGE(TAG, "opus state alloc failed: need=%d largest=%u",
-                     s_opus_state_size,
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-            s_encoder_gave_up = true;
+    // TTS and capture are deliberately time-sliced on this single arena.
+    // Wait for the playback task to leave opus_decode() before re-initializing
+    // the same bytes as an encoder.
+    if (s_decoder_ready || s_tts_task) {
+        if (!xz_tts_play_stop()) {
+            // 播放任务只是暂时没退出，下次按键再试；不能永久放弃（放弃会
+            // 让本次会话余下的录音全部失败）。
             return false;
         }
+    }
+    if (!xz_opus_arena_ensure()) {
+        s_encoder_gave_up = true;
+        return false;
     }
     memset(s_opus_state, 0, (size_t)s_opus_state_size);
     // ⚠⚠ 必须与官方 xiaozhi-esp32 的 AS_OPUS_ENC_CONFIG() 对齐(2026-10-12):
@@ -1008,6 +1042,20 @@ static bool xz_mic_task_stop_and_wait(void)
     return true;
 }
 
+static bool xz_opus_encoder_yield_to_decoder(void)
+{
+    if (!s_encoder_ready && !s_mic_task) return true;
+    // 麦克风采集任务里也会走 xz_opus_encoder_init() -> xz_tts_play_stop(),
+    // 若这里再阻塞等麦克风退出就会互相等待。TTS 侧直接让出这次机会,
+    // 由后续帧重试; 麦克风那条路会先把播放任务停干净。
+    if (s_mic_task) {
+        ESP_LOGW(TAG, "decoder deferred: mic task still owns the arena");
+        return false;
+    }
+    s_encoder_ready = false;
+    return true;
+}
+
 void xiaozhi_opus_release(void)
 {
     if (!xz_mic_task_stop_and_wait()) {
@@ -1017,7 +1065,11 @@ void xiaozhi_opus_release(void)
     s_encoder_ready = false;
     // 先停播放任务(它会自己收尾), 再归还 TTS 解码器 state。
     // play_stop 内部也会释放解码器, 这里再调一次是幂等的。
-    xz_tts_play_stop();
+    if (!xz_tts_play_stop()) {
+        // The playback task still owns the shared arena; freeing it here
+        // would be a use-after-free. Keep the arena until the next close.
+        return;
+    }
     xz_opus_decoder_release();
     // XiaoZhi owns this encoder only while its app is open. Once the app
     // exits, hand the large contiguous block back so the minimized radio can
@@ -1324,6 +1376,10 @@ bool xiaozhi_client_connect(void)
         dns.ip.u_addr.ip4.addr = ipaddr_addr("114.114.114.114");
         esp_netif_set_dns_info(netif, ESP_NETIF_DNS_BACKUP, &dns);
         ESP_LOGI(TAG, "DNS set: 223.5.5.5 / 114.114.114.114");
+        // 实时双向音频期间关闭 modem-sleep。MIN_MODEM 会丢 UDP/DNS 响应,
+        // 实测 OTA 连续 getaddrinfo()=202, 也会让 WebSocket 收发抖动。
+        extern void app_wifi_xiaozhi_mode(bool active);
+        app_wifi_xiaozhi_mode(true);
     }
     s_url[0] = 0; s_token[0] = 0; s_session_id[0] = 0;
     s_encoder_gave_up = false;   // 新会话: 允许再次尝试初始化编码器
@@ -1417,6 +1473,20 @@ bool xiaozhi_client_init(void)
     if (s_event_queue) return true;
     s_event_queue = xQueueCreate(8, sizeof(xz_ui_event_t));
     return s_event_queue != NULL;
+}
+
+// Radio may borrow the idle microphone stack as jitter buffer. Ownership is
+// exclusive by lifecycle: entering XiaoZhi stops the radio stream first, and
+// this returns NULL while any XiaoZhi task or WS owns the stack.
+uint8_t *xiaozhi_idle_buffer(size_t *size)
+{
+    if (size) *size = 0;
+    if (s_ws || s_ws_open || s_ws_connected || s_mic_task || s_tts_task ||
+        s_encoder_ready || s_decoder_ready) {
+        return NULL;
+    }
+    if (size) *size = sizeof(s_mic_stack_storage);
+    return s_mic_stack_storage;
 }
 
 

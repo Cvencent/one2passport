@@ -321,10 +321,12 @@ const char *playback_text() {
 void apply_network() {
     for (int i = 0; i < 3; ++i) {
         if (s_wifi_bars[i]) {
+            // 用颜色明暗表达"未连接", 不用 style_opa —— style_opa < 255 会让
+            // LVGL 走 simple layer, 单次就 malloc 24KB(见 sdkconfig 里
+            // LV_DRAW_LAYER_SIMPLE_BUF_SIZE)。C3 播放时堆只剩几 KB, 那条
+            // 路径一失败就是绘制异常/看门狗。
             lv_obj_set_style_bg_color(s_wifi_bars[i],
-                                      lv_color_hex(s_network_connected ? kGreen : kMuted), 0);
-            lv_obj_set_style_opa(s_wifi_bars[i],
-                                 s_network_connected ? LV_OPA_COVER : LV_OPA_30, 0);
+                                      lv_color_hex(s_network_connected ? kGreen : kPanelSoft), 0);
         }
     }
 }
@@ -568,8 +570,8 @@ void build_main() {
              kGrid, 1);
 
     // Soft halo under the needle so the sweep reads clearly against the ticks.
-    s_dial_glow = make_box(dial, kDialNeedleHome - 9, 33, 18, 8, kAmber, 4);
-    lv_obj_set_style_opa(s_dial_glow, LV_OPA_20, 0);
+    // 预混成暗色而不是半透明: 避免 simple layer 的 24KB 临时分配。
+    s_dial_glow = make_box(dial, kDialNeedleHome - 9, 33, 18, 8, 0x2A3D1E, 4);
     s_dial_needle = make_box(dial, kDialNeedleHome - kDialNeedleWidth / 2, 27,
                              kDialNeedleWidth, 22, kAmber, 1);
 
@@ -579,7 +581,10 @@ void build_main() {
     s_location = make_label(dial, s_location_text, 8, 47, 130, kAmber,
                             ui_cn_font());
 
-    lv_obj_t *meter_panel = make_box(s_main_group, 13, 214, 214, 49, kPanelSoft, 7);
+    // 圆角档位尽量收敛(与 dial 同为 8): LVGL 的圆角遮罩缓存槽位有限
+    // (LV_DRAW_SW_CIRCLE_CACHE_SIZE), 档位一多就要每帧重新 malloc 遮罩,
+    // 堆紧张时那次分配失败会让绘制路径直接崩(实测 c=NULL -> Load access fault)。
+    lv_obj_t *meter_panel = make_box(s_main_group, 13, 214, 214, 49, kPanelSoft, 8);
     s_meter[0] = meter_panel;
     lv_obj_add_event_cb(meter_panel, draw_meter_bars, LV_EVENT_DRAW_MAIN, nullptr);
 
@@ -1106,7 +1111,13 @@ void timer_callback(lv_timer_t *) {
     if (s_page == Page::Config || s_page == Page::WifiConnecting) {
         if (s_pair_dot) {
             const uint8_t triangle = s_animation < 128 ? s_animation : 255 - s_animation;
-            lv_obj_set_style_opa(s_pair_dot, 70 + triangle, 0);
+            // 用颜色明暗做呼吸效果, 不走 style_opa(见 apply_network 注释)。
+            const uint8_t level = 70 + triangle;
+            const uint8_t r = (uint8_t)(0xD8 * level / 255);
+            const uint8_t g = (uint8_t)(0xFF * level / 255);
+            const uint8_t b = (uint8_t)(0x7A * level / 255);
+            lv_obj_set_style_bg_color(s_pair_dot,
+                                      lv_color_make(r, g, b), 0);
         }
         return;
     }

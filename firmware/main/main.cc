@@ -1031,6 +1031,15 @@ void radio_wifi_set_streaming(bool streaming) {
                                         : WifiPowerSaveLevel::BALANCED);
 }
 
+extern "C" bool radio_is_playing_c(void);
+extern "C" void app_wifi_xiaozhi_mode(bool active) {
+    if (active) {
+        radio_wifi_set_streaming(true);
+    } else if (!radio_is_playing_c()) {
+        radio_wifi_set_streaming(false);
+    }
+}
+
 extern "C" void app_main(void) {
     esp_err_t error = nvs_flash_init();
     if (error == ESP_ERR_NVS_NO_FREE_PAGES || error == ESP_ERR_NVS_NEW_VERSION_FOUND) {

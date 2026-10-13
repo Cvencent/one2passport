@@ -28,6 +28,8 @@
 #include <optional>
 #include <strings.h>
 
+extern "C" uint8_t *xiaozhi_idle_buffer(std::size_t *size);
+
 namespace {
 
 constexpr char kTag[] = "radio_player";
@@ -40,8 +42,8 @@ constexpr std::size_t kInputSize = 1024;
 // MPEG Layer III 每声道最多 1152 样本, 16bit 立体声即 1152*2ch*2B = 4608B。
 constexpr std::size_t kPcmCapacity = 4608;
 // 尾部 2KB = 2 个网络块(与输出缓冲共享), 开机随解码器池一起预分配。
-// 其余网络块在连接时按剩余堆现分配(ring 是生产者/消费者之间的短命缓冲,
-// 不必全部常驻); kNetworkBlocks 仍是上限 6。
+// 其余网络块优先借用小智关闭时闲置的 25.6KB 麦克风静态栈(见
+// xiaozhi_idle_buffer), 借用不可用时才退回按剩余堆现分配。
 //
 // 取 2 而不是 6 的原因(2026-10-12 实测): 输出缓冲每多 1KB, 开机就少
 // 1KB 可用堆, 到 post_coding_bridge 时 largest 只剩 4~6KB —— 而 HTTP client
@@ -494,9 +496,30 @@ bool radio_player_has_pool() {
 
 void radio_player_release_pool(void) {
     xSemaphoreTakeRecursive(s_pool_mutex, portMAX_DELAY);
-    if (s_decoder_pool) { esp_audio_simple_dec_close(s_decoder_pool); s_decoder_pool = nullptr; }
-    if (s_output_pool) { free(s_output_pool); s_output_pool = nullptr; }
-    if (s_input_pool) { free(s_input_pool); s_input_pool = nullptr; }
+    ESP_LOGW(kTag, "release begin: free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (s_decoder_pool) {
+        esp_audio_simple_dec_close(s_decoder_pool);
+        s_decoder_pool = nullptr;
+        ESP_LOGW(kTag, "release after decoder close: free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+    if (s_output_pool) {
+        free(s_output_pool);
+        s_output_pool = nullptr;
+        ESP_LOGW(kTag, "release after output free: free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+    if (s_input_pool) {
+        free(s_input_pool);
+        s_input_pool = nullptr;
+        ESP_LOGW(kTag, "release after input free: free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
     s_pool_warmed.store(false, std::memory_order_release);
     ESP_LOGW(kTag, "radio pool released by caller (heap largest=%u)",
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -594,7 +617,15 @@ void radio_player_release_search_buffer(void) {
 
 namespace {
 
-constexpr std::size_t kNetworkBlocks = 6;
+// 网络抖动缓冲上限。正常路径借用小智空闲的 25.6KB 麦克风栈，形成约
+// 27KB 环形缓冲；heap 分配只作为 borrow 不可用时的兜底。
+constexpr std::size_t kNetworkBlocks = 28;
+// 启动预缓冲 2KB: 切台后尽快出声。实测源端会周期性停顿 0.5~2s, 所以每次
+// 欠载后把“恢复阈值”翻倍(见 stream_station 里的 wait_bytes), 但上限必须
+// 明显小于环容量: 27KB 环里等 20KB 再出声会在源端断续时制造 1.5s 以上的
+// 静音, 而且剩余空间不足以吸收下一段突发(实测 rebuffers 连续累积)。
+constexpr std::size_t kPrebufferTarget = 16 * 1024;
+constexpr std::size_t kMaxResumePrebuffer = 20 * 1024;
 
 // network_feed_task 的栈**静态分配**: 它要求一块 2048B **连续**堆, 而
 // 播放时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 动态申请必然失败
@@ -669,13 +700,15 @@ bool stream_station(std::size_t station, uint32_t generation) {
     esp_http_client_config_t config = {};
     config.url = preset.url;
     config.timeout_ms = 7000;
-    // ⚠⚠ 缓冲必须够大 —— 2026-10-10 踩坑还原:
-    // 曾为"省连续内存给解码器"把接收缓冲降到 1024/发送降到 256, 结果音频
-    // **一卡一卡**(吞吐不足, 解码器时常等数据饿死)。原始可工作版本用 2048/512。
-    // 现解码器内部缓冲已在开机预热并常驻, 播放路径不再依赖大连续块,
-    // 因此恢复原始值, 保证喂数据速率。
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 512;
+    // ⚠ 2026-10-13 修正(推翻 2026-10-10 的结论):
+    //   当时"降到 1024 就卡"的真正原因是网络环形缓冲只有 3~6KB, 而不是
+    //   HTTP 接收缓冲本身。现在环形缓冲已有 27KB(借用小智空闲麦克风栈),
+    //   1024 的接收缓冲完全够用 —— 喂流任务(优先级 7)会立刻把数据搬进环里。
+    //   反过来, 2048 要求一块 2048 **连续**内部堆, 而播放时 largest 常只有
+    //   1792 -> "HTTP_CLIENT: Allocation failed" 死循环, 连台都换不了。
+    //   降到 1024/256 后需求减半, 同时省下 ~1.3KB 给 LVGL 绘制。
+    config.buffer_size = 1024;
+    config.buffer_size_tx = 256;
     config.user_agent = "AI-Passport-Radio/1.1.1";
     config.keep_alive_enable = true;
     config.disable_auto_redirect = false;
@@ -749,10 +782,51 @@ bool stream_station(std::size_t station, uint32_t generation) {
         return false;
     }
 
+    // XiaoZhi and radio never own their task stacks at the same time. While
+    // XiaoZhi is closed, its 25.6KB mic stack is dead RAM and makes an ideal
+    // jitter pool: no heap allocation, no fragmentation, ~3s at 64kbps.
+    uint8_t *borrowed_network = nullptr;
+    std::size_t borrowed_blocks = 0;
+    std::size_t heap_network_start = kSharedNetworkBlocks;
+    {
+        std::size_t borrowed_size = 0;
+        borrowed_network = xiaozhi_idle_buffer(&borrowed_size);
+        if (borrowed_network && borrowed_size >= kInputSize) {
+            borrowed_blocks = std::min(borrowed_size / kInputSize,
+                                       kNetworkBlocks - kSharedNetworkBlocks);
+        } else {
+            borrowed_network = nullptr;
+        }
+    }
+
         do {
+        if (borrowed_blocks > 0) {
+            block_count = kSharedNetworkBlocks + borrowed_blocks;
+            prebuffer_bytes = std::min(
+                (block_count - kSharedNetworkBlocks) * kInputSize,
+                kPrebufferTarget);
+            ring_storage.emplace(network_blocks, block_count, kInputSize);
+            for (std::size_t i = 0; i < kSharedNetworkBlocks; ++i) {
+                network_blocks[i] = output + kPcmCapacity + i * kInputSize;
+            }
+            for (std::size_t i = 0; i < borrowed_blocks; ++i) {
+                network_blocks[kSharedNetworkBlocks + i] =
+                    borrowed_network + i * kInputSize;
+            }
+            heap_network_start = block_count;
+            ESP_LOGI(kTag,
+                     "network buffer: blocks=%u capacity=%u prebuffer=%u source=idle-xiaozhi-stack",
+                     (unsigned)block_count,
+                     (unsigned)(block_count * kInputSize),
+                     (unsigned)prebuffer_bytes);
+        }
         // 栈与 TCB 都在 .bss(见上方 kNetworkFeedStack), 不吃堆。
+        // 优先级 7 > 解码任务的 5: TCP 接收窗口只有几 KB, 喂流任务必须在
+        // socket 刚有数据时就排空, 否则 44.1kHz 立体声解码把 CPU 占满时
+        // 窗口排不空 -> 源端停发 -> 缓冲见底 -> 周期性卡顿。仍低于
+        // WiFi(23)/tcpip(18), 不会饿死网络栈。
         network_task = xTaskCreateStatic(network_feed_task, "radio_network",
-                                       kNetworkFeedStack, &feed, 5,
+                                       kNetworkFeedStack, &feed, 7,
                                        s_network_feed_stack, &s_network_feed_tcb);
         if (network_task == nullptr) {
             s_last_fail_lowmem.store(true, std::memory_order_release);
@@ -782,36 +856,47 @@ bool stream_station(std::size_t station, uint32_t generation) {
             interruptible_delay_ms(10000, generation, station);
             break;
         }
-        bool blocks_ready = true;
-        // 给页面重绘留下 8KB，避免缓冲耗尽堆后 LVGL malloc 断言卡死。
-        const std::size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        constexpr std::size_t kUiReserve = 4096;
-        const std::size_t affordable = free_bytes > kUiReserve
-            ? kSharedNetworkBlocks + (free_bytes - kUiReserve) / kInputSize
-            : kSharedNetworkBlocks;
-        block_count = std::min(block_count, affordable);
-        if (block_count < kSharedNetworkBlocks) {
-            s_last_fail_lowmem.store(true, std::memory_order_release);
-            ESP_LOGW(kTag, "insufficient heap for network buffer and UI reserve");
-            break;
+        if (!ring_storage.has_value()) {
+            bool blocks_ready = true;
+            // 给页面重绘留下 2KB。这个分支只在小智栈暂不可借时使用。
+            const std::size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            constexpr std::size_t kUiReserve = 2048;
+            const std::size_t affordable = free_bytes > kUiReserve
+                ? kSharedNetworkBlocks + (free_bytes - kUiReserve) / kInputSize
+                : kSharedNetworkBlocks;
+            block_count = std::min(block_count, affordable);
+            if (block_count < kSharedNetworkBlocks) {
+                s_last_fail_lowmem.store(true, std::memory_order_release);
+                ESP_LOGW(kTag, "insufficient heap for network buffer and UI reserve");
+                break;
+            }
+            prebuffer_bytes = std::min((block_count - kSharedNetworkBlocks) * kInputSize,
+                                       kPrebufferTarget);
+            ESP_LOGI(kTag,
+                     "network buffer: blocks=%u capacity=%u prebuffer=%u free=%u largest=%u source=heap",
+                     (unsigned)block_count,
+                     (unsigned)(block_count * kInputSize),
+                     (unsigned)prebuffer_bytes,
+                     (unsigned)free_bytes,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            ring_storage.emplace(network_blocks, block_count, kInputSize);
+            for (std::size_t i = 0; i < block_count; ++i) {
+                network_blocks[i] = i < kSharedNetworkBlocks
+                    ? output + kPcmCapacity + i * kInputSize
+                    : static_cast<uint8_t *>(malloc(kInputSize));
+                if (!network_blocks[i]) { blocks_ready = false; break; }
+            }
+            if (!blocks_ready) {
+                s_last_fail_lowmem.store(true, std::memory_order_release);
+                ESP_LOGW(kTag, "network buffer unavailable");
+                break;
+            }
         }
-        prebuffer_bytes = (block_count - 2) * kInputSize;
-        ring_storage.emplace(network_blocks, block_count, kInputSize);
+        // 缓冲已就位: 借用静态栈路径与 heap 兜底路径共用同一份环形缓冲访问。
         RadioStreamBuffer &ring = *ring_storage;
         feed.ring = &ring;
-        for (std::size_t i = 0; i < block_count; ++i) {
-            network_blocks[i] = i < kSharedNetworkBlocks
-                ? output + kPcmCapacity + i * kInputSize
-                : static_cast<uint8_t *>(malloc(kInputSize));
-            if (!network_blocks[i]) { blocks_ready = false; break; }
-        }
         // Bound pause/cancel latency after the connection is established.
         esp_http_client_set_timeout_ms(client, 1000);
-        if (!blocks_ready) {
-            s_last_fail_lowmem.store(true, std::memory_order_release);
-            ESP_LOGW(kTag, "network buffer unavailable");
-            break;
-        }
         xTaskNotifyGive(network_task);
         // 缓冲已在上面就位(池化复用或现场分配), 此处不再 malloc。
 
@@ -819,6 +904,10 @@ bool stream_station(std::size_t station, uint32_t generation) {
         bool format_ready = false;
         uint8_t source_channels = 1;
         bool buffering = true;
+        // 本次等待的预缓冲阈值: 起步用 prebuffer_bytes(2KB), 每欠载一次翻倍。
+        std::size_t wait_bytes = prebuffer_bytes ? prebuffer_bytes : kPrebufferTarget;
+        const std::size_t wait_limit = std::min(kMaxResumePrebuffer,
+                                                (block_count * kInputSize) * 3 / 4);
         bool playback_announced = false;
         uint32_t rebuffers = 0;
         int decode_fail_streak = 0;   // 连续解码失败计数(内存不足/坏流): 达限放弃本电台, 防3ms风暴
@@ -840,7 +929,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
         }
         while (request_still_current(generation, station)) {
             const std::size_t available = ring.available();
-            if (buffering && available < prebuffer_bytes && !feed.finished.load()) {
+            if (buffering && available < wait_bytes && !feed.finished.load()) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
@@ -849,8 +938,13 @@ bool stream_station(std::size_t station, uint32_t generation) {
             if (!received) {
                 if (feed.finished.load(std::memory_order_acquire)) break;
                 buffering = true;
+                // 源端刚才停顿到把缓冲吃空: 下次多攒一点再出声, 避免"刚恢复
+                // 又断"的连环卡顿。上限 kMaxResumePrebuffer。
+                wait_bytes = std::min<std::size_t>(wait_bytes * 2, wait_limit);
                 playback_announced = false;
                 ++rebuffers;
+                ESP_LOGW(kTag, "rebuffer #%u: next resume waits %u bytes",
+                         (unsigned)rebuffers, (unsigned)wait_bytes);
                 radio_ui_set_playback(RadioPlaybackState::Buffering, "正在缓冲");
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
@@ -1083,7 +1177,9 @@ bool stream_station(std::size_t station, uint32_t generation) {
         while (!feed.finished.load(std::memory_order_acquire)) vTaskDelay(pdMS_TO_TICKS(5));
         vTaskDelete(network_task);
     }
-    for (std::size_t i = kSharedNetworkBlocks; i < block_count; ++i) free(network_blocks[i]);
+    // 只释放 heap 兜底路径真正 malloc 出来的块；借用小智麦克风静态栈时
+    // heap_network_start == block_count，这里不会误 free 静态内存。
+    for (std::size_t i = heap_network_start; i < block_count; ++i) free(network_blocks[i]);
     // 池化资源(开机预分配)不在此释放, 留给下次切台复用。
     if (!s_decoder_pool) {
         if (decoder) esp_audio_simple_dec_close(decoder);
@@ -1225,6 +1321,14 @@ static bool start_player_task_locked() {
 }
 
 static bool set_playing_locked(bool playing) {
+    // 播放意图没变且 worker 还活着时, 直接返回 —— 不能在这里推进 generation。
+    // 否则"已最小化播着收音机 -> 进完整收音机界面"的 set_playing(true)
+    // 会把正在播的流整条掐断重连, 实测表现为进收音机要等 8 秒以上才出声。
+    if (s_wanted_playing.load(std::memory_order_acquire) == playing) {
+        if (!playing || s_player_task.load(std::memory_order_acquire) != nullptr) {
+            return true;
+        }
+    }
     s_playback_revision.fetch_add(1);
     s_wanted_playing.store(playing, std::memory_order_release);
     s_generation.fetch_add(1, std::memory_order_acq_rel);

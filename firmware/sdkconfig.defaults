@@ -18,6 +18,16 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_USE_CLIB_MALLOC=y
 # CONFIG_LV_USE_BUILTIN_MALLOC is not set
 CONFIG_LV_USE_STDLIB_MALLOC=1
+# LVGL 绘制图层上限。默认 simple layer 一次要 24KB 连续内存, 而 C3 在收音机
+# 播放 + 桥接同时运行时最大空闲块常只有 1~4KB —— 任何 style_opa<255 的控件
+# 都会让绘制路径 malloc 失败。UI 侧已改用预混颜色避免触发图层, 这里再把
+# 上限压到 4KB 作为兜底: 真触发时按块绘制, 慢一点但不会崩。
+CONFIG_LV_DRAW_LAYER_SIMPLE_BUF_SIZE=4096
+CONFIG_LV_DRAW_LAYER_MAX_MEMORY=8192
+# 圆角遮罩缓存槽位(默认 4)。收音机主页圆角档位收敛到 0/4/8 后仍有圆形
+# 指示灯等, 槽位不够就会每帧 malloc/free 遮罩 —— 堆紧张时那次分配失败会让
+# LVGL 绘制路径空指针崩溃。每槽只花 radius*4 字节, 留足余量更划算。
+CONFIG_LV_DRAW_SW_CIRCLE_CACHE_SIZE=6
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
 CONFIG_FREERTOS_HZ=1000
@@ -70,11 +80,15 @@ CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 # (差 6.6KB), 收音机播不了。
 #
 # 本设备是**单向接收音频流**(发出去的只有两行 HTTP 请求头),
-# 因此把发送方向压到最小; 接收窗口适度缩小(64kbps 码率下 2KB 窗口足够,
-# 且 esp_http_client 自己还有 1KB 接收缓冲兜底)。
-# 实测收益: 每条连接释放约 8KB 连续内存。
+# 因此发送方向保持最小。接收窗口的取值见下方 2026-10-13 的实测修正
+# (曾缩到 2880, 结果高码率台吞吐不足, 已调回 4*MSS)。
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
-CONFIG_LWIP_TCP_WND_DEFAULT=2880
+# ⚠ 2026-10-13 实测: 2880(2*MSS) 的接收窗口会把高码率台卡死。
+# 44.1kHz 立体声 MP3(~128kbps≈16KB/s) 下, 吞吐 = window/RTT; RTT 稍高
+# (200~300ms, 国内 CDN) 就只有 9~14KB/s —— 实测同一电台 pcm 仅 3s/10s,
+# 一直在 rebuffer。改成 4*MSS 后同一电台能连续播满(pcm 9.8s/10s, 队列常满)。
+# 接收窗口只限制"同时能有多少字节在途", 不额外常驻大块堆。
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
 # 收发邮箱各减 1(每项约 4 字节指针 + 少量结构, 主要省的是关联缓冲)
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=4
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=4

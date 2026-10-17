@@ -1,6 +1,7 @@
 #include "radio_ui.h"
 
 #include "radio_display_settings.h"
+#include "radio_ui_city.h"
 #include "radio_home.h"
 #include "radio_sleep_timer.h"
 #include "bsp_battery.h"
@@ -96,7 +97,7 @@ lv_obj_t *s_wifi_bars[3];
 lv_obj_t *s_meter[kMeterCount];
 lv_obj_t *s_volume_value;
 lv_obj_t *s_volume_bar;
-// 列表页行对象池。城市列表已增至 9 项(含重庆), 这里留到 10 防越界。
+// 列表页行对象池。城市列表按 9 行分页, 其余页面最多 9 行, 留到 10 防越界。
 constexpr std::size_t kSettingsRowsMax = 10;
 lv_obj_t *s_settings_rows[kSettingsRowsMax];
 lv_obj_t *s_settings_labels[kSettingsRowsMax];
@@ -137,6 +138,10 @@ bool s_network_connected;
 uint8_t s_volume = 55;
 RadioSettingsPage s_settings_page = RadioSettingsPage::Menu;
 std::size_t s_settings_selected;
+// 城市列表分页: 行池只有 10 格, 而城市有 49 项(自动定位 + 表内全部城市),
+// 所以一次只显示一页, s_city_offset 记录当前页第一项的绝对索引。
+std::size_t s_city_offset = 0;
+char s_city_title[48] = "城市电台";
 std::size_t s_settings_row_count;
 std::size_t s_station_index;
 std::size_t s_station_count = 1;
@@ -707,9 +712,11 @@ void reset_transient_objects(Page page) {
 }
 
 void apply_settings_selection() {
+    const bool cities = s_settings_page == RadioSettingsPage::City;
     for (std::size_t i = 0; i < s_settings_row_count; ++i) {
         if (!s_settings_rows[i] || !s_settings_labels[i]) continue;
-        const bool active = i == s_settings_selected;
+        const bool active = cities ? (s_city_offset + i == s_settings_selected)
+                                   : (i == s_settings_selected);
         lv_obj_set_style_bg_color(s_settings_rows[i],
                                   lv_color_hex(active ? kAmber : kPanel), 0);
         lv_obj_set_style_text_color(s_settings_labels[i],
@@ -749,9 +756,6 @@ void build_settings(RadioSettingsPage page, std::size_t selected, uint8_t volume
     static constexpr const char *kMenuItems[] = {
         "音量", "城市电台", "定时播放", "屏幕设置", "网络设置", "蓝牙", "返回",
     };
-    static constexpr const char *kCityItems[] = {
-        "自动定位", "北京", "上海", "广州", "深圳", "重庆", "长沙", "杭州", "成都",
-    };
     static constexpr const char *kSleepTimerItems[] = {
         "无定时", "15 分钟", "30 分钟", "60 分钟", "90 分钟", "返回",
     };
@@ -783,12 +787,26 @@ void build_settings(RadioSettingsPage page, std::size_t selected, uint8_t volume
             items = kMenuItems;
             item_count = sizeof(kMenuItems) / sizeof(kMenuItems[0]);
             break;
-        case RadioSettingsPage::City:
-            items = kCityItems;
-            item_count = sizeof(kCityItems) / sizeof(kCityItems[0]);
+        case RadioSettingsPage::City: {
+            // 城市表来自共享来源, 一屏 9 行 + 自动定位, 其余分页。
+            item_count = city_choice_count();
+            constexpr std::size_t kRows = 9;
+            if (item_count > kRows) {
+                const std::size_t pages = (item_count + kRows - 1) / kRows;
+                const std::size_t page =
+                    std::min(pages - 1, s_settings_selected / kRows);
+                s_city_offset = std::min(item_count - 1, page * kRows);
+            } else {
+                s_city_offset = 0;
+            }
             title_text = "城市电台";
-            hint_text = "确定选择  长按返回";
+            std::snprintf(s_city_title, sizeof(s_city_title), "城市电台 %u/%u",
+                          static_cast<unsigned>(s_city_offset / 9 + 1),
+                          static_cast<unsigned>((item_count + 8) / 9));
+            title_text = s_city_title;
+            hint_text = "上下选择  确定切换城市  长按返回";
             break;
+        }
         case RadioSettingsPage::SleepTimer:
             items = kSleepTimerItems;
             item_count = sizeof(kSleepTimerItems) / sizeof(kSleepTimerItems[0]);
@@ -811,23 +829,39 @@ void build_settings(RadioSettingsPage page, std::size_t selected, uint8_t volume
             return;
     }
 
-    const bool compact = item_count > 3;
+    char city_row[24];
+    const bool paging_cities = page == RadioSettingsPage::City;
+    const std::size_t render_count =
+        paging_cities ? std::min<std::size_t>(item_count - s_city_offset, 9) : item_count;
+    const bool compact = render_count > 3;
     const bool extra_compact = item_count > 6;
-    const bool city_rows = item_count >= 8;   // 城市列表(9项): 行更矮更密
-    // 城市列表 9 项: 34 + 9*30 = 304, 底部提示需留位 -> 收紧到间距 28。
+    const bool city_rows = paging_cities || render_count >= 8;
+    // 城市列表一屏 9 项: 34 + 9*30 = 304, 底部提示需留位 -> 收紧到间距 28。
     const int first_y = city_rows ? 32 : (extra_compact ? 39 : (compact ? 45 : 70));
     const int row_height = city_rows ? 25 : (extra_compact ? 29 : (compact ? 32 : 42));
     const int row_gap = city_rows ? 28 : (extra_compact ? 34 : (compact ? 38 : 55));
-    s_settings_row_count = item_count;
+    s_settings_row_count = render_count;
     if (s_settings_selected >= item_count) s_settings_selected = 0;
+    if (paging_cities && s_settings_selected < s_city_offset) {
+        s_city_offset = (s_settings_selected / 9) * 9;
+        s_settings_row_count = std::min<std::size_t>(item_count - s_city_offset, 9);
+    }
 
     lv_obj_t *title = make_label(s_screen, title_text, 12, 13, 216, kText,
                                  &radio_font);
     set_centered(title);
-    for (std::size_t i = 0; i < item_count; ++i) {
+    for (std::size_t i = 0; i < render_count; ++i) {
         const int y = first_y + static_cast<int>(i) * row_gap;
+        const char *text = paging_cities ? "" : items[i];
+        if (paging_cities) {
+            const char *name = city_display_for(s_city_offset + i);
+            std::snprintf(city_row, sizeof(city_row), "%s",
+                          s_city_offset + i == 0 ? "自动定位"
+                           : (name && name[0] ? name : "?"));
+            text = city_row;
+        }
         s_settings_rows[i] = make_box(s_screen, 24, y, 192, row_height, kPanel, 7);
-        s_settings_labels[i] = make_label(s_settings_rows[i], items[i], 0,
+        s_settings_labels[i] = make_label(s_settings_rows[i], text, 0,
                                           city_rows ? 5 :
                                           extra_compact ? 5 : (compact ? 7 : 12),
                                           192, kText);
@@ -1400,8 +1434,21 @@ void radio_ui_show_settings(RadioSettingsPage page, std::size_t selected,
     if (s_page == Page::Settings && s_settings_page == page &&
         page != RadioSettingsPage::Volume &&
         page != RadioSettingsPage::Display && s_settings_row_count > 0) {
-        s_settings_selected = selected % s_settings_row_count;
-        apply_settings_selection();
+        if (page == RadioSettingsPage::City) {
+            // 城市页的 selected 是跨页的绝对索引, 不能被当前页的行数取模。
+            // 只有翻到另一页才重建, 同页移动只改变高亮, 避免每按一次键重建
+            // 整屏 LVGL 对象(播放期间会抢堆)。
+            const std::size_t want_page = selected / 9;
+            if (want_page != s_city_offset / 9 || s_settings_row_count == 0) {
+                build_settings(page, selected, volume);
+            } else {
+                s_settings_selected = selected;
+                apply_settings_selection();
+            }
+        } else {
+            s_settings_selected = selected % s_settings_row_count;
+            apply_settings_selection();
+        }
     } else {
         build_settings(page, selected, volume);
     }

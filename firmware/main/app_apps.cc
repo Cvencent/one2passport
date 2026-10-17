@@ -10,6 +10,7 @@
 
 #include "app_registry.h"
 #include "radio_ui.h"
+#include "radio_ui_city.h"
 #include "radio_player.h"
 #include "radio_font.h"          // radio_font_big(设备激活码大字显示)
 #include "radio_sleep_timer.h"
@@ -671,18 +672,15 @@ std::size_t s_sel = 0;
 std::size_t s_saved_network_index = 0;
 int s_sleep_minutes_idx = 0;          // 0=无,1=15,2=30,3=60,4=90
 static constexpr int kSleepMinutes[] = {0, 15, 30, 60, 90};
-// ⚠ 必须与 radio_ui.cc 的 kCityItems[] **逐项、逐序**一致(含"重庆"这个新增项),
-// 否则会"选 A 城市却搜 B 城市"。历史上这里漏了"重庆"且顺序错位:
-// UI 第5项显示"重庆", 本表第5项却是"长沙"; 选"成都"(第8项)时索引 8 直接越界
-// (本表只有 8 项)。同时 page_rows(City) 必须等于本表项数。
-static constexpr const char *kCityNames[] = {
-    "", "北京", "上海", "广州", "深圳", "重庆", "长沙", "杭州", "成都",
-};   // 与 radio_ui 的 kCityItems 顺序一致(空=自动定位)
+// 城市表(自动定位 + 全部可选城市)来自 main.cc 的 city_choice_count()/
+// city_query_for(), 其数据源是 radio_catalog 的 kCityRegions 表。以前 UI、
+// app_apps、main 各存一份顺序, 一旦不同步就会"选 A 城市搜 B 城市"甚至越界。
+
 
 std::size_t page_rows(RadioSettingsPage page) {
     switch (page) {
         case RadioSettingsPage::Menu: return 7;
-        case RadioSettingsPage::City: return 9;
+        case RadioSettingsPage::City: return city_choice_count();
         case RadioSettingsPage::SleepTimer: return 6;
         case RadioSettingsPage::Display: return 3;
         case RadioSettingsPage::WifiMenu: return 3;
@@ -696,7 +694,10 @@ std::size_t page_rows(RadioSettingsPage page) {
 
 void show(RadioSettingsPage page, std::size_t sel) {
     s_page = page;
-    s_sel = sel % page_rows(page);
+    const std::size_t rows = page_rows(page);
+    s_sel = rows ? sel % rows : 0;
+    // page_rows(City) is the *total* city count, not the visible rows: the
+    // selection is an absolute index and radio_ui.cc draws the window around it.
     if (page == RadioSettingsPage::SavedWifi) {
         const auto &saved = SsidManager::GetInstance().GetSsidList();
         std::array<const char *, 10> names{};
@@ -826,9 +827,10 @@ void settings_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
             }
             break;
         case RadioSettingsPage::City: {
-            // 选城市: 空=自动定位, 其他按名字搜台
-            const char *city = kCityNames[s_sel];
-            if (s_sel == 0 || city[0] == '\0') {
+            // 选城市: 第 0 项=自动定位, 其他按名字搜台。s_sel 是绝对索引,
+            // 分页只显示其中 9 项。
+            const char *city = city_query_for(s_sel);
+            if (city == nullptr || city[0] == '\0') {
                 app_radio_request_city("", "");
             } else {
                 app_radio_request_city(city, city);

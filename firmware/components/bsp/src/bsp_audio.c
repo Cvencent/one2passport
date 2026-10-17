@@ -56,13 +56,17 @@ static esp_err_t i2s_full_duplex_init(void) {
     // DMA 缓冲决定"抗网络抖动"能力, 但**必须省着用**: C3 内部 DMA RAM 很紧,
     // 且收音机 MP3 解码器需要 ~19KB 连续块, 挤占会导致
     // "ESP_MP3_DEC: Fail to init MP3 decoder ret 10"(实测 8x512=16KB 就触发)。
-    // 4x128: 每帧 4B(stereo16bit) -> 4*128*4 = 2KB, 约 12ms @44.1kHz。
-    // WiFi 初始化后堆最大连续块只有约 12KB, 只能使用小 DMA 池。
+    // 4x256: 每帧 4B(stereo16bit) -> 4*256 = 1024 帧, 约 23ms @44.1kHz。
+    // 2026-10-13: 4x128 只有 ~12ms, 而播放任务两次 bsp_audio_write 之间实测常有
+    // 12~17ms(解码+电平+统计的 CPU 时间), DMA 刚好被抽干 -> 听感一卡一卡。
+    // 折中取 4x256(约 23ms): 只比原来的 4x128 多占约 4KB DMA(TX+RX 各一份),
+    // 又比 6x240(33ms, 多 7.4KB)省 3.4KB —— 播放时 DMA 池本就只剩几百字节,
+    // 加太多会让首次连接直接 wifi:mem fail。
     i2s_chan_config_t chan = {
         .id = BSP_I2S_PORT,
         .role = I2S_ROLE_MASTER,
         .dma_desc_num = 4,
-        .dma_frame_num = 128,
+        .dma_frame_num = 256,
         .auto_clear_after_cb = true,
         .auto_clear_before_cb = false,
         .intr_priority = 0,

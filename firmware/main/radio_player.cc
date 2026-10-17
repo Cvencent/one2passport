@@ -84,38 +84,43 @@ constexpr uint8_t kMaxFailedAttempts = 1;
 
 // These national streams are not tied to one local transmitter, so they carry
 // no dial frequency and the needle spreads them across the scale by position.
-// 全部为"实测可播"的流(2026-10-09 用 PC 端逐条验证: http 明文可达 +
-// 首字节为标准 MPEG 帧同步字 0xFF 或 ID3 标签头, 编码均为 MP3 Layer III)。
-// 教训: qtfm/qingting.fm 的 64k.mp3 实测返回随机字节(Content-Type 谎报
-// audio/mpeg), 是不可解码的加密/防盗链流, 已从兜底表移除。
 //
-// 【顺序很重要】中文台排最前(用户主要听中文), 国际台排后。合并时本表整体
-// 排在目录搜索结果之前, 所以列表第 1/2 位永远是已验证可播的中文台 ——
-// 避免用户一切台就是坏源(此前"频道1和2播放不了"即目录结果里的加密流占位)。
+// 2026-10-17 重新逐条实测(本机直连取流 5 秒, 解析 MPEG 帧同步字并核对帧长序列):
+// ① 旧注释说 qtfm/qingting 的 64k.mp3 "返回随机字节" —— 那个结论已不成立。
+//    现在这批流每条都能解出连续定长 MPEG 帧(~16 kB/s, 与 128kbps 一致),
+//    各地城市台正是走这个源, 所以本地台列表可以依赖它。
+// ② 表里凡是"中文台名 + 实际放英文氛围乐"的一律删掉(SomaFM 的 dronezone /
+//    secretagent 曾被标成"Fred 电影电台""亚洲音乐台", 属于错标)。
+// ③ FM891 的 96k.aac 与 qingting 的 kuwo "音乐之声" 变体都不是稳定直播流
+//    (后者实测 238 kB/s 的整块下载, 是单曲而非电台), 同样删除。
+// ④ 兜底表整体换成中文台: 国家级 4 条 + 中文综艺/音乐 6 条。原先收着的
+//    RFI中文、SomaFM 环境/爵士/复古(英文氛围乐)和怀旧金曲(设备端实测 Open
+//    failed)按用户要求删掉, 换成 2026-10-18 逐条测速通过的中文台。
 const RadioStation kFallbackStations[] = {
-    // ---- 中文台(实测 http 明文可播) ----
-    {"RFI 中文", "法国国际广播 · 中文",
-     "http://rfienchinois64k.ice.infomaniak.ch/rfienchinois-64", 0},
-    {"中文新闻台", "每5分钟新闻 · 中文",
-     "http://replaynewszh.ice.infomaniak.ch/replaynewszh-128.mp3", 0},
-    {"FM891 音乐台", "中文流行 · 在线",
-     "http://live.fm891.net/96k.aac", 0},
-    {"Fred 电影电台", "电影文化 · 普通话",
-     "http://ice1.somafm.com/dronezone-128-mp3", 0},
-    // ⚠ 动漫音乐台(pool.anison.fm:9000) 已移除: 实测该源码率/编码不稳定,
-    // 播放时持续一卡一卡(用户明确要求删除)。
-    {"亚洲音乐台", "亚洲流行 · 中文",
-     "http://ice1.somafm.com/secretagent-128-mp3", 0},
-    {"怀旧金曲", "乐享音乐 · 中文",
-     "http://cn.bigbigmix.com/audio/stream", 0},
-    // ---- 国际台(氛围/爵士, 音质稳定, 作备选) ----
-    {"SomaFM 环境", "轻松氛围 · 网络直播",
-     "http://ice1.somafm.com/lush-128-mp3", 0},
-    {"爵士电台", "Smooth Jazz · 网络直播",
-     "http://ice1.somafm.com/sonicuniverse-128-mp3", 0},
-    {"复古频道", "Retro · 网络直播",
-     "http://ice1.somafm.com/u80s-128-mp3", 0},
+    // ---- 国家级中文台(全国可达, 实测可播) ----
+    {"中国之声", "中央人民广播电台 · 新闻",
+     "http://lhttp.qtfm.cn/live/15318317/64k.mp3", 0},
+    {"经济之声", "中央人民广播电台 · 财经",
+     "http://lhttp.qtfm.cn/live/15318316/64k.mp3", 0},
+    {"劲曲调频", "CRI Hit FM · 中文流行",
+     "http://lhttp.qingting.fm/live/15318703/64k.mp3", 0},
+    {"轻松调频", "CRI Easy FM · 中英双语",
+     "http://lhttp.qingting.fm/live/15318704/64k.mp3", 0},
+    // ---- 中文综艺/音乐台(2026-10-18 逐条测速后保留) ----
+    {"清晨音乐台", "华语轻音乐 · 全天不间断",
+     "http://lhttp.qingting.fm/live/4915/64k.mp3", 0},
+    {"500首华语经典", "老歌精选 · 中文",
+     "https://lhttp.qtfm.cn/live/5022308/64k.mp3", 0},
+    {"动听音乐台", "流行音乐 · 中文",
+     "https://lhttp-hw.qtfm.cn/live/5022107/64k.mp3", 0},
+    {"听云音乐台", "320kbps 高码率 · 中文",
+     "https://m.tyradio.uk/radio.mp3", 0},
+    {"听云评书台", "评书 · 中文",
+     "https://m.tyradio.uk/typs.mp3", 0},
+    {"听云相声台", "相声 · 中文",
+     "https://m.tyradio.uk/tyxs.mp3", 0},
 };
+
 
 std::atomic<bool> s_network_connected{false};
 std::atomic<bool> s_wanted_playing{false};
@@ -659,12 +664,28 @@ struct NetworkFeed {
     std::atomic<uint32_t> max_read_us{0};
 };
 
+// 2026-10-17: 把"空读次数"改成"空读时长预算"。
+// esp_http_client_read 的超时是 1000ms, 一次空读(EAGAIN)本身就阻塞满 1s,
+// 原来的 empty_reads>=5 等于**任何停顿超过 5s 的直播源都被判死并拆流**。
+// 中央台系(qtfm/qingting CDN)实测就是每 2s 突发一段数据, 首包之后还会静默
+// 6~10s, 于是真机看到的现象是: 播放 1s -> 卡住 -> 每 10s 重连一轮
+// (boot2.log: pcm=1123ms / wall=10223ms, gap_max=5198ms, queued=0),
+// 用户听到的就是"说一半就不说了 / 一卡一卡"。
+// 现在给 20s 的连续空读预算: 只要 20s 内回到数据就不重连。暂停/换台延迟
+// 不受影响 —— stop 与 generation 检查仍在每轮循环最前面, 单轮最多阻塞一个
+// 读超时(1s)。
+constexpr int64_t kStallBudgetUs = 20 * 1000 * 1000;
+// received==0 在 esp_http_client_read 里表示对端关闭(立即返回, 不阻塞),
+// 这类失败要快速退出, 否则坏台会让用户等满整个停顿预算。
+constexpr unsigned kEofReads = 3;
+
 void network_feed_task(void *argument) {
     auto *feed = static_cast<NetworkFeed *>(argument);
     // 先预留任务栈，等 HTTP 和环形缓冲就绪后才开始读取。
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     uint8_t bytes[kInputSize];
-    unsigned empty_reads = 0;
+    unsigned eof_reads = 0;
+    int64_t stall_start_us = 0;
     while (!feed->stop.load() && request_still_current(feed->generation, feed->station)) {
         const int64_t start = esp_timer_get_time();
         const int received = esp_http_client_read(feed->client,
@@ -675,8 +696,13 @@ void network_feed_task(void *argument) {
         while (maximum < elapsed &&
                !feed->max_read_us.compare_exchange_weak(maximum, elapsed)) {}
         if (received == -ESP_ERR_HTTP_EAGAIN) {
-            if (++empty_reads >= 5) break;
-            vTaskDelay(pdMS_TO_TICKS(10));
+            if (!stall_start_us) stall_start_us = start;
+            if (esp_timer_get_time() - stall_start_us >= kStallBudgetUs) {
+                ESP_LOGW(kTag, "network feed idle %us, reconnecting",
+                         (unsigned)((esp_timer_get_time() - stall_start_us) / 1000000));
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         if (received < 0) {
@@ -685,11 +711,12 @@ void network_feed_task(void *argument) {
         }
         if (!received) {
             if (esp_http_client_is_complete_data_received(feed->client) ||
-                ++empty_reads >= 5) break;
+                ++eof_reads >= kEofReads) break;
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        empty_reads = 0;
+        eof_reads = 0;
+        stall_start_us = 0;
         std::size_t used = 0;
         while (used < static_cast<std::size_t>(received) &&
                !feed->stop.load() &&
@@ -975,6 +1002,12 @@ bool stream_station(std::size_t station, uint32_t generation) {
         uint32_t rebuffers = 0;
         int decode_fail_streak = 0;   // 连续解码失败计数(内存不足/坏流): 达限放弃本电台, 防3ms风暴
         bool stream_checked = false;  // 首块是否已做 MP3 同步字校验
+        // 2026-10-17: 电流声/爆音根因。接入直播流是从**帧中间**开始的, 解码器
+        // 在真正锁定位流之前解出的头一帧是垃圾(实测同一窗口 clipped=842
+        // peak=32768, 也就是整段满幅方波直接推到 I2S -> 用户听到的"滋"一声)。
+        // 欠载重新攒缓冲后同理。故这里丢掉接流后的前两帧 PCM(约 50ms),
+        // 让耳朵只听到内容而不是对齐噪声。
+        int join_warmup_frames = 2;
         int64_t stats_start = esp_timer_get_time();
         int64_t last_write_end = 0;
         uint32_t max_read_us = 0, max_gap_us = 0, slow_gaps = 0;
@@ -1005,6 +1038,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
             if (!received) {
                 if (feed.finished.load(std::memory_order_acquire)) break;
                 buffering = true;
+                join_warmup_frames = 2;   // 重新接入同样先丢两帧防爆音
                 // 源端刚才停顿到把缓冲吃空: 下次多攒一点再出声, 避免"刚恢复
                 // 又断"的连环卡顿。上限 kMaxResumePrebuffer。
                 wait_bytes = std::min<std::size_t>(wait_bytes * 2, wait_limit);
@@ -1153,6 +1187,11 @@ bool stream_station(std::size_t station, uint32_t generation) {
                 raw.len -= raw.consumed;
 
                 if (frame.decoded_size > 0) {
+                    if (join_warmup_frames > 0) {
+                        --join_warmup_frames;
+                        raw.len = 0;
+                        break;   // 丢弃接入期的对齐垃圾帧, 不推给 I2S
+                    }
                     s_pool_warmed.store(true, std::memory_order_release);
                     esp_audio_simple_dec_info_t info = {};
                     if (!format_ready &&
@@ -1496,7 +1535,10 @@ bool radio_player_init() {
     nvs_handle_t catalog_handle;
     if (nvs_open("radio", NVS_READONLY, &catalog_handle) == ESP_OK) {
         std::size_t bytes = sizeof(s_stations);
-        if (nvs_get_blob(catalog_handle, "catalog_v1", s_stations, &bytes) == ESP_OK &&
+        // catalog_v3: 2026-10-18 又一次改名。目录请求从 esp_http_client 换成裸 socket 之后
+        // 才真正搜得到本地台, 而此前存进 NVS 的是"只剩全国兜底台"的列表; 不清掉的话
+        // app_radio_request_catalog 会因为"已有缓存"永远不再搜索, 用户看到的仍然是外地台。
+        if (nvs_get_blob(catalog_handle, "catalog_v3", s_stations, &bytes) == ESP_OK &&
             bytes > 0 && bytes % sizeof(RadioStation) == 0 && bytes <= sizeof(s_stations)) {
             const std::size_t cached_count = bytes / sizeof(RadioStation);
             bool valid = true;
@@ -1540,6 +1582,12 @@ bool radio_player_init() {
 void radio_player_set_network(bool connected) {
     s_network_connected.store(connected, std::memory_order_release);
     s_generation.fetch_add(1, std::memory_order_acq_rel);
+    // 播放意图可能早于联网就绪(开机首页自动播放、WiFi 重连): 那时
+    // radio_wifi_set_streaming(true) 因 IsConnected()==false 被丢弃, 之后
+    // 再没人把射频切回 PERFORMANCE, 整条流就跑在 modem-sleep 下 -> 周期性
+    // 卡顿(实测日志: 全程只有 BALANCED (MIN_MODEM), 没有 PERFORMANCE)。
+    // 联网状态变化时按当前播放意图重新应用一次。
+    radio_wifi_set_streaming(connected && s_wanted_playing.load(std::memory_order_acquire));
 }
 
 void radio_player_toggle() {
@@ -1691,7 +1739,7 @@ bool radio_player_replace_stations_resuming(const RadioStation *stations,
     s_catalog_cached = true;
     nvs_handle_t catalog_handle;
     if (nvs_open("radio", NVS_READWRITE, &catalog_handle) == ESP_OK) {
-        esp_err_t saved = nvs_set_blob(catalog_handle, "catalog_v1", merged,
+        esp_err_t saved = nvs_set_blob(catalog_handle, "catalog_v3", merged,
                                       merged_count * sizeof(RadioStation));
         if (saved == ESP_OK) saved = nvs_commit(catalog_handle);
         if (saved != ESP_OK) ESP_LOGW(kTag, "catalog cache save failed: %s", esp_err_to_name(saved));

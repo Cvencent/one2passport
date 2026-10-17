@@ -46,6 +46,23 @@ extern "C" void xz_heap_report(const char *tag);  // xiaozhi_client.c 临时heap
 #include <mutex>
 #include <string>
 
+// 城市电台列表: 第 0 项是自动定位, 其余直接来自 radio_catalog 的城市表
+// (同一张表也提供查询用的省名与旧式 state 拼写)。历史上这里和 UI 的
+// kCityItems[]、app_apps 的 kCityNames[] 各存一份, 顺序一旦不同就会
+// "选 A 城市却搜 B 城市", 甚至索引越界。现在三处共用一个来源。
+std::size_t city_choice_count() {
+    return 1 + radio_catalog_city_count();
+}
+
+const char *city_query_for(std::size_t index) {
+    if (index == 0 || index >= city_choice_count()) return nullptr;
+    return radio_catalog_city_name(index - 1);
+}
+
+const char *city_display_for(std::size_t index) {
+    return index == 0 ? "自动定位" : city_query_for(index);
+}
+
 namespace {
 
 constexpr char kTag[] = "internet_radio";
@@ -73,23 +90,6 @@ enum class SettingsInputMode {
     SavedWifi,
     WifiAction,
     WifiDeleteConfirm,
-};
-
-struct CityChoice {
-    const char *query;
-    const char *display;
-};
-
-constexpr CityChoice kCityChoices[] = {
-    {nullptr, "AUTO"},
-    {"北京", "BEIJING"},
-    {"上海", "SHANGHAI"},
-    {"广州", "GUANGZHOU"},
-    {"深圳", "SHENZHEN"},
-    {"重庆", "CHONGQING"},
-    {"长沙", "CHANGSHA"},
-    {"杭州", "HANGZHOU"},
-    {"成都", "CHENGDU"},
 };
 
 constexpr uint16_t kSleepTimerMinutes[] = {0, 15, 30, 60, 90};
@@ -204,30 +204,63 @@ extern "C" esp_netif_t *wifi_manager_get_station_netif(void) {
 
 // Persists the city the listener picked in Settings so a restart comes back to
 // the same place instead of relocating from scratch every time.
+//
+// 存的是**城市名**而不是表索引: 表会随版本增删(旧表 9 项, 现在 50 项), 索引一
+// 移位就会"上次选广州、这次自动选天津"。旧固件只写过 "city" 这个 u8, 所以这里
+// 保留一张旧表做一次性迁移。
+constexpr const char *kLegacyCityOrder[] = {
+    "", "北京", "上海", "广州", "深圳", "重庆", "长沙", "杭州", "成都",
+};
+
 void save_selected_city(std::size_t choice_index) {
     nvs_handle_t handle;
     if (nvs_open("radio", NVS_READWRITE, &handle) != ESP_OK) return;
+    const char *name = city_query_for(choice_index);
+    if (name) {
+        nvs_set_str(handle, "city_name", name);
+    } else {
+        nvs_set_str(handle, "city_name", "");
+    }
     nvs_set_u8(handle, "city", static_cast<uint8_t>(choice_index));
     nvs_commit(handle);
     nvs_close(handle);
 }
 
+std::size_t find_city_index(const char *name) {
+    if (!name || !name[0]) return 0;
+    const std::size_t count = city_choice_count();
+    for (std::size_t i = 1; i < count; ++i) {
+        const char *query = city_query_for(i);
+        if (query && std::strcmp(query, name) == 0) return i;
+    }
+    return 0;
+}
+
 std::size_t load_selected_city() {
     nvs_handle_t handle;
     if (nvs_open("radio", NVS_READONLY, &handle) != ESP_OK) return 0;
-    uint8_t value = 0;
-    if (nvs_get_u8(handle, "city", &value) != ESP_OK) value = 0;
+    char name[24] = {};
+    std::size_t length = sizeof(name);
+    std::size_t index = 0;
+    if (nvs_get_str(handle, "city_name", name, &length) == ESP_OK) {
+        index = find_city_index(name);
+    } else {
+        uint8_t legacy = 0;
+        if (nvs_get_u8(handle, "city", &legacy) == ESP_OK &&
+            legacy < sizeof(kLegacyCityOrder) / sizeof(kLegacyCityOrder[0])) {
+            index = find_city_index(kLegacyCityOrder[legacy]);
+        }
+    }
     nvs_close(handle);
-    const std::size_t count = sizeof(kCityChoices) / sizeof(kCityChoices[0]);
-    return value < count ? value : 0;
+    return index;
 }
 
 // Starts the search for whichever city was last chosen, falling back to
 // automatic detection the first time the radio is used.
 void start_remembered_catalog_search() {
-    const CityChoice &choice = kCityChoices[load_selected_city()];
-    if (choice.query) {
-        start_city_catalog_search(choice.query, choice.display);
+    const char *query = city_query_for(load_selected_city());
+    if (query) {
+        start_city_catalog_search(query, query);
     } else {
         start_local_catalog_search();
     }
@@ -745,9 +778,8 @@ void start_sntp_once() {
         s_sntp_started.store(false);
     }
 }
-
 void catalog_task(void *) {
-    constexpr std::size_t kDiscoveryCapacity = 4;
+    constexpr std::size_t kDiscoveryCapacity = 8;
     auto *stations = static_cast<RadioStation *>(
         std::calloc(kDiscoveryCapacity, sizeof(RadioStation)));
     while (stations) {
@@ -1038,9 +1070,12 @@ void app_radio_request_catalog(void) {
     if (s_connected.load() && needs_catalog) start_remembered_catalog_search();
 }
 void app_radio_request_city(const char *city, const char *display) {
-    for (std::size_t i = 0; i < sizeof(kCityChoices) / sizeof(kCityChoices[0]); ++i) {
-        const char *query = kCityChoices[i].query;
-        if ((!city || !city[0]) ? query == nullptr : query && std::strcmp(city, query) == 0) {
+    const std::size_t count = city_choice_count();
+    for (std::size_t i = 0; i < count; ++i) {
+        const char *query = city_query_for(i);
+        const bool matches = (!city || !city[0]) ? query == nullptr
+                                                 : query && std::strcmp(city, query) == 0;
+        if (matches) {
             save_selected_city(i);
             break;
         }

@@ -5,7 +5,7 @@
 #define CODING_RENDER_CAPACITY (CODING_STATUS_MAX + CODING_DETAIL_MAX + 16)
 #define CODING_CATALOG_CAPACITY 8
 
-typedef struct { char id[8]; char title[192]; } coding_catalog_item_t;
+typedef struct { char id[12]; char title[192]; } coding_catalog_item_t;
 typedef struct {
  char detail[CODING_RENDER_CAPACITY];
  coding_catalog_item_t catalog[CODING_CATALOG_CAPACITY];

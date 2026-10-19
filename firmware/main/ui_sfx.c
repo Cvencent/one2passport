@@ -14,6 +14,7 @@
 static QueueHandle_t s_queue;
 static uint8_t s_volume = 50;
 static bool s_available;
+static volatile bool s_suspended;
 extern bool radio_is_playing_c(void);
 
 typedef struct {
@@ -123,7 +124,7 @@ static void sfx_task(void *argument)
     sfx_request_t request;
     for (;;) {
         if (xQueueReceive(s_queue, &request, portMAX_DELAY) != pdTRUE) continue;
-        if (!s_available || s_volume == 0 || radio_is_playing_c()) continue;
+        if (!s_available || s_suspended || s_volume == 0 || radio_is_playing_c()) continue;
         if (bsp_audio_set_format(SFX_SAMPLE_RATE, 16, 1) != ESP_OK) continue;
         bsp_audio_set_volume(s_volume);
 
@@ -164,16 +165,21 @@ void ui_sfx_set_volume(uint8_t percent)
     s_volume = percent > 100 ? 100 : percent;
 }
 
+void ui_sfx_suspend(bool suspended)
+{
+    s_suspended = suspended;
+}
+
 void ui_sfx_play(ui_sfx_t effect)
 {
-    if (s_queue == NULL || s_volume == 0 || radio_is_playing_c()) return;
+    if (s_queue == NULL || s_suspended || s_volume == 0 || radio_is_playing_c()) return;
     const sfx_request_t request = { .effect = effect };
     (void)xQueueSend(s_queue, &request, 0);
 }
 
 void ui_sfx_play_wav(const uint8_t *wav, size_t wav_size)
 {
-    if (s_queue == NULL || s_volume == 0 || radio_is_playing_c() ||
+    if (s_queue == NULL || s_suspended || s_volume == 0 || radio_is_playing_c() ||
         wav == NULL || wav_size == 0) return;
     const sfx_request_t request = {
         .effect = UI_SFX_CONFIRM,

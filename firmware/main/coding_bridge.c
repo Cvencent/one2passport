@@ -17,43 +17,130 @@
 #include "fap_screenshot.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
-#include "ui_sfx.h"
 #include "app_registry.h"
 #include "wireless_bridge.h"
+#include "ui_sfx.h"
 
 #define BRIDGE_LINE_MAX 768
 #define BRIDGE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 #define CAPTURE_SAMPLE_RATE 16000
 #define CAPTURE_CHUNK_SAMPLES 160
 #define CAPTURE_CHUNK_BYTES (CAPTURE_CHUNK_SAMPLES * sizeof(int16_t))
-#define CAPTURE_BASE64_BYTES (4 * ((CAPTURE_CHUNK_BYTES + 2) / 3))
 #define CAPTURE_TASK_STACK 4096
 #define SPEECH_CHUNK_BYTES 384
+#define CBDP_IDEM_BYTES 16U
+
+// Maps CBDP error codes to a short, user-facing message. The device only
+// receives the numeric `code` in the fixed header; error_message (0x0062) is
+// optional and carries detail.
+static const char *cbdp_error_text(uint16_t code)
+{
+    switch (code) {
+    case CBDP_ERR_NOT_FOUND: return "没有找到对应的会话或任务";
+    case CBDP_ERR_BUSY: return "电脑端正忙，请稍后重试";
+    case CBDP_ERR_UNAUTHORIZED: return "配对已失效，请重新配对";
+    case CBDP_ERR_CAPABILITY_NOT_ENABLED: return "该功能未在电脑端启用";
+    case CBDP_ERR_INVALID_PARAM: return "请求参数不完整";
+    case CBDP_ERR_INVALID_STATE: return "请先选择一个会话";
+    case CBDP_ERR_UPSTREAM_UNAVAILABLE: return "电脑端暂时无法处理，请稍后重试";
+    case CBDP_ERR_PAYLOAD_TOO_LARGE: return "内容过大，请缩短后重试";
+    case CBDP_ERR_TIMEOUT: return "操作超时，请重试";
+    case CBDP_ERR_QUEUE_FULL: return "电脑端队列已满，请稍后重试";
+    default: return "电脑端处理失败，请重试";
+    }
+}
 
 static const char *TAG = "coding_bridge";
 extern bool radio_is_playing_c(void);
+extern void radio_pause_for_xiaozhi(void);
 static bool s_ready;
+
 static bool s_connected;
 static bool s_wireless_started;
 static bool s_wireless_enabled;
 static bool s_bridge_online;
 static bool s_allow_foreground_ui;
-static codex_bridge_parser_t s_wireless_parser;
-static char s_active_message_id[CODEX_BRIDGE_ID_MAX];
-static char s_enabled_capabilities[CODEX_BRIDGE_CAPABILITY_MAX][CODEX_BRIDGE_CAPABILITY_LEN];
-static size_t s_enabled_capability_count;
+static cbdp_session_t s_session;
 static int64_t s_last_message_us;
+// A reconnect replays a backlog of deltas in one burst. Every delta that
+// reaches the UI takes the LVGL lock and invalidates the screen, which starved
+// the LVGL/IDLE tasks long enough to trip the task watchdog. Apply UI work at a
+// bounded rate and let later events converge the final state.
+static int64_t s_last_ui_us;
+static bool ui_budget_available(void)
+{
+    const int64_t now = esp_timer_get_time();
+    if (now - s_last_ui_us < 120000LL) return false;
+    s_last_ui_us = now;
+    return true;
+}
 static app_codex_state_t s_background_codex_state = APP_CODEX_OFFLINE;
 static codex_background_state_t s_background_state;
 static volatile bool s_capture_requested;
 static volatile bool s_capture_cancelled;
-static bool s_capture_wireless;
 static uint32_t s_catalog_request_id;
+static uint32_t s_thread_topic_id;
+static uint32_t s_thread_scope_seq;
+static uint64_t s_thread_scope_cursor;
+static uint32_t s_thread_ref_for_topic;
+static uint32_t s_summary_scope_seq;
+static uint32_t s_last_acked_seq;
+#define MAX_SUBSCRIPTIONS 6
+static uint32_t s_sub_topic[MAX_SUBSCRIPTIONS];
+static uint8_t s_sub_scope[MAX_SUBSCRIPTIONS];
+static int s_sub_count;
+
+// 15.1: `threads.list` objects already carry the stable thread topic_id, so
+// cache the most recent list. Selection can then bind and subscribe straight
+// from the cache instead of depending on a second thread.read round trip that
+// a host may reject.
+#define THREAD_CACHE_MAX 16
+#define THREAD_CACHE_TITLE_MAX 96
+static struct {
+    uint32_t thread_ref;
+    uint32_t topic_id;
+    char title[THREAD_CACHE_TITLE_MAX];
+} s_thread_cache[THREAD_CACHE_MAX];
+static int s_thread_cache_count;
+
+static bool wireless_is_subscribed(uint32_t topic_id, uint8_t scope)
+{
+    for (int i = 0; i < s_sub_count; ++i) {
+        if (s_sub_topic[i] == topic_id && s_sub_scope[i] == scope) return true;
+    }
+    return false;
+}
+
+static bool wireless_topic_subscribed(uint32_t topic_id)
+{
+    for (int i = 0; i < s_sub_count; ++i) {
+        if (s_sub_topic[i] == topic_id) return true;
+    }
+    return false;
+}
+
+// Drop every subscription for one topic. Selecting a new thread replaces the
+// previous thread topic; without this the fixed-size table fills up after a few
+// selections and new subscriptions are silently refused.
+static void wireless_unsubscribe_topic(uint32_t topic_id)
+{
+    int write_index = 0;
+    for (int read_index = 0; read_index < s_sub_count; ++read_index) {
+        if (s_sub_topic[read_index] == topic_id) continue;
+        s_sub_topic[write_index] = s_sub_topic[read_index];
+        s_sub_scope[write_index] = s_sub_scope[read_index];
+        ++write_index;
+    }
+    s_sub_count = write_index;
+}
+
+static uint64_t s_summary_scope_cursor;
 static TaskHandle_t s_capture_task;
 static esp_ota_handle_t s_ota_handle;
 static const esp_partition_t *s_ota_partition;
@@ -61,6 +148,99 @@ static size_t s_ota_expected;
 static size_t s_ota_written;
 static int s_ota_progress;
 static bool s_ota_active;
+static uint32_t s_wireless_request_id = 1U;
+static uint32_t s_wireless_tx_id = 1U;
+
+// Section 17.4 keys host-side idempotency on (device_id, request_id, method_id,
+// params) and remembers it for 24h. A counter that restarts at 1 on every boot
+// therefore replays ids the host already recorded and is rejected with
+// IDEMPOTENCY_CONFLICT, so both init paths seed it per boot.
+static void seed_wireless_counters(void)
+{
+    s_wireless_request_id = esp_random() & 0x00FFFFFFU;
+    if (s_wireless_request_id == 0U) s_wireless_request_id = 1U;
+    s_wireless_tx_id = esp_random() & 0x00FFFFFFU;
+    if (s_wireless_tx_id == 0U) s_wireless_tx_id = 1U;
+}
+static size_t s_capture_offset;
+static size_t s_text_offset;
+static uint32_t s_approval_ref;
+static char s_active_thread_id[CODEX_BRIDGE_ID_MAX];
+static char s_active_turn_id[CODEX_BRIDGE_ID_MAX];
+static uint32_t s_active_thread_ref;
+static uint32_t s_active_turn_ref;
+static uint8_t s_text_idem[CBDP_IDEM_BYTES];
+static uint8_t s_audio_idem[CBDP_IDEM_BYTES];
+
+static void clear_active_turn(void)
+{
+    s_active_turn_id[0] = '\0';
+    s_active_turn_ref = 0U;
+}
+
+static void wireless_subscribe(uint32_t topic_id, uint8_t scope, uint64_t cursor);
+
+// Bind the device to one thread and make its event topic reachable.
+// `threads.list` objects already carry thread_ref (0x0021) and topic_id
+// (0x0030), so selection does not have to depend on a second thread.read
+// round trip. `thread.read` is still requested for metadata, but a host that
+// cannot serve it must not leave the device unable to subscribe.
+static void wireless_bind_thread(uint32_t thread_ref, uint32_t topic_id)
+{
+    if (thread_ref != 0U) {
+        s_active_thread_ref = thread_ref;
+        snprintf(s_active_thread_id, sizeof(s_active_thread_id), "%lu",
+                 (unsigned long)thread_ref);
+    }
+    if (topic_id == 0U) return;
+    if (s_thread_topic_id != 0U && s_thread_topic_id != topic_id) {
+        wireless_unsubscribe_topic(s_thread_topic_id);
+    }
+    s_thread_topic_id = topic_id;
+    s_thread_ref_for_topic = thread_ref;
+    s_thread_scope_seq = 0U;
+    s_thread_scope_cursor = 0U;
+    wireless_subscribe(topic_id, CBDP_SCOPE_THREAD, 0U);
+    // `message.read` is a summary-scope event on the same topic.
+    wireless_subscribe(topic_id, CBDP_SCOPE_SUMMARY, 0U);
+}
+
+static void thread_cache_reset(void) { s_thread_cache_count = 0; }
+
+static void thread_cache_add(uint32_t thread_ref, uint32_t topic_id, const char *title)
+{
+    if (thread_ref == 0U || topic_id == 0U) return;
+    for (int i = 0; i < s_thread_cache_count; ++i) {
+        if (s_thread_cache[i].thread_ref == thread_ref) {
+            s_thread_cache[i].topic_id = topic_id;
+            snprintf(s_thread_cache[i].title, THREAD_CACHE_TITLE_MAX, "%s",
+                     title != NULL ? title : "");
+            return;
+        }
+    }
+    if (s_thread_cache_count >= THREAD_CACHE_MAX) return;
+    s_thread_cache[s_thread_cache_count].thread_ref = thread_ref;
+    s_thread_cache[s_thread_cache_count].topic_id = topic_id;
+    snprintf(s_thread_cache[s_thread_cache_count].title, THREAD_CACHE_TITLE_MAX, "%s",
+             title != NULL ? title : "");
+    ++s_thread_cache_count;
+}
+
+static uint32_t thread_cache_topic(uint32_t thread_ref)
+{
+    for (int i = 0; i < s_thread_cache_count; ++i) {
+        if (s_thread_cache[i].thread_ref == thread_ref) return s_thread_cache[i].topic_id;
+    }
+    return 0U;
+}
+
+static const char *thread_cache_title(uint32_t thread_ref)
+{
+    for (int i = 0; i < s_thread_cache_count; ++i) {
+        if (s_thread_cache[i].thread_ref == thread_ref) return s_thread_cache[i].title;
+    }
+    return NULL;
+}
 
 typedef enum {
     LONG_TEXT_NONE = 0,
@@ -77,6 +257,23 @@ static char s_long_text_thread[64];
 static char s_long_text_turn[64];
 static bool s_speech_playing;
 static uint32_t s_long_text_elapsed_ms;
+
+static void wireless_subscribe(uint32_t topic_id, uint8_t scope, uint64_t cursor);
+static void wireless_ack(uint32_t topic_id, uint8_t scope, uint32_t ack_seq,
+                         uint64_t cursor);
+// Section 15.8/9.4 allow the host to coalesce delivery (ack_delay_ms), and a
+// subscribe that replays a topic's backlog arrives as a burst. Acknowledging
+// every replayed frame one-for-one doubled the traffic and saturated the socket
+// until the connection dropped mid-recording, so only the newest cursor is
+// acknowledged, at most once per ACK_COALESCE_US.
+#define ACK_COALESCE_US (150LL * 1000LL)
+static bool s_ack_pending;
+static uint32_t s_pending_ack_topic;
+static uint8_t s_pending_ack_scope;
+static uint32_t s_pending_ack_seq;
+static uint64_t s_pending_ack_cursor;
+static int64_t s_last_ack_us;
+static void wireless_ack_flush(void);
 
 static const char *json_string(const cJSON *root, const char *key)
 {
@@ -237,47 +434,31 @@ static bool send_json(cJSON *root)
         memcpy(wire, json, length);
         wire[length] = '\n';
         wire[length + 1] = '\0';
-        // One event must use one transport. Mirroring the 50 audio chunks per
-        // second to an attached but unopened USB serial port fills its small TX
-        // ring buffer and can block each chunk for 250 ms, truncating a spoken
-        // command to a fraction of its real duration. Prefer the authenticated
-        // Wi-Fi bridge and use USB only as a fallback.
-        bool sent_wirelessly = wireless_bridge_write(wire, length + 1);
-        sent = sent_wirelessly;
-        if (!sent_wirelessly && usb_serial_jtag_is_connected()) {
-            sent = fap_usb_write(wire, length + 1);
-        }
+        sent = usb_serial_jtag_is_connected() && fap_usb_write(wire, length + 1);
         free(wire);
     }
     cJSON_free(json);
     return sent;
 }
 
-static bool send_wireless_line(const char *line, size_t length)
-{
-    return wireless_bridge_write(line, length);
-}
-
-static bool authenticate_wireless(const char *line, const char *device_id)
-{
-    return codex_bridge_protocol_accept_line(line, send_wireless_line, device_id);
-}
-
-static void capabilities_replace_from_message(const codex_bridge_message_t *message)
-{
-    if (message == NULL) return;
-    s_enabled_capability_count = message->capability_count;
-    for (size_t index = 0; index < s_enabled_capability_count; ++index) {
-        snprintf(s_enabled_capabilities[index], CODEX_BRIDGE_CAPABILITY_LEN, "%s",
-                 message->capabilities[index]);
-    }
-}
-
 bool coding_bridge_capability_enabled(const char *capability)
 {
-    if (capability == NULL) return false;
-    for (size_t index = 0; index < s_enabled_capability_count; ++index) {
-        if (strcmp(s_enabled_capabilities[index], capability) == 0) return true;
+    // 9.3: only capabilities that survived the three-way intersection may be
+    // used, so consult the session's effective set instead of the firmware's
+    // own supported set.
+    if (capability == NULL || !s_session.ready) return false;
+    static const struct { const char *name; uint8_t bit; } names[] = {
+        {"status", CBDP_CAP_STATUS}, {"text", CBDP_CAP_TEXT},
+        {"tasks", CBDP_CAP_TASKS}, {"results", CBDP_CAP_RESULTS},
+        {"approval", CBDP_CAP_APPROVAL}, {"audio", CBDP_CAP_AUDIO},
+        {"voice", CBDP_CAP_VOICE}, {"read_ack", CBDP_CAP_READ_ACK},
+        {"control", CBDP_CAP_CONTROL}, {"history", CBDP_CAP_HISTORY},
+    };
+    for (size_t index = 0U; index < sizeof(names) / sizeof(names[0]); ++index) {
+        if (strcmp(names[index].name, capability) == 0) {
+            const uint64_t bit = UINT64_C(1) << names[index].bit;
+            return (s_session.effective_caps & bit) != 0U;
+        }
     }
     return false;
 }
@@ -290,11 +471,6 @@ static cJSON *event_create(const char *type)
         return NULL;
     }
     return root;
-}
-
-static void send_simple(const char *type)
-{
-    send_json(event_create(type));
 }
 
 bool coding_bridge_is_connected(void)
@@ -327,6 +503,10 @@ static void home_codex_state_changed(void)
     home_codex_counts_changed();
     app_home_set_codex_state(s_background_codex_state);
 }
+
+static bool wireless_build_and_send_command(uint16_t method_id,
+                                             const uint8_t *params,
+                                             size_t params_length);
 
 static void background_read_state_changed(const char *message_id)
 {
@@ -477,72 +657,148 @@ static void send_capture_error(const char *message)
     send_json(root);
 }
 
-static bool send_record_header(void)
+// 17.4: idem = first_16_bytes(SHA-256(device_id || request_id || method_id ||
+// canonical_params)). Seeding from the request counter alone made a restarted
+// device reuse an idem that the host had already recorded for a different
+// method, and the host then rejected the command with IDEMPOTENCY_CONFLICT.
+static void make_idem_for(uint8_t idem[CBDP_IDEM_BYTES], uint32_t request_id,
+                          uint16_t method_id, const uint8_t *params,
+                          size_t params_length)
 {
-    static const char wire[] =
-        "{\"type\":\"record_start\",\"sample_rate\":16000,\"bits\":16,\"channels\":1}\n";
-    s_capture_wireless = wireless_bridge_write(wire, sizeof(wire) - 1);
-    return s_capture_wireless ||
-           (usb_serial_jtag_is_connected() &&
-            fap_usb_write(wire, sizeof(wire) - 1));
-}
-
-static bool send_capture_packet(const char *wire, size_t length)
-{
-    /* Keep a recording on the transport that accepted its header. */
-    return s_capture_wireless ? wireless_bridge_write(wire, length)
-                              : fap_usb_write(wire, length);
+    cbdp_build_idem(idem, request_id, method_id, params, params_length);
 }
 
 static bool send_audio_chunk(const int16_t *samples, size_t sample_count)
 {
-    const size_t byte_count = sample_count * sizeof(samples[0]);
-    static const char prefix[] = "{\"type\":\"audio_chunk\",\"data\":\"";
-    char wire[CAPTURE_BASE64_BYTES + sizeof(prefix) + 4];
-    const size_t prefix_length = sizeof(prefix) - 1;
-    memcpy(wire, prefix, prefix_length);
-    size_t encoded_length = 0;
-    /* Base64 contains no JSON escape characters. Encode straight into the
-     * packet to avoid three simultaneous heap buffers during microphone I/O. */
-    if (mbedtls_base64_encode((unsigned char *)wire + prefix_length,
-                              CAPTURE_BASE64_BYTES + 1, &encoded_length,
-                              (const unsigned char *)samples, byte_count) != 0) {
-        send_capture_error("音频编码失败");
-        s_capture_requested = false;
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    if (samples == NULL || sample_count == 0U ||
+        sample_count > SIZE_MAX / sizeof(*samples)) {
         return false;
     }
-    memcpy(wire + prefix_length + encoded_length, "\"}\n", 3);
-    size_t length = prefix_length + encoded_length + 3;
-    return send_capture_packet(wire, length);
+    const size_t payload_length = sample_count * sizeof(*samples);
+    if (!cbdp_build_audio_chunk(frame, sizeof(frame), &length, s_wireless_tx_id,
+                                (uint32_t)s_capture_offset, (const uint8_t *)samples,
+                                payload_length)) {
+        return false;
+    }
+    return wireless_bridge_send_frame(frame, length);
 }
 
-static bool send_record_footer(size_t byte_count)
+static uint32_t next_tx_id(void)
 {
-    char wire[64];
-    int length = snprintf(wire, sizeof(wire),
-                          "{\"type\":\"record_stop\",\"bytes\":%u}\n",
-                          (unsigned)byte_count);
-    return send_capture_packet(wire, (size_t)length);
+    // Each SEND_*/AUDIO_* transaction needs its own tx_id: idempotency and the
+    // host-side transaction state are keyed by it. Reusing one tx_id across
+    // recordings left stale transactions behind whenever a recording ended
+    // without AUDIO_END.
+    ++s_wireless_tx_id;
+    if (s_wireless_tx_id == 0U) s_wireless_tx_id = 1U;
+    return s_wireless_tx_id;
+}
+
+static bool send_audio_begin(void)
+{
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    s_wireless_tx_id = next_tx_id();
+    make_idem_for(s_audio_idem, s_wireless_tx_id, CBDP_MT_AUDIO_BEGIN,
+                  (const uint8_t *)s_active_thread_id, strlen(s_active_thread_id));
+    if (!cbdp_build_audio_begin(frame, sizeof(frame), &length, s_wireless_tx_id, 0U,
+                                CAPTURE_SAMPLE_RATE, 1U, 16U, 0U, NULL,
+                                s_active_thread_ref, s_active_thread_id,
+                                s_active_thread_ref == 0U && s_active_thread_id[0] == '\0',
+                                s_audio_idem)) {
+        return false;
+    }
+    return wireless_bridge_send_frame(frame, length);
+}
+
+static bool send_audio_end(size_t total_bytes)
+{
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    if (total_bytes > UINT32_MAX ||
+        !cbdp_build_audio_end(frame, sizeof(frame), &length, s_wireless_tx_id,
+                              (uint32_t)total_bytes)) {
+        return false;
+    }
+    return wireless_bridge_send_frame(frame, length);
+}
+
+static bool send_text_bytes(const char *text)
+{
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    if (text == NULL || !s_connected || !wireless_bridge_session_ready()) {
+        return false;
+    }
+    const size_t total_bytes = strlen(text);
+    if (total_bytes == 0U || total_bytes > UINT32_MAX) {
+        return false;
+    }
+    (void)next_tx_id();
+    make_idem_for(s_text_idem, s_wireless_tx_id, CBDP_MT_SEND_BEGIN,
+                  (const uint8_t *)text, total_bytes);
+    if (!cbdp_build_send_begin(frame, sizeof(frame), &length, s_wireless_tx_id,
+                               0U, (uint32_t)total_bytes,
+                               s_active_thread_ref, s_active_thread_id,
+                               s_active_thread_ref == 0U && s_active_thread_id[0] == '\0',
+                               s_text_idem) ||
+        !wireless_bridge_send_frame(frame, length)) {
+        return false;
+    }
+    size_t offset = 0U;
+    while (offset < total_bytes) {
+        size_t chunk = total_bytes - offset;
+        if (chunk > CBDP_MAX_CHUNK_BYTES) chunk = CBDP_MAX_CHUNK_BYTES;
+        if (!cbdp_build_send_chunk(frame, sizeof(frame), &length,
+                                   s_wireless_tx_id, (uint32_t)offset,
+                                   (const uint8_t *)(text + offset), chunk) ||
+            !wireless_bridge_send_frame(frame, length)) {
+            return false;
+        }
+        offset += chunk;
+    }
+    if (!cbdp_build_send_end(frame, sizeof(frame), &length, s_wireless_tx_id,
+                             (uint32_t)total_bytes)) {
+        return false;
+    }
+    s_text_offset = total_bytes;
+    return wireless_bridge_send_frame(frame, length);
 }
 
 static void capture_task(void *argument)
 {
     (void)argument;
+    ui_sfx_suspend(true);
     int16_t samples[CAPTURE_CHUNK_SAMPLES];
     size_t total_bytes = 0;
     unsigned level_tick = 0;
+    unsigned chunk_stalls = 0U;
     bool capture_ok = true;
-
-    if (bsp_audio_set_format(CAPTURE_SAMPLE_RATE, 16, 1) != ESP_OK) {
+        if (bsp_audio_set_format(CAPTURE_SAMPLE_RATE, 16, 1) != ESP_OK) {
         send_capture_error("麦克风格式设置失败");
         s_capture_requested = false;
         s_capture_task = NULL;
+        ui_sfx_suspend(false);
         vTaskDelete(NULL);
         return;
     }
 
-    capture_ok = send_record_header();
+    s_capture_offset = 0U;
+    capture_ok = send_audio_begin();
+    const bool audio_begun = capture_ok;
     while (capture_ok && s_capture_requested) {
+        // 19.5: never send more audio than the host declared in WELCOME.
+        if (s_session.max_audio_bytes != 0U &&
+            total_bytes + sizeof(samples) > s_session.max_audio_bytes) {
+            ESP_LOGW(TAG, "audio capture hit max_audio_bytes=%u",
+                     (unsigned)s_session.max_audio_bytes);
+            s_capture_requested = false;
+            capture_ok = false;
+            send_capture_error("录音超过电脑端允许的长度");
+            break;
+        }
         if (bsp_audio_read(samples, sizeof(samples)) != ESP_OK) {
             send_capture_error("麦克风读取失败");
             s_capture_requested = false;
@@ -550,9 +806,22 @@ static void capture_task(void *argument)
             break;
         }
         if (!send_audio_chunk(samples, CAPTURE_CHUNK_SAMPLES)) {
+            // The host can briefly stop draining (for example while it streams
+            // topic history back to us). Tolerate a short stall, but do not keep
+            // re-reading and discarding microphone frames: the transport is a
+            // real-time stream, so beyond a moment there is nothing useful left
+            // to send. Keep s_capture_offset unchanged so whatever did go out
+            // stays contiguous for the host.
+            if (++chunk_stalls < 25U) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
             capture_ok = false;
+            send_capture_error("上传通道拥塞，录音已停止");
             break;
         }
+        chunk_stalls = 0U;
+        s_capture_offset += sizeof(samples);
         total_bytes += sizeof(samples);
         if (++level_tick >= 4) {
             int32_t peak = 0;
@@ -570,8 +839,12 @@ static void capture_task(void *argument)
             level_tick = 0;
         }
     }
-    if (capture_ok && !s_capture_cancelled) {
-        capture_ok = send_record_footer(total_bytes);
+    // An opened transaction must always be closed: AUDIO_BEGIN without
+    // AUDIO_END strands host-side state and makes every later recording fail
+    // on the same tx_id. Cancelling still sends the end frame so the host can
+    // discard the partial audio deliberately.
+    if (audio_begun) {
+        if (!send_audio_end(total_bytes)) capture_ok = false;
     }
     s_capture_requested = false;
     ESP_LOGI(TAG, "capture bytes=%u stack_free=%u",
@@ -585,6 +858,7 @@ static void capture_task(void *argument)
         bsp_lvgl_unlock();
     }
     s_capture_task = NULL;
+    ui_sfx_suspend(false);
     vTaskDelete(NULL);
 }
 
@@ -605,6 +879,31 @@ static void start_capture(void)
 
 void coding_bridge_send_record_start(void)
 {
+    // 19.5: AUDIO_BEGIN needs the audio capability, and an AUDIO_* transaction
+    // must be bound to a selected thread. Refuse locally with a clear message
+    // instead of starting a capture the host will reject.
+    if (!wireless_bridge_session_ready() ||
+        !coding_bridge_capability_enabled("audio")) {
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_bridge_error("电脑端未启用语音上行");
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
+    if (s_active_thread_ref == 0U && s_active_thread_id[0] == '\0') {
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_bridge_error("请先选择一个会话");
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
+    // The codec sits behind one shared bus lock. While the radio or speech
+    // playback owns it, a 16 kHz capture read can be starved for seconds and
+    // the recording silently stops making progress. Stop the radio and wait for
+    // it to actually idle before opening the microphone.
+    if (radio_is_playing_c()) {
+        radio_pause_for_xiaozhi();
+    }
     start_capture();
 }
 
@@ -617,105 +916,176 @@ void coding_bridge_cancel_record(void)
 {
     s_capture_cancelled = true;
     s_capture_requested = false;
-    send_simple("record_cancel");
 }
 
 bool coding_bridge_send_voice(const char *text)
 {
-    cJSON *root = event_create("voice_command");
-    if (root != NULL && cJSON_AddStringToObject(root, "text", text != NULL ? text : "") == NULL) {
-        cJSON_Delete(root);
-        root = NULL;
-    }
-    return send_json(root);
-}
-
-static const char *decision_wire_name(coding_decision_t decision)
-{
-    static const char *const names[] = {
-        "approve_once", "approve_session", "deny", "cancel_task",
-    };
-    return decision >= CODING_DECISION_APPROVE_ONCE && decision < CODING_DECISION_COUNT
-               ? names[decision]
-               : "deny";
+    return send_text_bytes(text);
 }
 
 void coding_bridge_send_approval(coding_decision_t decision)
 {
-    cJSON *root = event_create("approval_decision");
-    if (root != NULL &&
-        cJSON_AddStringToObject(root, "decision", decision_wire_name(decision)) == NULL) {
-        cJSON_Delete(root);
-        root = NULL;
+    uint8_t idem[CBDP_IDEM_BYTES];
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    uint8_t wire_decision = 2U;
+    if (decision == CODING_DECISION_APPROVE_ONCE) wire_decision = 0U;
+    else if (decision == CODING_DECISION_APPROVE_SESSION) wire_decision = 1U;
+    else if (decision == CODING_DECISION_DENY) wire_decision = 2U;
+    else if (decision == CODING_DECISION_CANCEL_TASK) wire_decision = 3U;
+    ++s_wireless_request_id;
+    {
+        uint8_t approve_params[8];
+        size_t approve_length = 0U;
+        (void)cbdp_tlv_write_u32(approve_params, sizeof(approve_params),
+                                 &approve_length, CBDP_TLV_APPROVAL_REF,
+                                 s_approval_ref);
+        (void)cbdp_tlv_write_u8(approve_params, sizeof(approve_params),
+                                &approve_length, CBDP_TLV_DECISION, wire_decision);
+        make_idem_for(idem, s_wireless_request_id, CBDP_METHOD_APPROVAL_RESOLVE,
+                      approve_params, approve_length);
     }
-    send_json(root);
+    if (!cbdp_build_approval_resolve(frame, sizeof(frame), &length,
+                                     s_wireless_request_id, s_approval_ref,
+                                     wire_decision, NULL, idem)) {
+        return;
+    }
+    wireless_bridge_send_frame(frame, length);
 }
 
 void coding_bridge_send_cancel(void)
 {
-    send_simple("cancel_task");
+    if (!s_connected || !wireless_bridge_session_ready()) return;
+    uint8_t params[128];
+    size_t params_length = 0U;
+    if (s_active_thread_ref != 0U &&
+        !cbdp_tlv_write_u32(params, sizeof(params), &params_length,
+                            CBDP_TLV_THREAD_REF, s_active_thread_ref)) {
+        return;
+    }
+    if (s_active_turn_ref != 0U &&
+        !cbdp_tlv_write_u32(params, sizeof(params), &params_length,
+                            CBDP_TLV_TURN_REF, s_active_turn_ref)) {
+        return;
+    }
+    if (s_active_thread_ref == 0U && s_active_thread_id[0] != '\0' &&
+        !cbdp_tlv_write_bytes(params, sizeof(params), &params_length,
+                              CBDP_TLV_THREAD_ID, s_active_thread_id,
+                              strlen(s_active_thread_id))) {
+        return;
+    }
+    uint8_t idem[CBDP_IDEM_BYTES];
+    ++s_wireless_request_id;
+    make_idem_for(idem, s_wireless_request_id, CBDP_METHOD_TURN_INTERRUPT,
+                  params, params_length);
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    if (cbdp_build_command(frame, sizeof(frame), &length, s_wireless_request_id,
+                           CBDP_METHOD_TURN_INTERRUPT, params, params_length, idem)) {
+        wireless_bridge_send_frame(frame, length);
+    }
 }
 
 void coding_bridge_request_projects(void)
 {
-    cJSON *root = event_create("codex_catalog_request");
-    if (root) cJSON_AddNumberToObject(root, "request_id", ++s_catalog_request_id);
-    send_json(root);
+    wireless_build_and_send_command(CBDP_METHOD_PROJECTS_LIST, NULL, 0U);
 }
 
 void coding_bridge_cancel_catalog(void)
 {
-    ++s_catalog_request_id;
-    send_simple("codex_catalog_cancel");
+    s_catalog_request_id++;
 }
 
 void coding_bridge_confirm_selection(void)
 {
-    cJSON *root = event_create("codex_selection_confirm");
-    if (root) cJSON_AddNumberToObject(root, "request_id", s_catalog_request_id);
-    send_json(root);
-}
-
-static void send_catalog_selection(const char *type, const char *id)
-{
-    cJSON *root = event_create(type);
-    if (root) cJSON_AddNumberToObject(root, "request_id", ++s_catalog_request_id);
-    if (root != NULL &&
-        cJSON_AddStringToObject(root, "id", id != NULL ? id : "") == NULL) {
-        cJSON_Delete(root);
-        root = NULL;
-    }
-    send_json(root);
+    s_catalog_request_id++;
 }
 
 void coding_bridge_select_project(const char *id)
 {
-    send_catalog_selection("codex_project_select", id);
+    if (id == NULL) return;
+    const unsigned long reference = strtoul(id, NULL, 10);
+    if (reference == 0UL || reference > UINT32_MAX) return;
+    uint8_t params[16];
+    size_t params_length = 0U;
+    if (!cbdp_tlv_write_u32(params, sizeof(params), &params_length,
+                            CBDP_TLV_PROJECT_REF, (uint32_t)reference)) {
+        return;
+    }
+    wireless_build_and_send_command(CBDP_METHOD_THREADS_LIST, params,
+                                    params_length);
 }
 
 void coding_bridge_select_thread(const char *id)
 {
-    send_catalog_selection("codex_thread_select", id);
+    if (id == NULL) return;
+    const unsigned long reference = strtoul(id, NULL, 10);
+    if (reference == 0UL || reference > UINT32_MAX) return;
+    // Ask for the thread's metadata/history FIRST and subscribe only once that
+    // reply lands. Subscribing up front makes the host immediately replay the
+    // whole topic backlog, and while it is busy draining that replay it stops
+    // answering anything else: the read below then sat behind the replay for
+    // more than 3 x heartbeat_seconds and the device dropped the session before
+    // the selection ever completed.
+    uint8_t params[64];
+    size_t params_length = 0U;
+    if (!cbdp_tlv_write_u32(params, sizeof(params), &params_length,
+                            CBDP_TLV_THREAD_REF, (uint32_t)reference) ||
+        !cbdp_tlv_write_u16(params, sizeof(params), &params_length,
+                           CBDP_TLV_HISTORY_DEPTH, 2U)) {
+        return;
+    }
+    wireless_build_and_send_command(CBDP_METHOD_THREAD_READ, params,
+                                    params_length);
 }
 
 void coding_bridge_create_thread(void)
 {
-    send_catalog_selection("codex_thread_new", "");
+    wireless_build_and_send_command(CBDP_METHOD_THREAD_START, NULL, 0U);
+}
+
+const char *coding_bridge_thread_title(const char *id)
+{
+    if (id == NULL) return NULL;
+    const unsigned long reference = strtoul(id, NULL, 10);
+    if (reference == 0UL || reference > UINT32_MAX) return NULL;
+    return thread_cache_title((uint32_t)reference);
 }
 
 void coding_bridge_request_review(void)
 {
-    send_simple("codex_review_request");
+    if (s_active_thread_ref != 0U) {
+        uint8_t params[16];
+        size_t params_length = 0U;
+        if (cbdp_tlv_write_u32(params, sizeof(params), &params_length,
+                               CBDP_TLV_THREAD_REF, s_active_thread_ref)) {
+            wireless_build_and_send_command(CBDP_METHOD_THREAD_READ, params,
+                                            params_length);
+        }
+    }
 }
 
 bool coding_bridge_result_seen(const char *thread_id, const char *turn_id)
 {
-    cJSON *root = event_create("codex_result_seen");
-    if (root) {
-        cJSON_AddStringToObject(root, "thread_id", thread_id);
-        cJSON_AddStringToObject(root, "turn_id", turn_id);
+    (void)turn_id;
+    if (thread_id == NULL || thread_id[0] == '\0' || !s_connected) return false;
+    uint32_t thread_ref = s_active_thread_ref;
+    if (thread_ref == 0U) {
+        const unsigned long parsed = strtoul(thread_id, NULL, 10);
+        if (parsed == 0UL || parsed > UINT32_MAX) return false;
+        thread_ref = (uint32_t)parsed;
     }
-    return send_json(root);
+    if (thread_ref != 0U) {
+        uint8_t params[16];
+        size_t params_length = 0U;
+        if (cbdp_tlv_write_u32(params, sizeof(params), &params_length,
+                               CBDP_TLV_THREAD_REF, thread_ref)) {
+            wireless_build_and_send_command(CBDP_METHOD_THREAD_READ, params,
+                                            params_length);
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool dispatch_message(const cJSON *root)
@@ -849,115 +1219,644 @@ static void process_line(const char *line, bool usb_transport)
     cJSON_Delete(root);
 }
 
-static void process_wireless_line(const char *line)
+static bool wireless_build_and_send_command(uint16_t method_id,
+                                             const uint8_t *params, size_t params_length)
 {
-    if (!s_wireless_enabled) {
-        codex_bridge_parser_reset(&s_wireless_parser);
-        return;
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    uint8_t idem[CBDP_IDEM_BYTES];
+    ++s_wireless_request_id;
+    make_idem_for(idem, s_wireless_request_id, method_id, params, params_length);
+    if (!cbdp_build_command(frame, sizeof(frame), &length, s_wireless_request_id,
+                            method_id, params, params_length, idem)) {
+        return false;
     }
-    codex_bridge_message_t message = {0};
-    if (!codex_bridge_protocol_feed(&s_wireless_parser, line, strlen(line), &message)) {
-        return;
-    }
-    if (!s_bridge_online) {
-        if (strcmp(message.type, "bridge_ready") == 0 && !message.ignored) {
-            capabilities_replace_from_message(&message);
-            s_bridge_online = true;
-            s_connected = true;
-            s_background_state.connected = true;
-            s_last_message_us = esp_timer_get_time();
-            home_codex_state_changed();
-
-            if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
-                app_coding_bridge_connected(true);
-                bsp_lvgl_unlock();
-            }
-        }
-        codex_bridge_protocol_reset_message(&message);
-        return;
-    }
-    if (strcmp(message.type, "bridge_ready") == 0) {
-        capabilities_replace_from_message(&message);
-        s_last_message_us = esp_timer_get_time();
-        codex_bridge_protocol_reset_message(&message);
-        return;
-    }
-    if (strcmp(message.type, "capabilities_update") == 0) {
-        capabilities_replace_from_message(&message);
-        s_last_message_us = esp_timer_get_time();
-        codex_bridge_protocol_reset_message(&message);
-        return;
-    }
-    if (strcmp(message.type, "read_state") == 0) {
-        s_last_message_us = esp_timer_get_time();
-        background_read_state_changed(message.message_id);
-        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
-            app_coding_apply_read_state(message.message_id, message.read_count);
-            bsp_lvgl_unlock();
-        }
-        codex_bridge_protocol_reset_message(&message);
-        return;
-    }
-    if (strcmp(message.type, "message") == 0 && !message.ignored) {
-        s_last_message_us = esp_timer_get_time();
-        if (message.seq + 1 >= message.total) {
-            snprintf(s_active_message_id, sizeof(s_active_message_id), "%s",
-                     message.message_id);
-            const bool kind_status = strcmp(message.kind, "status") == 0 &&
-                                     coding_bridge_capability_enabled("status");
-            const bool kind_task = strcmp(message.kind, "task") == 0 &&
-                                   coding_bridge_capability_enabled("tasks");
-            const bool kind_result = strcmp(message.kind, "result") == 0 &&
-                                     coding_bridge_capability_enabled("results");
-            bool first_result = false;
-            if (kind_status || kind_task || kind_result) {
-                const uint32_t running = strcmp(message.status, "working") == 0 ||
-                                                 strcmp(message.status, "in_progress") == 0
-                                             ? 1U
-                                             : 0U;
-                if (kind_result) {
-                    /* Results are immutable and may be rebroadcast; only the
-                     * first delivery increments the unread badge. */
-                    codex_background_apply(&s_background_state, message.kind,
-                                           message.status, running);
-                    first_result = codex_background_apply_result(
-                        &s_background_state, message.message_id, message.status);
-                    if (first_result) {
-                        home_codex_state_changed();
-                    }
-                } else {
-                    codex_background_apply(&s_background_state, message.kind,
-                                           message.status, running);
-                    home_codex_state_changed();
-                }
-            }
-            if (first_result && !coding_bridge_foreground_ui_active()) {
-                app_voice_mode_t mode = app_settings_voice_mode();
-                if (strcmp(message.status, "failed") == 0) {
-                    ui_sfx_play(UI_SFX_FAIL);
-                } else if (mode == APP_VOICE_SPEECH) {
-                    ui_sfx_play(UI_SFX_DONE_SPEECH);
-                } else if (mode == APP_VOICE_TONE) {
-                    ui_sfx_play(UI_SFX_CONFIRM);
-                }
-            }
-            if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
-                if (kind_status) {
-                    app_coding_remote_status(message.body);
-                } else if (kind_task) {
-                    app_coding_remote_task(message.thread_id, message.body,
-                                           message.message_id);
-                } else if (kind_result) {
-                    app_coding_remote_result(message.thread_id, message.status,
-                                             message.body, message.message_id);
-                }
-                bsp_lvgl_unlock();
-            }
-        }
-    }
-    codex_bridge_protocol_reset_message(&message);
+    return wireless_bridge_send_frame(frame, length);
 }
 
+static const uint8_t *wireless_tlv_bytes(const uint8_t *tlv, size_t tlv_len,
+                                          uint16_t tag, size_t *value_len)
+{
+    const cbdp_tlv_t *item = cbdp_tlv_find(tlv, tlv_len, tag);
+    const uint8_t *value = NULL;
+    if (item == NULL || !cbdp_tlv_read_bytes(item, &value, value_len)) return NULL;
+    return value;
+}
+
+static bool copy_utf8_field(const uint8_t *tlv, size_t tlv_len, uint16_t tag,
+                            char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0U) return false;
+    size_t value_len = 0U;
+    const uint8_t *value = wireless_tlv_bytes(tlv, tlv_len, tag, &value_len);
+    if (value == NULL) {
+        output[0] = '\0';
+        return false;
+    }
+    const size_t copy_len = value_len < output_size - 1U ? value_len : output_size - 1U;
+    memcpy(output, value, copy_len);
+    output[copy_len] = '\0';
+    return true;
+}
+
+// Event bodies can be several kilobytes. Handing that straight to an LVGL
+// label makes text layout (word wrapping over CJK) run long enough on the
+// caller's task to trip the task watchdog, so the UI only ever sees a bounded
+// preview. The full text stays available in the background state.
+#define UI_PREVIEW_BYTES 384U
+static bool copy_utf8_preview(const uint8_t *tlv, size_t tlv_len, uint16_t tag,
+                              char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0U) return false;
+    const size_t limit = output_size - 1U < UI_PREVIEW_BYTES
+                             ? output_size - 1U : UI_PREVIEW_BYTES;
+    if (!copy_utf8_field(tlv, tlv_len, tag, output, limit + 1U)) {
+        output[0] = '\0';
+        return false;
+    }
+    // Drop a trailing partial multi-byte sequence so LVGL never has to walk an
+    // invalid UTF-8 tail.
+    size_t length = strlen(output);
+    while (length > 0U) {
+        const unsigned char last = (unsigned char)output[length - 1U];
+        if ((last & 0x80U) == 0U) break;          // ASCII
+        size_t lead = length - 1U;
+        while (lead > 0U && ((unsigned char)output[lead] & 0xC0U) == 0x80U) --lead;
+        const unsigned char first = (unsigned char)output[lead];
+        size_t expected = 1U;
+        if ((first & 0xE0U) == 0xC0U) expected = 2U;
+        else if ((first & 0xF0U) == 0xE0U) expected = 3U;
+        else if ((first & 0xF8U) == 0xF0U) expected = 4U;
+        if (length - lead >= expected) break;      // complete sequence
+        length = lead;
+        output[length] = '\0';
+    }
+    return length > 0U;
+}
+
+static void wireless_set_connected(bool connected)
+{
+    if (s_connected == connected) return;
+    s_connected = connected;
+    s_background_state.connected = connected;
+    if (!connected) {
+        s_bridge_online = false;
+        codex_background_reset(&s_background_state);
+    }
+    home_codex_state_changed();
+    if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+        app_coding_bridge_connected(connected);
+        bsp_lvgl_unlock();
+    }
+}
+
+// Section 15.4: subscriptions are per-session. A fresh TCP session starts with
+// none, so drop the local table whenever the transport loses the peer and
+// re-issue the summary (plus any active thread) subscription on AUTH_OK.
+static void wireless_reset_subscriptions(void)
+{
+    s_sub_count = 0;
+    s_last_acked_seq = 0U;
+    s_summary_scope_seq = 0U;
+    s_summary_scope_cursor = 0U;
+    s_thread_scope_seq = 0U;
+    s_thread_scope_cursor = 0U;
+}
+
+static void wireless_handle_result(const cbdp_frame_header_t *header,
+                                   const uint8_t *tlv, size_t tlv_len)
+{
+    (void)header;
+    uint16_t method_id = 0U;
+    uint8_t state = 0U;
+    const cbdp_tlv_t *item = cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_METHOD_ID);
+    (void)cbdp_tlv_read_u16(item, &method_id);
+    item = cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_STATE);
+    (void)cbdp_tlv_read_u8(item, &state);
+    const cbdp_tlv_t *result = cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_RESULT);
+    const uint8_t *result_tlv = result != NULL ? result->value : NULL;
+    const size_t result_len = result != NULL ? result->length : 0U;
+
+    if (method_id == CBDP_METHOD_PROJECTS_LIST || method_id == CBDP_METHOD_THREADS_LIST ||
+        method_id == CBDP_METHOD_THREAD_READ) {
+        char thread_ref_text[16] = {0};
+        uint32_t thread_ref = 0U;
+        cbdp_tlv_read_u32(cbdp_tlv_find(result_tlv, result_len, CBDP_TLV_THREAD_REF),
+                          &thread_ref);
+        if (thread_ref == 0U && method_id != CBDP_METHOD_PROJECTS_LIST) {
+            cbdp_tlv_read_u32(cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_THREAD_REF),
+                              &thread_ref);
+        }
+        const cbdp_tlv_t *objects = cbdp_tlv_find(result_tlv, result_len,
+                                                  CBDP_TLV_OBJECTS);
+        if (objects == NULL) objects = cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_OBJECTS);
+        // The catalog state machine only emits items while it is in the
+        // matching LOADING_* state and only becomes selectable after the END
+        // event. The CBDP result path therefore has to bracket the object list
+        // with begin/end exactly like the legacy JSON catalog stream does;
+        // without END the device stayed in LOADING_* forever, so OK was ignored
+        // and the user could never leave the project/thread picker.
+        const bool is_list = method_id == CBDP_METHOD_PROJECTS_LIST ||
+                             method_id == CBDP_METHOD_THREADS_LIST;
+        const char *list_scope = method_id == CBDP_METHOD_PROJECTS_LIST
+                                     ? "projects" : "threads";
+        if (method_id == CBDP_METHOD_THREADS_LIST) thread_cache_reset();
+        if (is_list && coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_catalog_begin(list_scope);
+            bsp_lvgl_unlock();
+        }
+        if (objects != NULL) {
+            cbdp_tlv_cursor_t cursor = {
+                .data = objects->value, .length = objects->length, .offset = 0U,
+            };
+            uint16_t object_count = (uint16_t)(objects->length / 2U);
+            if (objects->length >= 2U) {
+                object_count = cbdp_read_u16(objects->value);
+                cursor.offset = 2U;
+            }
+            cbdp_tlv_t object;
+            uint16_t parsed_count = 0U;
+            while (parsed_count < object_count && cbdp_tlv_next(&cursor, &object)) {
+                if (object.tag != CBDP_TLV_OBJECT) continue;
+                ++parsed_count;
+                char title[128] = {0};
+                char id[16] = {0};
+                char detail[256] = {0};
+                uint8_t object_type = 0U;
+                uint32_t object_ref = 0U;
+                uint32_t object_topic_id = 0U;
+                copy_utf8_field(object.value, object.length, CBDP_TLV_TITLE,
+                                title, sizeof(title));
+                copy_utf8_field(object.value, object.length, CBDP_TLV_SUMMARY,
+                                detail, sizeof(detail));
+                cbdp_tlv_read_u8(cbdp_tlv_find(object.value, object.length,
+                                               CBDP_TLV_OBJECT_TYPE),
+                                 &object_type);
+                if (object_type == 10U) {
+                    cbdp_tlv_read_u32(cbdp_tlv_find(object.value, object.length,
+                                                    CBDP_TLV_PROJECT_REF),
+                                      &object_ref);
+                } else if (object_type == 0U) {
+                    cbdp_tlv_read_u32(cbdp_tlv_find(object.value, object.length,
+                                                    CBDP_TLV_THREAD_REF),
+                                      &object_ref);
+                    // 15.1: thread objects carry their stable topic_id. Without
+                    // it the device cannot subscribe to that thread's events.
+                    cbdp_tlv_read_u32(cbdp_tlv_find(object.value, object.length,
+                                                    CBDP_TLV_TOPIC_ID),
+                                      &object_topic_id);
+                }
+                if (object_ref != 0U) snprintf(id, sizeof(id), "%lu",
+                                               (unsigned long)object_ref);
+                if (method_id == CBDP_METHOD_THREADS_LIST) {
+                    thread_cache_add(object_ref, object_topic_id, title);
+                }
+                if (!coding_bridge_foreground_ui_active() || !bsp_lvgl_lock(500)) {
+                    continue;
+                }
+                // A thread.read REPLIES with the thread object followed by its
+                // message history. Only the thread object belongs in the
+                // catalog/selection path; rendering every historical message as
+                // a catalog item held the LVGL lock long enough to starve the
+                // device (task watchdog inside wireless_bridge).
+                if (method_id == CBDP_METHOD_THREAD_READ && object_type != 0U) {
+                    bsp_lvgl_unlock();
+                    continue;
+                }
+                const char *scope = method_id == CBDP_METHOD_PROJECTS_LIST
+                                        ? "projects" : "threads";
+                app_coding_catalog_item(scope, id, title, detail);
+                if (method_id == CBDP_METHOD_THREAD_READ) {
+                    // 18.1/19.1: remember the selected thread so SEND_* and
+                    // AUDIO_* can bind to it. Falling back to use_active_thread
+                    // is invalid because the device never ran active_state.read.
+                    if (thread_ref != 0U) {
+                        snprintf(thread_ref_text, sizeof(thread_ref_text), "%lu",
+                                 (unsigned long)thread_ref);
+                    }
+                    wireless_bind_thread(thread_ref, object_topic_id);
+                    app_coding_result_identity(thread_ref_text, "");
+                    app_coding_task_selected(title, "", detail);
+                }
+                bsp_lvgl_unlock();
+            }
+        }
+        if (is_list && coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_catalog_end(list_scope);
+            bsp_lvgl_unlock();
+        }
+        s_last_message_us = esp_timer_get_time();
+        return;
+    }
+    if (method_id == CBDP_METHOD_TURN_START || method_id == CBDP_METHOD_TURN_STEER ||
+        method_id == CBDP_METHOD_THREAD_START) {
+        uint32_t thread_ref = 0U;
+        uint32_t turn_ref = 0U;
+        cbdp_tlv_read_u32(cbdp_tlv_find(result_tlv, result_len, CBDP_TLV_THREAD_REF),
+                          &thread_ref);
+        cbdp_tlv_read_u32(cbdp_tlv_find(result_tlv, result_len, CBDP_TLV_TURN_REF),
+                          &turn_ref);
+        if (thread_ref != 0U) {
+            s_active_thread_ref = thread_ref;
+            snprintf(s_active_thread_id, sizeof(s_active_thread_id), "%lu",
+                     (unsigned long)thread_ref);
+        }
+        if (turn_ref != 0U) {
+            s_active_turn_ref = turn_ref;
+            snprintf(s_active_turn_id, sizeof(s_active_turn_id), "%lu",
+                     (unsigned long)turn_ref);
+        }
+    } else if (method_id == CBDP_METHOD_TURN_INTERRUPT && state <= 1U) {
+        clear_active_turn();
+    }
+    if (state == 0U || state == 1U) {
+        s_last_message_us = esp_timer_get_time();
+        return;
+    }
+    if (state == 2U || state == 3U || state == 4U) {
+        char error[192] = {0};
+        copy_utf8_field(tlv, tlv_len, CBDP_TLV_ERROR_MESSAGE, error, sizeof(error));
+        if (error[0] == '\0') copy_utf8_field(tlv, tlv_len, CBDP_TLV_ERROR_DETAIL,
+                                              error, sizeof(error));
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_bridge_error(error[0] != '\0' ? error : "Bridge command failed");
+            bsp_lvgl_unlock();
+        }
+    }
+    s_last_message_us = esp_timer_get_time();
+}
+
+static void wireless_handle_delta(const cbdp_frame_header_t *header,
+                                  const uint8_t *tlv, size_t tlv_len)
+{
+    cbdp_event_header_t event = {0};
+    if (!cbdp_parse_event_header(tlv, tlv_len, &event)) return;
+    // 13.1: the transport seq lives in the fixed header; topic_id does too.
+    // topic_seq (in the event TLV) is the per-topic ordering key.
+    const uint32_t topic_id = header->topic_id;
+    const uint32_t frame_seq = header->seq;
+
+    // 15.4: the host only promises to deliver topics this session subscribed
+    // to, so any delta on another topic is a protocol anomaly. Applying it
+    // mutates application state for content the device never asked for (the
+    // unselected threads' events were driving the UI into stale DONE/ERROR
+    // screens before the user picked anything).
+    if (!wireless_topic_subscribed(topic_id)) {
+        return;
+    }
+
+    uint32_t *expected_seq = NULL;
+    uint64_t *cursor = NULL;
+    uint8_t scope = CBDP_SCOPE_THREAD;
+    if (topic_id == 0x50000003U) {
+        expected_seq = &s_summary_scope_seq;
+        cursor = &s_summary_scope_cursor;
+        scope = CBDP_SCOPE_SUMMARY;
+    } else {
+        expected_seq = &s_thread_scope_seq;
+        cursor = &s_thread_scope_cursor;
+        scope = CBDP_SCOPE_THREAD;
+    }
+
+    const uint32_t topic_seq = (uint32_t)event.topic_seq;
+    if (topic_seq != 0U && *expected_seq != 0U && topic_seq < *expected_seq) {
+        // Duplicate/older topic event: drop it, but still acknowledge the
+        // transport frame so the host can retire it.
+        if (frame_seq != 0U && frame_seq != s_last_acked_seq) {
+            s_last_acked_seq = frame_seq;
+            wireless_ack(topic_id, scope, frame_seq, *cursor);
+        }
+        return;
+    }
+    if (topic_seq != 0U && *expected_seq != 0U && topic_seq > *expected_seq) {
+        uint8_t resync[CBDP_MAX_FRAME_BYTES];
+        size_t resync_length = 0U;
+        if (cbdp_build_resync(resync, sizeof(resync), &resync_length,
+                              ++s_wireless_request_id, 0U)) {
+            wireless_bridge_send_frame(resync, resync_length);
+        }
+        // Keep processing the event we do have; the resync fills the gap.
+    }
+    if (topic_seq != 0U) *expected_seq = topic_seq + 1U;
+    if (event.global_seq != 0U) *cursor = event.global_seq;
+
+    s_last_message_us = esp_timer_get_time();
+
+    if (event.event_type == CBDP_EVENT_MESSAGE_READ) {
+        char message_id[CODEX_BRIDGE_ID_MAX] = {0};
+        uint32_t message_ref = 0U;
+        (void)copy_utf8_field(event.event_payload, event.event_payload_length,
+                              CBDP_TLV_MESSAGE_ID, message_id, sizeof(message_id));
+        cbdp_tlv_read_u32(cbdp_tlv_find(event.event_payload, event.event_payload_length,
+                                        CBDP_TLV_MESSAGE_REF),
+                          &message_ref);
+        if (message_id[0] == '\0' && message_ref != 0U) {
+            snprintf(message_id, sizeof(message_id), "%lu", (unsigned long)message_ref);
+        }
+        if (message_id[0] != '\0') {
+            background_read_state_changed(message_id);
+            if (ui_budget_available() && coding_bridge_foreground_ui_active() &&
+                bsp_lvgl_lock(500)) {
+                app_coding_apply_read_state(message_id, 1U);
+                bsp_lvgl_unlock();
+            }
+        }
+        return;
+    }
+
+    if (event.event_type == CBDP_EVENT_TURN_COMPLETED ||
+        event.event_type == CBDP_EVENT_TURN_FAILED ||
+        event.event_type == CBDP_EVENT_TURN_INTERRUPTED) {
+        char body[CODING_STATUS_MAX] = {0};
+        char thread_id[64] = {0};
+        char turn_id[64] = {0};
+        if (!copy_utf8_preview(event.event_payload, event.event_payload_length,
+                               CBDP_TLV_BODY, body, sizeof(body))) {
+            copy_utf8_preview(event.event_payload, event.event_payload_length,
+                              CBDP_TLV_SUMMARY, body, sizeof(body));
+        }
+        copy_utf8_field(event.event_payload, event.event_payload_length,
+                        CBDP_TLV_THREAD_ID, thread_id, sizeof(thread_id));
+        copy_utf8_field(event.event_payload, event.event_payload_length,
+                        CBDP_TLV_TURN_ID, turn_id, sizeof(turn_id));
+        uint32_t thread_ref = 0U;
+        uint32_t turn_ref = 0U;
+        cbdp_tlv_read_u32(cbdp_tlv_find(event.event_payload,
+                                        event.event_payload_length,
+                                        CBDP_TLV_THREAD_REF), &thread_ref);
+        cbdp_tlv_read_u32(cbdp_tlv_find(event.event_payload,
+                                        event.event_payload_length,
+                                        CBDP_TLV_TURN_REF), &turn_ref);
+        if (thread_id[0] == '\0' && thread_ref != 0U) {
+            snprintf(thread_id, sizeof(thread_id), "%lu", (unsigned long)thread_ref);
+            s_active_thread_ref = thread_ref;
+        }
+        if (turn_id[0] == '\0' && turn_ref != 0U) {
+            snprintf(turn_id, sizeof(turn_id), "%lu", (unsigned long)turn_ref);
+        }
+        if (event.event_type == CBDP_EVENT_TURN_COMPLETED ||
+            event.event_type == CBDP_EVENT_TURN_FAILED ||
+            event.event_type == CBDP_EVENT_TURN_INTERRUPTED) {
+            if ((turn_ref != 0U && turn_ref == s_active_turn_ref) ||
+                (turn_ref == 0U && turn_id[0] != '\0' &&
+                 strcmp(turn_id, s_active_turn_id) == 0)) {
+                clear_active_turn();
+            }
+        }
+        if (body[0] != '\0' && ui_budget_available() &&
+            coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_result_identity(thread_id, turn_id);
+            if (event.event_type == CBDP_EVENT_TURN_FAILED) {
+                app_coding_bridge_error(body);
+            } else {
+                app_coding_bridge_done(body);
+            }
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
+
+    if (event.event_type == CBDP_EVENT_MESSAGE_APPENDED ||
+        event.event_type == CBDP_EVENT_MESSAGE_UPDATED) {
+        char body[CODING_STATUS_MAX] = {0};
+        char thread_id[64] = {0};
+        char message_id[CODEX_BRIDGE_ID_MAX] = {0};
+        uint32_t thread_ref = 0U;
+        uint32_t message_ref = 0U;
+        if (!copy_utf8_preview(event.event_payload, event.event_payload_length,
+                               CBDP_TLV_BODY, body, sizeof(body))) {
+            copy_utf8_preview(event.event_payload, event.event_payload_length,
+                              CBDP_TLV_SUMMARY, body, sizeof(body));
+        }
+        copy_utf8_field(event.event_payload, event.event_payload_length,
+                        CBDP_TLV_THREAD_ID, thread_id, sizeof(thread_id));
+        copy_utf8_field(event.event_payload, event.event_payload_length,
+                        CBDP_TLV_MESSAGE_ID, message_id, sizeof(message_id));
+        cbdp_tlv_read_u32(cbdp_tlv_find(event.event_payload,
+                                        event.event_payload_length,
+                                        CBDP_TLV_THREAD_REF), &thread_ref);
+        cbdp_tlv_read_u32(cbdp_tlv_find(event.event_payload,
+                                        event.event_payload_length,
+                                        CBDP_TLV_MESSAGE_REF), &message_ref);
+        if (thread_id[0] == '\0' && thread_ref != 0U) {
+            snprintf(thread_id, sizeof(thread_id), "%lu", (unsigned long)thread_ref);
+        }
+        if (message_id[0] == '\0' && message_ref != 0U) {
+            snprintf(message_id, sizeof(message_id), "%lu", (unsigned long)message_ref);
+        }
+        if (body[0] != '\0' && ui_budget_available() &&
+            coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_remote_result(thread_id, "completed", body, message_id);
+            bsp_lvgl_unlock();
+        }
+    }
+    // 15.8: ACK the transport seq with the durable cursor. Only ACK when the
+    // transport sequence advances, otherwise replayed frames cause an ACK storm.
+    if (frame_seq != 0U && frame_seq != s_last_acked_seq) {
+        s_last_acked_seq = frame_seq;
+        wireless_ack(topic_id, scope, frame_seq, *cursor);
+    }
+}
+
+static void wireless_handle_approval_request(const uint8_t *tlv, size_t tlv_len)
+{
+    char prompt[192] = {0};
+    char detail[192] = {0};
+    uint32_t approval_ref = 0U;
+    uint8_t risk = 0U;
+    cbdp_tlv_read_u32(cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_APPROVAL_REF),
+                      &approval_ref);
+    cbdp_tlv_read_u8(cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_RISK), &risk);
+    copy_utf8_field(tlv, tlv_len, CBDP_TLV_PROMPT, prompt, sizeof(prompt));
+    copy_utf8_field(tlv, tlv_len, CBDP_TLV_APPROVAL_DETAIL, detail, sizeof(detail));
+    if (prompt[0] == '\0') {
+        copy_utf8_field(tlv, tlv_len, CBDP_TLV_TITLE, prompt, sizeof(prompt));
+    }
+    if (detail[0] == '\0') {
+        snprintf(detail, sizeof(detail), "风险等级：%u", (unsigned)risk);
+    }
+    s_approval_ref = approval_ref;
+    s_last_message_us = esp_timer_get_time();
+    if (approval_ref != 0U && coding_bridge_foreground_ui_active() &&
+        bsp_lvgl_lock(500)) {
+        app_coding_bridge_approval(prompt, detail);
+        bsp_lvgl_unlock();
+    }
+}
+
+// 19.5: Bridge must report what went wrong instead of silently dropping an
+// uplink transaction. Surface the code (and any host detail) to the user so a
+// missing active thread or a disabled capability is actionable.
+// 15.4: subscribe one topic at one scope. Message events live on the thread's
+// own topic (0x1xxxxxxx), so after selecting a thread the device must subscribe
+// to that topic as well; the summary topic alone never carries them.
+static void wireless_subscribe(uint32_t topic_id, uint8_t scope, uint64_t cursor)
+{
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    ESP_LOGI(TAG, "SUBSCRIBE topic=0x%08lx scope=%u cursor=%llu",
+             (unsigned long)topic_id, (unsigned)scope, (unsigned long long)cursor);
+    // A subscription is per-session state, and re-issuing one for a topic we
+    // already hold is a duplicate request the host rejects. thread.read and the
+    // list response can both bind the same thread, so guard here rather than at
+    // each call site.
+    if (wireless_is_subscribed(topic_id, scope)) return;
+    if (s_sub_count < MAX_SUBSCRIPTIONS) {
+        s_sub_topic[s_sub_count] = topic_id;
+        s_sub_scope[s_sub_count] = scope;
+        ++s_sub_count;
+    }
+    if (cbdp_build_subscribe(frame, sizeof(frame), &length, ++s_wireless_request_id,
+                             topic_id, scope, CBDP_QOS_STATE, cursor)) {
+        wireless_bridge_send_frame(frame, length);
+    }
+}
+
+// 15.8: ACK carries the cursor the device has durably applied so the Bridge can
+// advance its checkpoint and resume from it after a reconnect.
+// Section 15.8/9.4 allow the host to coalesce delivery (ack_delay_ms), and a
+// subscribe that replays a topic's backlog arrives as a burst. Acknowledging
+// every replayed frame one-for-one doubled the traffic and saturated the socket
+// until the connection dropped mid-recording, so only the newest cursor is
+// acknowledged, at most once per ACK_COALESCE_US.
+static void wireless_ack_send(uint32_t topic_id, uint8_t scope, uint32_t ack_seq,
+                              uint64_t cursor)
+{
+    uint8_t frame[CBDP_MAX_FRAME_BYTES];
+    size_t length = 0U;
+    if (cbdp_build_ack(frame, sizeof(frame), &length, ack_seq, topic_id, scope,
+                       cursor)) {
+        wireless_bridge_send_frame(frame, length);
+    }
+}
+
+// Flush a coalesced ACK once the quiet window elapsed. Driven by bridge_tick.
+static void wireless_ack_flush(void)
+{
+    if (!s_ack_pending) return;
+    if (esp_timer_get_time() - s_last_ack_us < ACK_COALESCE_US) return;
+    s_ack_pending = false;
+    s_last_ack_us = esp_timer_get_time();
+    wireless_ack_send(s_pending_ack_topic, s_pending_ack_scope,
+                      s_pending_ack_seq, s_pending_ack_cursor);
+}
+
+static void wireless_ack(uint32_t topic_id, uint8_t scope, uint32_t ack_seq,
+                         uint64_t cursor)
+{
+    // 15.8: only acknowledge topics this device actually subscribed to; the
+    // host rejects ACKs for unknown subscriptions with UNSUPPORTED_FEATURE.
+    if (!wireless_is_subscribed(topic_id, scope)) {
+        return;
+    }
+    s_pending_ack_topic = topic_id;
+    s_pending_ack_scope = scope;
+    s_pending_ack_seq = ack_seq;
+    s_pending_ack_cursor = cursor;
+    s_ack_pending = true;
+    if (esp_timer_get_time() - s_last_ack_us >= ACK_COALESCE_US) {
+        wireless_ack_flush();
+    }
+}
+
+static void wireless_handle_error(const cbdp_frame_header_t *header,
+                                  const uint8_t *tlv, size_t tlv_len)
+{
+    char detail[192] = {0};
+    copy_utf8_field(tlv, tlv_len, CBDP_TLV_ERROR_MESSAGE, detail, sizeof(detail));
+    if (detail[0] == '\0') {
+        copy_utf8_field(tlv, tlv_len, CBDP_TLV_ERROR_DETAIL, detail, sizeof(detail));
+    }
+    const uint16_t code = header != NULL ? header->code : CBDP_ERR_NONE;
+    const char *message = detail[0] != '\0' ? detail : cbdp_error_text(code);
+    ESP_LOGW(TAG, "bridge error code=0x%04X: %s", (unsigned)code, message);
+
+    s_last_message_us = esp_timer_get_time();
+
+    // 21.3: only authentication errors end the session. A peer ERROR such as
+    // INVALID_FRAME or INVALID_STATE must not, and per 21.3 the device must not
+    // answer an ERROR with another ERROR.
+    if (code == CBDP_ERR_UNAUTHORIZED || code == CBDP_ERR_AUTH_EXPIRED ||
+        code == CBDP_ERR_TOKEN_ROTATED) {
+        s_capture_requested = false;
+        s_long_text_target = LONG_TEXT_NONE;
+        wireless_bridge_disconnect();
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_bridge_connected(false);
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
+    // A peer ERROR concerns the request it answers; it is not a reason to abort
+    // an in-flight recording. Clearing the capture flag here cut multi-second
+    // recordings down to the moment an unrelated command (for example a
+    // thread.read the host could not serve) failed. Per 19.4/19.5 an AUDIO_END
+    // that the host cannot transcribe is reported on that transaction instead.
+    if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+        app_coding_bridge_error(message);
+        bsp_lvgl_unlock();
+    }
+}
+
+static void process_wireless_frame(const cbdp_frame_header_t *header,
+                                   const uint8_t *tlv, size_t tlv_len,
+                                   const uint8_t *payload, size_t payload_len)
+{
+    (void)payload;
+    (void)payload_len;
+    if (!s_wireless_enabled || header == NULL) return;
+    switch (header->message_type) {
+    case CBDP_MT_AUTH_OK:
+        if (cbdp_parse_auth_ok(tlv, tlv_len, &s_session)) {
+            // cbdp_parse_auth_ok() overwrites the session with AUTH_OK fields
+            // only, which zeroes the policy negotiated in WELCOME. Re-read the
+            // transport's copy so max_audio_bytes/max_chunk_bytes are honoured;
+            // without it the device ignored the host cap and uploaded past the
+            // limit, and the Bridge reset the socket mid-recording.
+            cbdp_session_t transport = {0};
+            if (wireless_bridge_session_snapshot(&transport) &&
+                transport.ready) {
+                s_session.max_audio_bytes = transport.max_audio_bytes;
+                s_session.max_chunk_bytes = transport.max_chunk_bytes;
+                s_session.max_frame_bytes = transport.max_frame_bytes;
+                s_session.heartbeat_seconds = transport.heartbeat_seconds;
+                s_session.queue_depth = transport.queue_depth;
+                s_session.supported_caps = transport.supported_caps;
+                s_session.ready = true;
+            }
+            wireless_reset_subscriptions();
+            wireless_subscribe(0x50000003U, CBDP_SCOPE_SUMMARY, 0U);
+            // 15.4: re-attach the selected thread topic so message events keep
+            // flowing across a transport reconnect without another UI action.
+            if (s_thread_topic_id != 0U) {
+                wireless_subscribe(s_thread_topic_id, CBDP_SCOPE_THREAD, 0U);
+            }
+            wireless_set_connected(true);
+        }
+        break;
+    case CBDP_MT_CAPABILITY_UPDATE:
+        if (cbdp_parse_capability_update(tlv, tlv_len, &s_session)) {
+            s_last_message_us = esp_timer_get_time();
+            s_bridge_online = true;
+            wireless_set_connected(true);
+        }
+        break;
+    case CBDP_MT_RESULT:
+        wireless_handle_result(header, tlv, tlv_len);
+        break;
+    case CBDP_MT_DELTA:
+        wireless_handle_delta(header, tlv, tlv_len);
+        break;
+    case CBDP_MT_APPROVAL_REQUEST:
+        wireless_handle_approval_request(tlv, tlv_len);
+        break;
+    case CBDP_MT_ERROR:
+        wireless_handle_error(header, tlv, tlv_len);
+        break;
+    default:
+        break;
+    }
+}
 static void process_usb_line(const char *line)
 {
     process_line(line, true);
@@ -966,19 +1865,25 @@ static void process_usb_line(const char *line)
 static void bridge_tick(void)
 {
     if (!s_wireless_enabled) return;
-    if (s_connected &&
-            esp_timer_get_time() - s_last_message_us > BRIDGE_TIMEOUT_US) {
-            s_capture_requested = false;
-            s_long_text_target = LONG_TEXT_NONE;
-            s_connected = false;
-            s_bridge_online = false;
-            codex_background_reset(&s_background_state);
-            home_codex_state_changed();
-            wireless_bridge_disconnect();
-            if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
-                app_coding_bridge_connected(false);
-                bsp_lvgl_unlock();
-            }
+    wireless_ack_flush();
+    // Section 12 keeps heartbeat liveness in the transport: the socket layer
+    // sends PING on idle links and tears the session down after
+    // 3 x heartbeat_seconds without any inbound frame. The application layer
+    // therefore only reacts to a session the transport has actually lost;
+    // using a fixed application-silence timer here disconnected healthy idle
+    // sessions and forced a full re-handshake every few seconds.
+    if (s_connected && !wireless_bridge_session_active()) {
+        s_capture_requested = false;
+        s_long_text_target = LONG_TEXT_NONE;
+        s_connected = false;
+        s_bridge_online = false;
+        codex_background_reset(&s_background_state);
+        home_codex_state_changed();
+        wireless_bridge_disconnect();
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_bridge_connected(false);
+            bsp_lvgl_unlock();
+        }
     }
 }
 
@@ -1005,9 +1910,8 @@ esp_err_t coding_bridge_init(void)
     fap_set_json_line_hook(process_usb_line);
     fap_set_tick_hook(bridge_tick);
     codex_bridge_protocol_init();
-    wireless_bridge_set_authenticate(authenticate_wireless,
-                                     codex_bridge_protocol_device_id());
-    esp_err_t wireless = wireless_bridge_init(process_wireless_line,
+    seed_wireless_counters();
+    esp_err_t wireless = wireless_bridge_init(process_wireless_frame,
                                               send_wifi_status);
     if (wireless != ESP_OK) {
         ESP_LOGW(TAG, "wireless bridge unavailable: %s",
@@ -1047,7 +1951,7 @@ esp_err_t coding_bridge_start_wireless(void)
 {
     if (s_wireless_started) {
         if (s_wireless_enabled) return ESP_OK;
-        esp_err_t resumed = wireless_bridge_init(process_wireless_line,
+        esp_err_t resumed = wireless_bridge_init(process_wireless_frame,
                                                  send_wifi_status);
         if (resumed != ESP_OK) {
             ESP_LOGW(TAG, "wireless bridge restart failed: %s",
@@ -1067,9 +1971,8 @@ esp_err_t coding_bridge_start_wireless(void)
     esp_err_t ready = coding_bridge_init_usb_only();
     if (ready != ESP_OK) return ready;
     codex_bridge_protocol_init();
-    wireless_bridge_set_authenticate(authenticate_wireless,
-                                     codex_bridge_protocol_device_id());
-    esp_err_t wireless = wireless_bridge_init(process_wireless_line,
+    seed_wireless_counters();
+    esp_err_t wireless = wireless_bridge_init(process_wireless_frame,
                                               send_wifi_status);
     if (wireless != ESP_OK) {
         ESP_LOGW(TAG, "wireless bridge unavailable: %s",
@@ -1091,7 +1994,6 @@ void coding_bridge_stop_wireless(void)
     s_allow_foreground_ui = false;
     s_bridge_online = false;
     s_connected = false;
-    s_enabled_capability_count = 0U;
     codex_background_reset(&s_background_state);
     s_background_codex_state = APP_CODEX_OFFLINE;
     app_home_set_codex_counts(0U, 0U, 0U);
@@ -1099,12 +2001,38 @@ void coding_bridge_stop_wireless(void)
     /* Drop the current PC session so the discovery loop reconnects and the
      * host replays the latest unread/read state when we resume. */
     wireless_bridge_disconnect();
-    codex_bridge_parser_reset(&s_wireless_parser);
 }
 
 bool coding_bridge_send_read_ack(const char *message_id)
 {
-    if (!codex_bridge_protocol_send_read_ack(send_wireless_line, message_id)) {
+    if (message_id == NULL || message_id[0] == '\0' || !s_connected ||
+        !wireless_bridge_session_ready()) {
+        return false;
+    }
+    uint8_t params[96];
+    size_t params_length = 0U;
+    const unsigned long parsed = strtoul(message_id, NULL, 10);
+    if (parsed != 0UL && parsed <= UINT32_MAX) {
+        if (!cbdp_tlv_write_u32(params, sizeof(params), &params_length,
+                                CBDP_TLV_MESSAGE_REF, (uint32_t)parsed)) {
+            return false;
+        }
+    } else if (!cbdp_tlv_write_bytes(params, sizeof(params), &params_length,
+                                     CBDP_TLV_MESSAGE_ID, message_id,
+                                     strlen(message_id))) {
+        return false;
+    }
+    if (s_active_thread_ref != 0U &&
+        !cbdp_tlv_write_u32(params, sizeof(params), &params_length,
+                            CBDP_TLV_THREAD_REF, s_active_thread_ref)) {
+        return false;
+    }
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms < 0) now_ms = 0;
+    if (!cbdp_tlv_write_i64(params, sizeof(params), &params_length,
+                            CBDP_TLV_READ_AT_MS, now_ms) ||
+        !wireless_build_and_send_command(CBDP_METHOD_MESSAGE_READ_UPDATE,
+                                         params, params_length)) {
         return false;
     }
     /* The host broadcasts read_state to other devices, not back to the

@@ -1,15 +1,5 @@
 // main/wireless_bridge.c
-// 局域网桥接层:TCP 8765 承载行分隔 JSON 事件,UDP 8764 负责设备发现。
-//
-// 【与 FoloOS 原版的架构差异 —— 必读】
-// FoloOS 原版在这里完整接管 WiFi 栈并自建一套配网门户。本工程基于 LEO RADIO,
-// WiFi 已由 esp-wifi-connect(WifiManager)独占管理,重复初始化必然失败。
-// 故本文件被裁剪为【纯传输层】,只保留:
-//   - TCP 8765 / UDP 8764 socket 服务与 bridge_auth token 鉴权
-//   - token 的 NVS 持久化(独立 namespace,不碰 esp-wifi-connect 的数据)
-//   - 通过回调把换网请求交给 C++ 侧的 WifiManager
-// 被移除的部分:esp_netif/esp_wifi 初始化、STA 连接与重连状态机、多 profile
-// 轮换、FoloOS-Setup AP 配网页、WiFi 事件处理。这些职责统一归 WifiManager。
+// CBDP v1 LAN transport and session handshake.
 #include "wireless_bridge.h"
 
 #include <errno.h>
@@ -18,10 +8,11 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "cJSON.h"
 #include "codex_bridge_protocol.h"
-#include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -33,44 +24,159 @@
 
 #define BRIDGE_PORT 8765
 #define DISCOVERY_PORT 8764
-#define NETWORK_LINE_MAX 768
-/* 必须与 FoloOS 原版一致(7168),不可下调。本任务不只是收发 socket:
- * 收到一行 JSON 后会经 s_line_cb -> process_wireless_line -> process_line
- * -> dispatch_message -> app_coding_*(持 LVGL 锁,内部再走 coding_render 的
- * 完整绘制链)。这条链的栈深度由 FoloOS 原版实测标定在 7168;而本版回调
- * 链与它完全相同,没有任何变浅的理由。NETWORK_LINE_MAX 也保持 768,
- * 因为同行缓冲区就落在这条链的栈上。 */
-#define NETWORK_TASK_STACK 7168
+#define NETWORK_FRAME_MAX CBDP_MAX_FRAME_BYTES
+// The receive path nests the TCP/UDP scratch buffers, a subscribe frame, and
+// the event body copy before the parser returns. Keep enough headroom for the
+// worst-case CBDP message instead of tuning to the handshake-only path.
+#define NETWORK_TASK_STACK 12288
 #define TOKEN_MAX 64
+#define TCP_TEXT_BUFFER_MAX 8192
+#define FRAGMENT_TIMEOUT_MS 30000U
+// Section 12 default timeouts: a peer that never completes the handshake, and
+// a heartbeat interval used when WELCOME did not carry heartbeat_seconds.
+#define HANDSHAKE_TIMEOUT_US (10LL * 1000LL * 1000LL)
+#define HEARTBEAT_FALLBACK_SECONDS 15U
 
 static const char *TAG = "wireless_bridge";
 static const char *NVS_NAMESPACE = "folo_bridge";
 static const char *NVS_TOKEN_KEY = "token";
-static const char *DISCOVERY_REQUEST = "CODEXBRIDGE_DISCOVER";
 
-static wireless_bridge_line_cb_t s_line_cb;
+static wireless_bridge_frame_cb_t s_frame_cb;
 static wireless_bridge_status_cb_t s_status_cb;
 static wireless_bridge_wifi_configure_t s_wifi_configure_cb;
-static wireless_bridge_authenticate_t s_authenticate_cb;
-static char s_device_id[24];
 static SemaphoreHandle_t s_client_lock;
 static int s_client_fd = -1;
 static bool s_client_authenticated;
-// 由 main.cc 经 wireless_bridge_set_wifi_state() 单向写入,本文件不自行探测。
+// Lock-free mirror of the authenticated session state so tick hooks and send
+// paths can observe liveness without contending on the socket lock.
+static volatile bool s_session_ready;
 static bool s_wifi_connected;
 static char s_token[TOKEN_MAX + 1];
 static char s_ip[16];
+static cbdp_session_t s_session;
+static cbdp_fragment_assembly_t s_fragment_assembly;
+static uint32_t s_fragment_started_ms;
+static uint8_t s_client_nonce[16];
+static uint32_t s_request_id = 1U;
+// Section 12 keeps heartbeat liveness at the transport layer: record the
+// arrival time of every valid inbound frame so the session can be kept alive
+// without the application layer owning the socket or its timers.
+static int64_t s_last_rx_us;
+static int64_t s_last_ping_us;
+static int64_t s_client_connected_us;
 static volatile bool s_task_stop_requested;
 static TaskHandle_t s_task_handle;
-/* The bridge task is long-lived and its 7KB stack was one of the large heap
- * allocations that left the minimized home screen starved while the radio was
- * streaming. XiaoZhi's idle microphone stack is already reserved static RAM;
- * xiaozhi_bridge_stack() lends the lower half to this task whenever XiaoZhi is
- * closed, keeping the heap free for DNS/HTTP work. */
 static StaticTask_t s_task_tcb;
 extern uint8_t *xiaozhi_bridge_stack(size_t *size);
 
-static esp_err_t save_token(const char *token);
+static esp_err_t save_token(const char *token)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (result == ESP_OK) result = nvs_set_str(handle, NVS_TOKEN_KEY, token);
+    if (result == ESP_OK) result = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+    return result;
+}
+
+static void load_token(void)
+{
+    nvs_handle_t handle = 0;
+    size_t length = sizeof(s_token);
+    esp_err_t result = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (result == ESP_OK) {
+        result = nvs_get_str(handle, NVS_TOKEN_KEY, s_token, &length);
+        nvs_close(handle);
+    }
+    if (result != ESP_OK) s_token[0] = '\0';
+}
+
+static void random_bytes(uint8_t *data, size_t length)
+{
+    for (size_t index = 0U; index < length; ++index) {
+        data[index] = (uint8_t)(esp_random() & 0xFFU);
+    }
+}
+
+static bool send_frame_locked(const uint8_t *frame, size_t length);
+
+static bool socket_send_all(int fd, const uint8_t *data, size_t length)
+{
+    // SO_SNDTIMEO bounds each send() call, and on a busy link send() can still
+    // report EAGAIN once the buffer fills. That is back-pressure, not a broken
+    // session.
+    //
+    // Audio is a real-time stream, so a chunk must NOT wait seconds here: the
+    // capture loop runs at 16 kHz and a long retry made it fall behind the
+    // microphone, which starved the recording. Chunks therefore get a short
+    // budget and the transmitter drops the frame on persistent back-pressure.
+    // Terminal frames (AUDIO_END/SEND_END/CLOSE) keep a long budget because
+    // losing one strands the host-side transaction.
+    int64_t budget_us = 2000000LL;
+    if (length >= CBDP_FIXED_HEADER_BYTES) {
+        const uint8_t type = data[3];
+        if (type == CBDP_MT_AUDIO_END || type == CBDP_MT_SEND_END ||
+            type == CBDP_MT_CLOSE) {
+            budget_us = 10000000LL;
+        } else if (type == CBDP_MT_AUDIO_CHUNK || type == CBDP_MT_SEND_CHUNK) {
+            // Keep this short. The receive loop shares this lock, so a chunk
+            // that spins here also stops us draining the host's own events; if
+            // that fills the host's send buffer it stops reading our audio and
+            // the two sides deadlock. A brief attempt, then drop the frame:
+            // s_capture_offset only advances on success, so the stream the host
+            // sees stays contiguous.
+            budget_us = 5000LL;
+        }
+    }
+    const int64_t deadline = esp_timer_get_time() + budget_us;
+    size_t offset = 0U;
+    while (offset < length) {
+        const int sent = send(fd, data + offset, length - offset, 0);
+        if (sent > 0) {
+            offset += (size_t)sent;
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            if (esp_timer_get_time() < deadline) {
+                vTaskDelay(1);
+                continue;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+bool wireless_bridge_send_frame(const uint8_t *frame, size_t length)
+{
+    if (frame == NULL || length < CBDP_FIXED_HEADER_BYTES || length > NETWORK_FRAME_MAX) {
+        return false;
+    }
+    return send_frame_locked(frame, length);
+}
+
+static bool send_frame_locked(const uint8_t *frame, size_t length)
+{
+    // A blocking send can hold the socket lock for up to SO_SNDTIMEO. Waiting
+    // less than that here made the audio path drop frames (and lose AUDIO_END)
+    // whenever a slower peer stalled an in-band ACK send, so wait longer than
+    // the socket timeout before giving up.
+    if (s_client_lock == NULL ||
+        xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGW(TAG, "send frame type=0x%02X: socket lock busy", (unsigned)frame[3]);
+        return false;
+    }
+    const bool authenticated = s_client_authenticated;
+    const int fd = s_client_fd;
+    const bool ok = authenticated && fd >= 0 && socket_send_all(fd, frame, length);
+    xSemaphoreGive(s_client_lock);
+    if (!ok && frame[3] != CBDP_MT_AUDIO_CHUNK) {
+        ESP_LOGW(TAG, "send frame type=0x%02X failed (auth=%d fd=%d errno=%d)",
+                 (unsigned)frame[3], (int)authenticated, fd, errno);
+    }
+    if (!ok) return false;
+    return ok;
+}
 
 static void client_replace(int new_fd)
 {
@@ -83,139 +189,192 @@ static void client_replace(int new_fd)
         return;
     }
     if (s_client_fd >= 0) {
-        const size_t free_before =
-            heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        const size_t dma_before = heap_caps_get_free_size(MALLOC_CAP_DMA);
         struct linger linger = { .l_onoff = 1, .l_linger = 0 };
-        const int linger_result = setsockopt(s_client_fd, SOL_SOCKET, SO_LINGER,
-                                             &linger, sizeof(linger));
+        setsockopt(s_client_fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
         close(s_client_fd);
-        ESP_LOGW(TAG,
-                 "client close: linger=%d free=%u->%u dma=%u->%u",
-                 linger_result, (unsigned)free_before,
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)dma_before,
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
     }
     s_client_fd = new_fd;
     s_client_authenticated = false;
+    s_session_ready = false;
+    s_last_rx_us = 0;
+    s_last_ping_us = 0;
+    s_client_connected_us = new_fd >= 0 ? esp_timer_get_time() : 0;
+    memset(&s_session, 0, sizeof(s_session));
+    cbdp_fragment_reset(&s_fragment_assembly);
+    s_fragment_started_ms = 0U;
     xSemaphoreGive(s_client_lock);
 }
 
-bool wireless_bridge_write(const char *data, size_t length)
+static uint32_t now_ms(void)
 {
-    if (data == NULL || length == 0 || s_client_lock == NULL ||
-        xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static bool transmit_hello(int fd)
+{
+    uint8_t frame[256];
+    size_t length = 0U;
+    random_bytes(s_client_nonce, sizeof(s_client_nonce));
+    if (!cbdp_build_hello(frame, sizeof(frame), &length, s_request_id++, s_client_nonce)) {
         return false;
     }
-    bool complete = false;
-    if (s_client_fd >= 0 && s_client_authenticated) {
-        size_t sent = 0;
-        TickType_t retry_started = xTaskGetTickCount();
-        while (sent < length) {
-            int result = send(s_client_fd, data + sent, length - sent, 0);
-            if (result <= 0) {
-                int error = errno;
-                if (result < 0 &&
-                    (error == EAGAIN || error == ENOMEM || error == ENOBUFS) &&
-                    xTaskGetTickCount() - retry_started < pdMS_TO_TICKS(1000)) {
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                    continue;
-                }
-                ESP_LOGW(TAG, "send failed: errno=%d bytes=%u/%u largest=%u",
-                         error, (unsigned)sent, (unsigned)length,
-                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-                shutdown(s_client_fd, SHUT_RDWR);
-                s_client_authenticated = false;
-                break;
-            }
-            sent += (size_t)result;
-        }
-        complete = sent == length;
-    }
-    xSemaphoreGive(s_client_lock);
-    return complete;
+    return socket_send_all(fd, frame, length);
 }
 
-static bool authenticate_line(const char *line)
+static bool transmit_auth(int fd)
 {
-    cJSON *root = cJSON_Parse(line);
-    const cJSON *type = root != NULL
-                            ? cJSON_GetObjectItemCaseSensitive(root, "type")
-                            : NULL;
-    const cJSON *token = root != NULL
-                             ? cJSON_GetObjectItemCaseSensitive(root, "token")
-                             : NULL;
-    bool is_auth = cJSON_IsString(type) && cJSON_IsString(token) &&
-                   strcmp(type->valuestring, "bridge_auth") == 0 &&
-                   strlen(token->valuestring) >= 16;
-    bool matches = is_auth && s_token[0] != '\0' &&
-                   strcmp(token->valuestring, s_token) == 0;
-    /* TOFU(首次信任配对):设备本地没有 token 时,接受电脑端带来的第一个
-     * 合法 token 并落盘。配对之后 token 固定,后续连接必须严格匹配。 */
-    bool pair_first_time = is_auth && s_token[0] == '\0';
-    if (pair_first_time) {
-        strlcpy(s_token, token->valuestring, sizeof(s_token));
+    if (s_token[0] == '\0') return false;
+    uint8_t frame[256];
+    size_t length = 0U;
+    if (!cbdp_build_auth(frame, sizeof(frame), &length, &s_session, s_token,
+                         s_client_nonce, s_request_id++)) {
+        return false;
     }
-    cJSON_Delete(root);
-    if (!matches && !pair_first_time) return false;
-    if (pair_first_time) {
-        esp_err_t saved = save_token(s_token);
-        ESP_LOGI(TAG, "paired with client, token persist=%s",
-                 saved == ESP_OK ? "ok" : esp_err_to_name(saved));
-    }
+    return socket_send_all(fd, frame, length);
+}
 
-    /* Mark the session before invoking the protocol callback: the callback
-     * writes bridge_auth_ok through the normal authenticated transport. */
-    if (xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
-        s_client_authenticated = true;
-        xSemaphoreGive(s_client_lock);
+static bool transmit_pong(int fd, uint32_t echo)
+{
+    uint8_t frame[128];
+    size_t length = 0U;
+    if (!cbdp_build_pong(frame, sizeof(frame), &length, echo)) return false;
+    return send_frame_locked(frame, length);
+}
+
+// Section 12/11.1: either side may start PING/PONG once the session is READY.
+// The device sends PING when the link is quiet so a healthy idle session is not
+// mistaken for a dead peer.
+static bool transmit_ping(int fd, uint32_t ping_id)
+{
+    uint8_t frame[128];
+    size_t length = 0U;
+    if (!cbdp_build_ping(frame, sizeof(frame), &length, ping_id)) return false;
+    return send_frame_locked(frame, length);
+}
+
+static bool transmit_discovery_reply(int fd, const struct sockaddr_in *source,
+                                     socklen_t source_length, const uint8_t nonce[16])
+{
+    uint8_t frame[256];
+    size_t length = 0U;
+    if (!cbdp_build_discovery_reply(frame, sizeof(frame), &length, nonce)) return false;
+    return sendto(fd, frame, length, 0, (const struct sockaddr *)source,
+                  source_length) == (int)length;
+}
+
+static void process_client_frame(const uint8_t *frame, size_t length)
+{
+    cbdp_frame_header_t header;
+    if (!cbdp_frame_validate(frame, length, &header)) return;
+    // Any valid inbound frame proves the peer is alive, including PONG/PING.
+    s_last_rx_us = esp_timer_get_time();
+    const uint8_t *header_tlv = frame + CBDP_FIXED_HEADER_BYTES;
+    const uint8_t *payload = frame + header.header_len;
+
+    if (header.message_type == CBDP_MT_WELCOME) {
+        if (!cbdp_parse_welcome(header_tlv, header.header_len - CBDP_FIXED_HEADER_BYTES,
+                                &s_session)) {
+            client_replace(-1);
+            return;
+        }
+        if (!transmit_auth(s_client_fd)) client_replace(-1);
+        return;
     }
-    bool accepted = s_authenticate_cb != NULL &&
-                    s_authenticate_cb(line, s_device_id);
-    if (!accepted) {
-        if (xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
-            s_client_authenticated = false;
+    if (header.message_type == CBDP_MT_AUTH_OK) {
+        if (!cbdp_parse_auth_ok(header_tlv, header.header_len - CBDP_FIXED_HEADER_BYTES,
+                                &s_session)) {
+            client_replace(-1);
+            return;
+        }
+        if (s_client_lock != NULL &&
+            xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+            s_client_authenticated = true;
             xSemaphoreGive(s_client_lock);
         }
-        return false;
+        s_session_ready = true;
+        s_last_ping_us = esp_timer_get_time();
+        ESP_LOGI(TAG, "CBDP session ready");
+        if (s_frame_cb != NULL) {
+            s_frame_cb(&header, header_tlv, header.header_len - CBDP_FIXED_HEADER_BYTES,
+                       payload, header.payload_len);
+        }
+        return;
     }
-    ESP_LOGI(TAG, "bridge client authenticated");
-    return true;
-}
+    if (header.message_type == CBDP_MT_PING) {
+        const cbdp_tlv_t *ping = cbdp_tlv_find(
+            header_tlv, header.header_len - CBDP_FIXED_HEADER_BYTES, CBDP_TLV_PING_ID);
+        uint32_t echo = 0U;
+        (void)cbdp_tlv_read_u32(ping, &echo);
+        if (s_client_fd >= 0) transmit_pong(s_client_fd, echo);
+        return;
+    }
+    bool authenticated = false;
+    if (s_client_lock != NULL &&
+        xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+        authenticated = s_client_authenticated;
+        xSemaphoreGive(s_client_lock);
+    }
+    if (!authenticated) return;
 
-static void process_client_bytes(const uint8_t *input, size_t count,
-                                 char *line, size_t *line_length,
-                                 bool *dropping_line)
-{
-    for (size_t index = 0; index < count; ++index) {
-        char character = (char)input[index];
-        if (character == '\r') continue;
-        if (character == '\n') {
-            if (!*dropping_line && *line_length > 0) {
-                line[*line_length] = '\0';
-                bool authenticated = false;
-                /* A bounded audio send may hold this lock during backpressure.
-                 * Waiting must not turn an authenticated packet into bad auth. */
-                if (xSemaphoreTake(s_client_lock, portMAX_DELAY) == pdTRUE) {
-                    authenticated = s_client_authenticated;
-                    xSemaphoreGive(s_client_lock);
-                }
-                if (!authenticated) {
-                    if (!authenticate_line(line)) client_replace(-1);
-                } else if (s_line_cb != NULL) {
-                    s_line_cb(line);
-                }
-            }
-            *line_length = 0;
-            *dropping_line = false;
-        } else if (!*dropping_line) {
-            if (*line_length < NETWORK_LINE_MAX) {
-                line[(*line_length)++] = character;
-            } else {
-                *dropping_line = true;
+    if (header.message_type == CBDP_MT_FRAGMENT) {
+        const cbdp_tlv_t *crc_tlv = cbdp_tlv_find(
+            header_tlv, header.header_len - CBDP_FIXED_HEADER_BYTES,
+            CBDP_TLV_PAYLOAD_CRC32);
+        uint32_t crc32 = 0U;
+        if ((header.flags & CBDP_FLAG_CRC32_PRESENT) != 0U &&
+            !cbdp_tlv_read_u32(crc_tlv, &crc32)) {
+            cbdp_fragment_reset(&s_fragment_assembly);
+            return;
+        }
+        uint16_t fragment_index = 0U;
+        const cbdp_tlv_t *index_tlv = cbdp_tlv_find(
+            header_tlv, header.header_len - CBDP_FIXED_HEADER_BYTES,
+            CBDP_TLV_FRAGMENT_INDEX);
+        if (!cbdp_tlv_read_u16(index_tlv, &fragment_index)) {
+            cbdp_fragment_reset(&s_fragment_assembly);
+            return;
+        }
+        if (s_fragment_assembly.active &&
+            now_ms() - s_fragment_started_ms > FRAGMENT_TIMEOUT_MS) {
+            cbdp_fragment_reset(&s_fragment_assembly);
+        }
+        const bool was_active = s_fragment_assembly.active;
+        bool accepted = false;
+        uint8_t *complete_header = NULL;
+        uint8_t *complete_payload = NULL;
+        size_t complete_header_len = 0U;
+        size_t complete_payload_len = 0U;
+        accepted = cbdp_fragment_accept(
+            &s_fragment_assembly, header_tlv,
+            header.header_len - CBDP_FIXED_HEADER_BYTES, header.flags,
+            payload, header.payload_len, &complete_header,
+            &complete_header_len, &complete_payload, &complete_payload_len);
+        if (!was_active && s_fragment_assembly.active) s_fragment_started_ms = now_ms();
+        if (accepted && complete_payload != NULL) {
+            cbdp_frame_header_t original = {0};
+            original.version_major = CBDP_VERSION_MAJOR;
+            original.message_type = s_fragment_assembly.original_type;
+            original.flags = s_fragment_assembly.original_flags;
+            original.header_len = (uint16_t)(CBDP_FIXED_HEADER_BYTES + complete_header_len);
+            original.payload_len = (uint32_t)complete_payload_len;
+            original.qos = header.qos;
+            if (s_frame_cb != NULL) {
+                s_frame_cb(&original, complete_header, complete_header_len,
+                           complete_payload, complete_payload_len);
             }
         }
+        free(complete_header);
+        free(complete_payload);
+        return;
+    }
+
+    if (header.message_type == CBDP_MT_CAPABILITY_UPDATE) {
+        (void)cbdp_parse_capability_update(
+            header_tlv, header.header_len - CBDP_FIXED_HEADER_BYTES, &s_session);
+    }
+    if (s_frame_cb != NULL) {
+        s_frame_cb(&header, header_tlv, header.header_len - CBDP_FIXED_HEADER_BYTES,
+                   payload, header.payload_len);
     }
 }
 
@@ -246,23 +405,29 @@ static void network_task(void *argument)
         ESP_LOGE(TAG, "network sockets failed: %d", errno);
         if (tcp_fd >= 0) close(tcp_fd);
         if (udp_fd >= 0) close(udp_fd);
+        s_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
 
-    char line[NETWORK_LINE_MAX + 1];
-    size_t line_length = 0;
-    bool dropping_line = false;
-    uint8_t input[1024];
-    ESP_LOGI(TAG, "LAN bridge ready on TCP %d", BRIDGE_PORT);
+    uint8_t input[NETWORK_FRAME_MAX];
+    size_t input_length = 0U;
+    uint8_t udp_input[NETWORK_FRAME_MAX];
+    // The client fd is only ever published by this task, so the receive loop
+    // tracks it directly. Taking s_client_lock here every second competed with
+    // the audio uplink's send path: under a chunk flood the lock was never free,
+    // the loop never reached recv(), and the session died on its own heartbeat
+    // timeout in the middle of a recording.
+    int client_fd = -1;
+    ESP_LOGI(TAG, "CBDP LAN bridge ready on TCP %d", BRIDGE_PORT);
 
-    while (true) {
-        if (s_task_stop_requested) break;
-        int client = -1;
-        if (xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            client = s_client_fd;
-            xSemaphoreGive(s_client_lock);
+    while (!s_task_stop_requested) {
+        if (client_fd >= 0 && s_client_fd != client_fd) {
+            // Another path (disconnect/heartbeat lapse) dropped the session.
+            client_fd = -1;
+            input_length = 0U;
         }
+        int client = client_fd;
         fd_set read_set;
         FD_ZERO(&read_set);
         FD_SET(tcp_fd, &read_set);
@@ -276,106 +441,148 @@ static void network_task(void *argument)
         int ready = select(max_fd + 1, &read_set, NULL, NULL, &timeout);
         if (ready < 0) continue;
 
+        // Section 12 liveness. Handshake stages are bounded by 10s, and a
+        // READY session tolerates 3 x heartbeat_seconds without any inbound
+        // frame before it is considered dead. PING keeps an idle link warm.
+        if (client >= 0) {
+            const int64_t now_us = esp_timer_get_time();
+            if (!s_session_ready) {
+                if (s_client_connected_us != 0 &&
+                    now_us - s_client_connected_us > HANDSHAKE_TIMEOUT_US) {
+                    ESP_LOGW(TAG, "CBDP handshake timed out");
+                    client_replace(-1);
+                    input_length = 0U;
+                    client = -1;
+                    client_fd = -1;
+                }
+            } else {
+                const uint32_t heartbeat =
+                    s_session.heartbeat_seconds != 0U ? s_session.heartbeat_seconds
+                                                      : HEARTBEAT_FALLBACK_SECONDS;
+                if (s_last_rx_us != 0 &&
+                    now_us - s_last_rx_us > (int64_t)heartbeat * 3 * 1000000LL) {
+                    ESP_LOGW(TAG, "CBDP heartbeat timed out (%us)", (unsigned)heartbeat);
+                    client_replace(-1);
+                    input_length = 0U;
+                    client = -1;
+                    client_fd = -1;
+                } else if (now_us - s_last_ping_us > (int64_t)heartbeat * 1000000LL) {
+                    if (!transmit_ping(client, s_request_id++)) {
+                        client_replace(-1);
+                        input_length = 0U;
+                        client = -1;
+                        client_fd = -1;
+                    } else {
+                        s_last_ping_us = now_us;
+                    }
+                }
+            }
+        }
+
         if (FD_ISSET(tcp_fd, &read_set)) {
             int accepted = accept(tcp_fd, NULL, NULL);
             if (accepted >= 0) {
-                struct timeval send_timeout = {.tv_sec = 0, .tv_usec = 250000};
+                struct timeval send_timeout = {.tv_sec = 2, .tv_usec = 0};
                 setsockopt(accepted, SOL_SOCKET, SO_SNDTIMEO,
                            &send_timeout, sizeof(send_timeout));
+                // A 16 kHz capture feeds the socket steadily; the default send
+                // buffer is small enough that a brief scheduling hiccup on the
+                // peer makes every AUDIO_CHUNK fail with EAGAIN and aborts the
+                // recording. Ask for a larger buffer so normal jitter is
+                // absorbed instead of surfaced as a failed frame.
+                int send_buffer = 8192;
+                setsockopt(accepted, SOL_SOCKET, SO_SNDBUF,
+                           &send_buffer, sizeof(send_buffer));
                 int no_delay = 1;
                 setsockopt(accepted, IPPROTO_TCP, TCP_NODELAY,
                            &no_delay, sizeof(no_delay));
                 client_replace(accepted);
-                line_length = 0;
-                dropping_line = false;
+                input_length = 0U;
                 client = accepted;
+                client_fd = accepted;
+                if (s_token[0] != '\0') {
+                    if (!transmit_hello(accepted)) client_replace(-1);
+                } else {
+                    ESP_LOGW(TAG, "CBDP pairing token missing; TCP session closed");
+                    client_replace(-1);
+                }
             }
         }
         if (FD_ISSET(udp_fd, &read_set)) {
             struct sockaddr_in source;
             socklen_t source_length = sizeof(source);
-            int count = recvfrom(udp_fd, input, sizeof(input) - 1, 0,
-                                 (struct sockaddr *)&source, &source_length);
+            const int count = recvfrom(udp_fd, udp_input, sizeof(udp_input), 0,
+                                       (struct sockaddr *)&source, &source_length);
             if (count > 0) {
-                input[count] = '\0';
-                /* 只在已联上 Wi-Fi 时才应答发现请求。此处刻意不要求 token
-                 * 已存在 —— 未配对设备必须先被电脑端发现才能发起 TOFU 配对。
-                 * 未完成配网的设备 netif 尚未就绪,不会出现在局域网上。 */
-                if (s_wifi_connected &&
-                    strcmp((const char *)input, DISCOVERY_REQUEST) == 0) {
-                    /* device 字段必须与电脑端 mac_bridge.py 的
-                     * discover_wireless_device() 判定值逐字一致,
-                     * 否则电脑端收不到应答、报"局域网内没有发现已配网的
-                     * AI Passport"。此处刻意沿用 FoloOS 原版字符串。 */
-                    cJSON *reply = cJSON_CreateObject();
-                    if (reply != NULL) {
-                        cJSON_AddStringToObject(reply, "device", "FoloOS-AI-Passport");
-                        cJSON_AddStringToObject(reply, "device_id", s_device_id);
-                        cJSON_AddStringToObject(reply, "name", "AI Passport");
-                        cJSON_AddNumberToObject(reply, "port", BRIDGE_PORT);
-                        cJSON *capabilities = cJSON_CreateArray();
-                        if (capabilities != NULL) {
-                            size_t capability_count = 0;
-                            const char *const *supported =
-                                codex_bridge_protocol_capabilities(&capability_count);
-                            for (size_t index = 0; index < capability_count; ++index) {
-                                cJSON_AddItemToArray(
-                                    capabilities,
-                                    cJSON_CreateString(supported[index])
-                                );
-                            }
-                            cJSON_AddItemToObject(reply, "capabilities", capabilities);
-                        }
-                        char *payload = cJSON_PrintUnformatted(reply);
-                        if (payload != NULL) {
-                            sendto(udp_fd, payload, strlen(payload), 0,
-                                   (struct sockaddr *)&source, source_length);
-                            cJSON_free(payload);
-                        }
-                        cJSON_Delete(reply);
+                cbdp_frame_header_t header;
+                if (cbdp_frame_validate(udp_input, (size_t)count, &header) &&
+                    header.message_type == CBDP_MT_DISCOVERY) {
+                    const cbdp_tlv_t *nonce = cbdp_tlv_find(
+                        udp_input + CBDP_FIXED_HEADER_BYTES,
+                        header.header_len - CBDP_FIXED_HEADER_BYTES,
+                        CBDP_TLV_DISCOVERY_NONCE);
+                    const uint8_t *nonce_value = NULL;
+                    size_t nonce_length = 0U;
+                    if (nonce != NULL &&
+                        cbdp_tlv_read_bytes(nonce, &nonce_value, &nonce_length) &&
+                        nonce_length == 16U && s_wifi_connected) {
+                        transmit_discovery_reply(udp_fd, &source, source_length, nonce_value);
                     }
                 }
             }
         }
         if (client >= 0 && FD_ISSET(client, &read_set)) {
-            int count = recv(client, input, sizeof(input), 0);
+            const int count = recv(client, input + input_length,
+                                   sizeof(input) - input_length, 0);
             if (count <= 0) {
                 client_replace(-1);
-                line_length = 0;
-                dropping_line = false;
+                input_length = 0U;
+                client_fd = -1;
             } else {
-                process_client_bytes(input, (size_t)count, line, &line_length,
-                                     &dropping_line);
+                input_length += (size_t)count;
+                size_t consumed = 0U;
+                unsigned frames_this_batch = 0U;
+                while (input_length - consumed >= CBDP_FIXED_HEADER_BYTES) {
+                    cbdp_frame_header_t header;
+                    if (!cbdp_header_decode(input + consumed, input_length - consumed,
+                                            &header)) {
+                        consumed = input_length;
+                        break;
+                    }
+                    const size_t frame_length =
+                        (size_t)header.header_len + (size_t)header.payload_len;
+                    if (frame_length > sizeof(input)) {
+                        client_replace(-1);
+                        consumed = input_length;
+                        client_fd = -1;
+                        break;
+                    }
+                    if (input_length - consumed < frame_length) break;
+                    if (cbdp_frame_validate(input + consumed, frame_length, NULL)) {
+                        process_client_frame(input + consumed, frame_length);
+                        // A reconnect can deliver a large backlog in a single
+                        // read. Processing it without yielding starves the
+                        // IDLE/LVGL tasks and trips the watchdog, so give the
+                        // scheduler a slot every few frames.
+                        if (++frames_this_batch >= 4U) {
+                            frames_this_batch = 0U;
+                            vTaskDelay(1);
+                        }
+                    }
+                    consumed += frame_length;
+                }
+                if (consumed != 0U) {
+                    memmove(input, input + consumed, input_length - consumed);
+                    input_length -= consumed;
+                }
             }
         }
     }
 
-    client_replace(-1);
     close(tcp_fd);
     close(udp_fd);
     s_task_handle = NULL;
     vTaskDelete(NULL);
-}
-
-static void load_token(void)
-{
-    nvs_handle_t handle;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return;
-    size_t length = sizeof(s_token);
-    if (nvs_get_str(handle, NVS_TOKEN_KEY, s_token, &length) != ESP_OK) {
-        s_token[0] = '\0';
-    }
-    nvs_close(handle);
-}
-
-static esp_err_t save_token(const char *token)
-{
-    nvs_handle_t handle = 0;
-    esp_err_t result = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (result == ESP_OK) result = nvs_set_str(handle, NVS_TOKEN_KEY, token);
-    if (result == ESP_OK) result = nvs_commit(handle);
-    if (handle != 0) nvs_close(handle);
-    return result;
 }
 
 void wireless_bridge_set_wifi_configure(wireless_bridge_wifi_configure_t configure)
@@ -383,88 +590,96 @@ void wireless_bridge_set_wifi_configure(wireless_bridge_wifi_configure_t configu
     s_wifi_configure_cb = configure;
 }
 
-void wireless_bridge_set_authenticate(
-    wireless_bridge_authenticate_t authenticate, const char *device_id)
-{
-    s_authenticate_cb = authenticate;
-    strlcpy(s_device_id, device_id != NULL ? device_id : "", sizeof(s_device_id));
-}
-
 void wireless_bridge_set_wifi_state(bool connected, const char *ip)
 {
     s_wifi_connected = connected;
     strlcpy(s_ip, ip != NULL ? ip : "", sizeof(s_ip));
-    /* 链路已断,继续向旧 socket 写入只会堆积超时;主动断开让电脑端重连。 */
     if (!connected) client_replace(-1);
     if (s_status_cb != NULL) {
         s_status_cb(connected ? "connected" : "disconnected", s_ip);
     }
 }
 
-bool wireless_bridge_is_connected(void)
-{
-    return s_wifi_connected;
-}
-
-void wireless_bridge_disconnect(void)
-{
-    client_replace(-1);
-}
+bool wireless_bridge_is_connected(void) { return s_wifi_connected; }
+void wireless_bridge_disconnect(void) { client_replace(-1); }
 
 void wireless_bridge_get_ip(char *buffer, size_t size)
 {
-    if (buffer == NULL || size == 0) return;
+    if (buffer == NULL || size == 0U) return;
     strlcpy(buffer, s_ip, size);
 }
 
 esp_err_t wireless_bridge_configure(const char *ssid, const char *password,
                                     const char *token)
 {
-    /* token 由电脑端首配时下发;设备端 UI 已持有时可传 NULL 跳过覆盖。 */
     if (token != NULL && token[0] != '\0') {
         esp_err_t saved = save_token(token);
         if (saved != ESP_OK) return saved;
         strlcpy(s_token, token, sizeof(s_token));
     }
-    if (s_wifi_configure_cb == NULL) {
-        ESP_LOGW(TAG, "wifi configure callback not registered");
-        return ESP_ERR_INVALID_STATE;
-    }
-    /* 实际连接由 WifiManager 负责,结果经 WifiEvent 异步回传。 */
+    if (s_wifi_configure_cb == NULL) return ESP_ERR_INVALID_STATE;
     return s_wifi_configure_cb(ssid, password);
 }
 
-esp_err_t wireless_bridge_init(wireless_bridge_line_cb_t line_cb,
+bool wireless_bridge_session_ready(void)
+{
+    bool ready = false;
+    if (s_client_lock != NULL &&
+        xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ready = s_client_authenticated && s_session.ready;
+        xSemaphoreGive(s_client_lock);
+    }
+    return ready;
+}
+
+int wireless_bridge_seconds_since_rx(void)
+{
+    if (!s_session_ready || s_last_rx_us == 0) return -1;
+    const int64_t elapsed = esp_timer_get_time() - s_last_rx_us;
+    return elapsed <= 0 ? 0 : (int)(elapsed / 1000000LL);
+}
+
+bool wireless_bridge_session_active(void) { return s_session_ready; }
+
+bool wireless_bridge_session_snapshot(cbdp_session_t *session)
+{
+    if (session == NULL || s_client_lock == NULL ||
+        xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    *session = s_session;
+    xSemaphoreGive(s_client_lock);
+    return true;
+}
+
+bool wireless_bridge_token_available(void)
+{
+    return s_token[0] != '\0';
+}
+
+esp_err_t wireless_bridge_init(wireless_bridge_frame_cb_t frame_cb,
                                wireless_bridge_status_cb_t status_cb)
 {
-    s_line_cb = line_cb;
+    s_frame_cb = frame_cb;
     s_status_cb = status_cb;
     if (s_client_lock == NULL) {
         s_client_lock = xSemaphoreCreateMutex();
         if (s_client_lock == NULL) return ESP_ERR_NO_MEM;
     }
-    /* 注意:nvs_flash_init / esp_netif_init / esp_event_loop_create_default
-     * 均已由 main.cc 与 WifiManager 完成,此处不再重复调用 —— 重复调用
-     * esp_netif_create_default_wifi_sta() 会返回 NULL 并导致启动失败。 */
     load_token();
-
     if (s_task_handle != NULL) return ESP_OK;
     s_task_stop_requested = false;
-    size_t stack_size = 0;
+    size_t stack_size = 0U;
     uint8_t *stack = xiaozhi_bridge_stack(&stack_size);
     if (stack == NULL || stack_size < NETWORK_TASK_STACK) {
-        ESP_LOGE(TAG, "idle stack unavailable for bridge (size=%u)",
-                 (unsigned)stack_size);
+        ESP_LOGE(TAG, "idle stack unavailable for bridge (size=%u)", (unsigned)stack_size);
         return ESP_ERR_NO_MEM;
     }
     s_task_handle = xTaskCreateStatic(network_task, "wireless_bridge",
                                       NETWORK_TASK_STACK, NULL, 4,
                                       (StackType_t *)stack, &s_task_tcb);
-    if (s_task_handle == NULL) {
-        s_task_handle = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "transport ready, token=%s", s_token[0] ? "loaded" : "missing");
+    if (s_task_handle == NULL) return ESP_ERR_NO_MEM;
+    ESP_LOGI(TAG, "CBDP transport ready, token=%s", s_token[0] ? "loaded" : "missing");
     return ESP_OK;
 }
 
@@ -472,10 +687,8 @@ void wireless_bridge_stop(void)
 {
     s_task_stop_requested = true;
     client_replace(-1);
-    for (int i = 0; i < 100 && s_task_handle != NULL; ++i) {
+    for (int index = 0; index < 100 && s_task_handle != NULL; ++index) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
-    if (s_task_handle != NULL) {
-        ESP_LOGW(TAG, "network task did not stop in time");
-    }
+    if (s_task_handle != NULL) ESP_LOGW(TAG, "network task did not stop in time");
 }

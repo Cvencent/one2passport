@@ -29,7 +29,7 @@ static const char *kTag = "app_coding";
 #define CATALOG_MAX 8
 #define CATALOG_LINE_BUDGET 8
 #define CATALOG_LINE_UNITS 22
-#define CATALOG_ID_MAX 8
+#define CATALOG_ID_MAX 12
 #define CATALOG_TITLE_MAX 192
 #define CATALOG_DETAIL_MAX 192
 #define RENDER_DETAIL_MAX (CODING_STATUS_MAX + CODING_DETAIL_MAX + 16)
@@ -157,6 +157,18 @@ static char s_current_project[CATALOG_DETAIL_MAX];
 static char s_last_message[RENDER_DETAIL_MAX];
 
 static void coding_render(void);
+
+// The CBDP receive callback runs on the network task. Rendering straight from
+// there meant the wireless_bridge task could sit inside LVGL text layout for
+// several seconds, which starved low-priority work, tripped the task watchdog,
+// and made the host drop the session mid-recording. Mark the screen dirty and
+// let the LVGL timer below repaint on the LVGL task instead.
+static volatile bool s_render_pending;
+
+static void coding_render_deferred(void)
+{
+    s_render_pending = true;
+}
 
 static void release_project_cache(void)
 {
@@ -614,6 +626,10 @@ static void record_animate(lv_timer_t *timer)
     (void)timer;
     if (s_screen == NULL) return;
 
+    if (s_render_pending) {
+        s_render_pending = false;
+        coding_render();
+    }
     s_record_frame++;
     if ((s_flow.stage == CODING_STAGE_DONE || s_flow.stage == CODING_STAGE_ERROR) &&
         s_screen != NULL && s_active_message_id[0] != '\0' &&
@@ -1115,16 +1131,8 @@ void app_coding_bridge_connected(bool connected)
         if (s_catalog_mode != CATALOG_NONE) coding_bridge_cancel_catalog();
         s_selecting_thread = false;
         s_catalog_mode = CATALOG_NONE;
-    } else if (coding_bridge_capability_enabled("tasks") &&
-               s_workspace != NULL && s_current_task[0] == '\0' &&
-               s_catalog_mode == CATALOG_NONE) {
-        s_catalog_mode = CATALOG_LOADING_PROJECTS;
-        s_catalog_count = 0;
-        s_catalog_selected = 0;
-        s_catalog_window_start = 0;
-        coding_bridge_request_projects();
     }
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_catalog_begin(const char *scope)
@@ -1137,7 +1145,7 @@ void app_coding_catalog_begin(const char *scope)
     s_catalog_selected = 0;
     s_catalog_window_start = 0;
     s_catalog_input_unlock_ms = lv_tick_get() + CATALOG_INPUT_GUARD_MS;
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_catalog_item(const char *scope, const char *id,
@@ -1165,7 +1173,7 @@ void app_coding_catalog_end(const char *scope)
     s_catalog_selected = 0;
     s_catalog_window_start = 0;
     s_catalog_input_unlock_ms = lv_tick_get() + CATALOG_INPUT_GUARD_MS;
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_task_selected(const char *title, const char *project,
@@ -1188,7 +1196,11 @@ void app_coding_task_selected(const char *title, const char *project,
     snprintf(s_current_project, sizeof(s_current_project), "%s",
              project != NULL ? project : "未分组项目");
     // 会话最后一段文本(电脑端只下发这一段, 不传整段对话)。
-    snprintf(s_last_message, sizeof(s_last_message), "%s",
+    // Only keep a preview. A full thread message can be kilobytes of CJK,
+    // and laying that out plus flushing a 240x320 frame from the LVGL task
+    // ran past the 5 s task watchdog. The body is paged anyway, so the screen
+    // only needs the first line or two.
+    snprintf(s_last_message, sizeof(s_last_message), "%.220s",
              last_message != NULL ? last_message : "");
     // 便于排查"点开会话只拿到最后一段"这条链路(日志里能看到是否带内容)。
     ESP_LOGI(kTag, "task selected: '%s' last_message=%u bytes",
@@ -1198,7 +1210,7 @@ void app_coding_task_selected(const char *title, const char *project,
     s_flow.stage = CODING_STAGE_IDLE;
     s_result_thread[0] = '\0';
     s_result_turn[0] = '\0';
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_bridge_transcript(const char *text)
@@ -1206,7 +1218,7 @@ void app_coding_bridge_transcript(const char *text)
     app_power_activity();
     ensure_initialized();
     coding_flow_set_transcript(&s_flow, text);
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_bridge_task_queued(const char *text)
@@ -1214,7 +1226,7 @@ void app_coding_bridge_task_queued(const char *text)
     app_power_activity();
     ensure_initialized();
     coding_flow_set_queued(&s_flow, text);
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_bridge_task_status(const char *text)
@@ -1222,7 +1234,7 @@ void app_coding_bridge_task_status(const char *text)
     if (s_discard_selection_updates) return;
     ensure_initialized();
     coding_flow_set_task_status(&s_flow, text);
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_bridge_approval(const char *question, const char *detail)
@@ -1231,7 +1243,7 @@ void app_coding_bridge_approval(const char *question, const char *detail)
     ensure_initialized();
     s_catalog_mode = CATALOG_NONE;
     coding_flow_show_approval(&s_flow, question, detail);
-    coding_render();
+    coding_render_deferred();
     app_voice_mode_t mode = app_settings_voice_mode();
     if (mode == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
     if (mode == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_APPROVAL_SPEECH);
@@ -1255,7 +1267,7 @@ void app_coding_bridge_done_with_elapsed(const char *text, uint32_t elapsed_ms)
     s_has_remote_task_elapsed = elapsed_ms > 0U;
     if (s_has_remote_task_elapsed) s_last_task_elapsed_ms = elapsed_ms;
     coding_flow_set_done(&s_flow, text);
-    coding_render();
+    coding_render_deferred();
     app_voice_mode_t mode = app_settings_voice_mode();
     if (mode == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
     else if (mode == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
@@ -1268,7 +1280,12 @@ void app_coding_bridge_error(const char *text)
 
 void app_coding_bridge_error_with_elapsed(const char *text, uint32_t elapsed_ms)
 {
-    if (s_discard_selection_updates) {
+    // While a thread pick is in flight the only outstanding request is the
+    // optional thread.read metadata refresh. The selection already completed
+    // from threads.list, so a host error on that refresh must not push the whole
+    // UI into CODING_STAGE_ERROR and strand the user.
+    if (s_discard_selection_updates || s_selecting_thread ||
+        s_catalog_mode != CATALOG_NONE) {
         s_result_thread[0] = '\0';
         s_result_turn[0] = '\0';
         return;
@@ -1279,7 +1296,7 @@ void app_coding_bridge_error_with_elapsed(const char *text, uint32_t elapsed_ms)
     s_has_remote_task_elapsed = elapsed_ms > 0U;
     if (s_has_remote_task_elapsed) s_last_task_elapsed_ms = elapsed_ms;
     coding_flow_set_error(&s_flow, text);
-    coding_render();
+    coding_render_deferred();
     ui_sfx_play(UI_SFX_FAIL);
 }
 
@@ -1301,7 +1318,7 @@ void app_coding_remote_status(const char *text)
     app_power_activity();
     ensure_initialized();
     coding_flow_set_task_status(&s_flow, text);
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_remote_task(const char *thread_id, const char *text,
@@ -1315,7 +1332,7 @@ void app_coding_remote_task(const char *thread_id, const char *text,
              message_id != NULL ? message_id : "");
     s_read_count = 0U;
     coding_flow_set_task_status(&s_flow, text);
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_remote_result(const char *thread_id, const char *status,
@@ -1338,7 +1355,7 @@ void app_coding_remote_result(const char *thread_id, const char *status,
         if (mode == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
         else if (mode == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
     }
-    coding_render();
+    coding_render_deferred();
 }
 
 void app_coding_capture_level(uint8_t level)
@@ -1567,7 +1584,10 @@ void app_coding_exit(void)
 
 static void open_projects(void)
 {
-    if (!coding_bridge_capability_enabled("tasks")) return;
+    const bool cap = coding_bridge_capability_enabled("tasks");
+    ESP_LOGI(kTag, "open_projects cap=%d stage=%d sel=%d", (int)cap,
+             (int)s_flow.stage, s_selected);
+    if (!cap) return;
     s_cancel_confirm = false;
     release_project_cache();
     s_catalog_return_page = s_page;
@@ -1622,6 +1642,10 @@ bool app_coding_back(void)
 void app_coding_key(bsp_btn_t button, bsp_btn_ev_t event)
 {
     coding_action_t action = CODING_ACTION_NONE;
+    if (event == BSP_BTN_CLICK && button == BSP_BTN_OK) {
+        ESP_LOGI(kTag, "OK stage=%d sel=%d actions=%d catalog=%d",
+                 (int)s_flow.stage, s_selected, s_action_count, (int)s_catalog_mode);
+    }
 
     if (s_catalog_mode != CATALOG_NONE) {
         if (event == BSP_BTN_CLICK &&

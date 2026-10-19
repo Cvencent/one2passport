@@ -31,6 +31,9 @@ void coding_bridge_cancel_catalog(void);
 void coding_bridge_confirm_selection(void);
 void coding_bridge_select_project(const char *id);
 void coding_bridge_select_thread(const char *id);
+/* Title of a thread already seen in threads.list, or NULL when unknown. Lets
+ * the picker complete a selection without waiting for a thread.read reply. */
+const char *coding_bridge_thread_title(const char *id);
 void coding_bridge_create_thread(void);
 void coding_bridge_request_review(void);
 bool coding_bridge_result_seen(const char *thread_id, const char *turn_id);

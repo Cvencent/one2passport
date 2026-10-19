@@ -996,7 +996,10 @@ static bool s_encoder_gave_up;
 // Layout: [ bridge task stack ][ radio jitter ring ]. The two owners are
 // mutually exclusive with XiaoZhi (entering it stops radio and bridge first),
 // but they run together on home, so the regions must not overlap.
-#define XZ_BRIDGE_STACK_BYTES 7168
+// CBDP parsing keeps its receive, subscribe, and long event buffers on this
+// task stack. 7 KB overflowed on the first real delta event; 12 KB leaves
+// room for the complete authenticated message path.
+#define XZ_BRIDGE_STACK_BYTES 12288
 static StackType_t s_mic_stack_storage[XZ_MIC_STACK_WORDS]
     __attribute__((aligned(16)));
 static StaticTask_t s_mic_tcb;
@@ -1575,7 +1578,7 @@ static bool xz_mic_stack_is_idle(void)
 }
 
 // Carved out of the idle microphone stack for the always-on minimized bridge.
-// This keeps the bridge's 7KB task stack out of the heap; entering XiaoZhi
+// This keeps the bridge's 12KB task stack out of the heap; entering XiaoZhi
 // stops the bridge before the mic task is allowed to reuse the full array.
 uint8_t *xiaozhi_bridge_stack(size_t *size)
 {

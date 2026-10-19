@@ -24,6 +24,7 @@ void ui_sfx_init(bool audio_available);
 void ui_sfx_set_volume(uint8_t percent);
 void ui_sfx_play(ui_sfx_t effect);
 void ui_sfx_play_wav(const uint8_t *wav, size_t wav_size);
+void ui_sfx_suspend(bool suspended);
 
 #ifdef __cplusplus
 }

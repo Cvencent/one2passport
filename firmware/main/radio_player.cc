@@ -646,11 +646,24 @@ constexpr std::size_t kNetworkBlocks = 28;
 constexpr std::size_t kPrebufferTarget = 6 * 1024;
 constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
 
-// network_feed_task 的栈**静态分配**: 它要求一块 2048B **连续**堆, 而
-// 播放时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 动态申请必然失败
+// network_feed_task 的栈**静态分配**: 动态申请要求在播放时凑出一块连续堆,
+// 而那时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 必然失败
 // (实测 "network task stack unavailable")。放进 .bss 就没有这个约束:
 // 静态内存在开机就由 ELF 预留, 不参与堆碎片竞争。
-constexpr std::size_t kNetworkFeedStack = 2048;
+//
+// ⚠⚠ 2026-10-20 崩溃修复(真机复现: 设置 -> 城市电台 福建改重庆 -> 退出设置,
+// 画面卡住一段时间后自己回到首页):
+//   Guru Meditation Error: Core 0 panic'ed (Stack protection fault)
+//   Detected in task "radio_network"; MEPC=_vfprintf_r, RA=esp_log
+//   (调用链 esp_http_client_read -> lwip_select 的日志路径)
+// 崩溃时 Stack bounds 为 2032B, SP 已越过下界约 320B —— 正好说明 2048B 不够。
+// 本任务还持有 uint8_t bytes[kInputSize]=1024B 的局部数组, 切城市触发重连时
+// 那条 lwIP 日志路径再要一块栈, 于是越界 -> 任务崩溃 -> RTC_SW_CPU_RST 重启。
+// 3072B 相对原来只多占 1KB 静态 DRAM(.bss, 不参与堆竞争), 给该路径留出约 2KB
+// 余量; 在 ESP32-C3 极紧的内部内存下这是最小安全增量。
+constexpr std::size_t kNetworkFeedStack = 3072;
+static_assert(kNetworkFeedStack >= 3072,
+              "radio_network needs room for bytes[1024] plus the lwIP logging path");
 StaticTask_t s_network_feed_tcb;
 StackType_t  s_network_feed_stack[kNetworkFeedStack];
 
@@ -1668,6 +1681,19 @@ std::size_t radio_player_station_index() {
 
 bool radio_player_has_cached_catalog() { return s_catalog_cached; }
 
+// Drop the in-RAM cache so the next app_radio_request_catalog() performs a real
+// search. Used when the remembered city no longer matches the cached catalog's
+// city (a failed NVS write can leave the previous city's blob in place).
+void radio_player_invalidate_catalog_cache() {
+    s_catalog_cached = false;
+    nvs_handle_t handle;
+    if (nvs_open("radio", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_erase_key(handle, "catalog_v3");
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
 std::size_t radio_player_station_count() {
     return std::max<std::size_t>(s_station_count.load(std::memory_order_acquire), 1);
 }
@@ -1739,6 +1765,14 @@ bool radio_player_replace_stations_resuming(const RadioStation *stations,
     s_catalog_cached = true;
     nvs_handle_t catalog_handle;
     if (nvs_open("radio", NVS_READWRITE, &catalog_handle) == ESP_OK) {
+        // Erase first: overwriting a ~6KB blob in the 24KB NVS partition can
+        // fail with ESP_ERR_NVS_NOT_ENOUGH_SPACE while the old entry still
+        // occupies its slot, which then left the previous city's catalog in
+        // place across a reboot. Releasing the old blob makes room.
+        const esp_err_t erased = nvs_erase_key(catalog_handle, "catalog_v3");
+        if (erased != ESP_OK && erased != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(kTag, "catalog cache erase failed: %s", esp_err_to_name(erased));
+        }
         esp_err_t saved = nvs_set_blob(catalog_handle, "catalog_v3", merged,
                                       merged_count * sizeof(RadioStation));
         if (saved == ESP_OK) saved = nvs_commit(catalog_handle);

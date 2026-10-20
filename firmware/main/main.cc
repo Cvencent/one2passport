@@ -255,6 +255,31 @@ std::size_t load_selected_city() {
     return index;
 }
 
+// The station cache must remember which city it was searched for. NVS is small
+// and a failed catalog_v3 write (ESP_ERR_NVS_NOT_ENOUGH_SPACE) leaves the old
+// blob behind; comparing the stamped city at boot turns that into a forced
+// re-search instead of silently showing the previous city's stations.
+constexpr char kCatalogCityKey[] = "catalog_city";
+
+void save_catalog_city(const char *city) {
+    nvs_handle_t handle;
+    if (nvs_open("radio", NVS_READWRITE, &handle) != ESP_OK) return;
+    nvs_set_str(handle, kCatalogCityKey, city ? city : "");
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+bool load_catalog_city(char *out, std::size_t size) {
+    if (out == nullptr || size == 0) return false;
+    out[0] = '\0';
+    nvs_handle_t handle;
+    if (nvs_open("radio", NVS_READONLY, &handle) != ESP_OK) return false;
+    std::size_t length = size;
+    const esp_err_t error = nvs_get_str(handle, kCatalogCityKey, out, &length);
+    nvs_close(handle);
+    return error == ESP_OK;
+}
+
 // Starts the search for whichever city was last chosen, falling back to
 // automatic detection the first time the radio is used.
 void start_remembered_catalog_search() {
@@ -814,10 +839,17 @@ void catalog_task(void *) {
             continue;
         }
         if (s_connected.load(std::memory_order_acquire)) {
-            if (count > 0 &&
-                !(location.national_fallback && radio_player_has_cached_catalog()) &&
+            // The national-fallback guard exists so an auto-located search does
+            // not replace a good local list with generic top stations. When the
+            // user *explicitly* picked a city it must not win: keeping the old
+            // list is exactly why choosing 重庆 still showed 泉州.
+            const bool keep_cached_on_fallback =
+                city[0] == '\0' && location.national_fallback &&
+                radio_player_has_cached_catalog();
+            if (count > 0 && !keep_cached_on_fallback &&
                 radio_player_replace_stations_resuming(stations, count)) {
                 s_catalog_loaded = true;
+                save_catalog_city(city);
                 radio_ui_set_location(city[0]
                                           ? display
                                           : (location.city[0] ? location.city
@@ -830,6 +862,9 @@ void catalog_task(void *) {
             }
             radio_player_set_network(true);
         }
+        // Give the decoder its contiguous block back *before* resuming, or the
+        // playback worker starts without a pool and fails to open the stream.
+        radio_player_ensure_pool();
         radio_player_resume_after_catalog(pause);
         s_catalog_task = nullptr;
         break;
@@ -847,7 +882,32 @@ void start_catalog_search(const char *city, const char *display) {
     // Release the stream's HTTP client, network worker and jitter buffers before
     // allocating the catalog worker. Keep playback intent for its pause token.
     radio_player_set_network(false);
-    radio_player_wait_idle(2000);
+    // The stream worker tears down asynchronously: HTTP client, socket and the
+    // jitter buffer all have to be released before the catalog worker's stack
+    // can be allocated. Waiting a fixed 2s was not enough on hardware -- the
+    // task then failed with free=3788/largest=1280, the failure path silently
+    // kept the previous city's station list, and the user saw "picked 重庆 but
+    // still 泉州". Wait for the worker to go idle AND for a contiguous block
+    // big enough for the 6KB catalog stack, with a bounded overall budget.
+    radio_player_wait_idle(3000);
+    // The catalog search needs an HTTP client (~2KB contiguous) *plus* its 6KB
+    // task stack. While the minimized radio keeps its 20KB decoder pool, only
+    // ~1.8KB contiguous is left, so the search silently fails and the old
+    // city's list stays on screen. The decoder is not needed while searching
+    // (playback is paused), so hand the pool back and re-acquire it afterwards.
+    // Never release while the worker still owns the pool: stream_station holds
+    // the same buffers and release would race a use-after-free. If the stream
+    // did not wind down in time, skip the release and let the task creation
+    // fail loudly instead of corrupting memory.
+    if (!radio_player_is_stream_active()) {
+        radio_player_release_pool();
+    } else {
+        ESP_LOGW(kTag, "catalog: stream still active, keeping decoder pool");
+    }
+    for (int attempt = 0; attempt < 60; ++attempt) {
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= 8192) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
     bool task_running = false;
     bool task_available = true;
     {
@@ -865,6 +925,14 @@ void start_catalog_search(const char *city, const char *display) {
                         &s_catalog_task) != pdPASS) {
             s_catalog_task = nullptr;
             task_available = false;
+            ESP_LOGW(kTag, "catalog task create failed (free=%u largest=%u)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        } else if (!task_running) {
+            ESP_LOGI(kTag, "catalog task started for city '%s' (free=%u largest=%u)",
+                     city ? city : "(auto)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         }
     }
     radio_ui_set_location(city && city[0] ? display : "LOCATING...");
@@ -873,6 +941,9 @@ void start_catalog_search(const char *city, const char *display) {
                                           : "正在搜索本地电台");
     if (!task_running && !task_available) {
         radio_ui_set_location(city && city[0] ? display : "NATIONAL");
+        // The search never started, so nothing will give the decoder pool back.
+        // Re-acquire it here or the radio stays silent until the next restart.
+        radio_player_ensure_pool();
         radio_player_set_network(true);
     }
 }
@@ -1062,6 +1133,19 @@ void connection_watchdog_task(void *) {
 // ---- V6 应用层桥(供 app_apps.cc 调用; 统一 C 链接) ----
 extern "C" {
 void app_radio_request_catalog(void) {
+    char cached_city[24] = {};
+    const bool have_cached_city = load_catalog_city(cached_city, sizeof(cached_city));
+    const char *selected_query = city_query_for(load_selected_city());
+    const bool cache_matches_city =
+        have_cached_city &&
+        ((selected_query == nullptr && cached_city[0] == '\0') ||
+         (selected_query != nullptr && std::strcmp(cached_city, selected_query) == 0));
+    if (!cache_matches_city && radio_player_has_cached_catalog()) {
+        ESP_LOGI(kTag, "catalog cache city '%s' != selected '%s'; re-searching",
+                 have_cached_city ? cached_city : "(none)",
+                 selected_query ? selected_query : "(auto)");
+        radio_player_invalidate_catalog_cache();
+    }
     bool needs_catalog;
     {
         std::lock_guard<std::mutex> lock(s_catalog_mutex);

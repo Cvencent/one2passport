@@ -59,6 +59,8 @@ void radio_player_set_station(std::size_t index);
 std::size_t radio_player_station_index();
 std::size_t radio_player_station_count();
 bool radio_player_has_cached_catalog();
+// 作废电台目录缓存(内存 + NVS), 供城市变更后强制重新搜索。
+void radio_player_invalidate_catalog_cache();
 RadioStation radio_player_station(std::size_t index);
 bool radio_player_replace_stations(const RadioStation *stations, std::size_t count);
 // Installs a catalog and keeps listening to the station the user last chose

@@ -55,3 +55,46 @@
   启动、联网与 CBDP 会话建立后再注入按键。
 - 首页运行计数为 0 时，界面按设计隐藏该行（`refresh_home_codex()` 在所有计数为 0 时置空），
   因此“看不到运行中数量”在当前 Bridge 版本下属于预期表现，待 Bridge 侧补齐计数后自动显示。
+
+## 追加修复：设置里切换城市电台（2026-10-20 第二轮）
+
+用户复现：设置 → 城市电台，把福建切到重庆，退出设置时卡住，过一会自己回到首页，
+再打开仍是泉州。
+
+串口抓到两条独立根因：
+
+1. **崩溃**：`Guru Meditation Error: Core 0 panic'ed (Stack protection fault)`，
+   `Detected in task "radio_network"`，`MEPC=_vfprintf_r`（`esp_log` ←
+   `esp_http_client_read` → `lwip_select` 的日志路径）。该任务栈只有 2048B，
+   还带 `bytes[1024]` 局部数组，切城市触发重连时越界。
+   → 栈提升到 3072B（只 +1KB 静态 DRAM）。
+2. **城市没生效**：`catalog task create failed (free=3788 largest=1280)`。
+   搜索任务要 6KB 动态栈 + HTTP 客户端连续内存，而最小化收音机的 20KB
+   解码池占着堆，创建必然失败；失败路径当时静默保留旧列表。
+   → 搜索前释放解码池、等到足够连续内存、搜索完再抢回；显式选城市时不再
+   沿用旧缓存（auto 定位仍保留原保护逻辑）。
+
+真机验证（Bridge 为本地运行中的 v2.1.11，未启动第二个实例）：
+
+| 项目 | 结果 | 证据 |
+|---|---|---|
+| 切城市不再崩溃 | 通过 | 全程无 `Guru Meditation` / `Stack protection` |
+| 搜索任务创建 | 通过 | `catalog task started for city '重庆' (free=42896 largest=29696)` |
+| 城市搜索生效 | 通过 | `Manual city search '重庆' returned 2 playable stations` / `Manual province state 'Chungking' now totals 8 stations` / `Installed local catalog with 14 stations` |
+| 播放新城市电台 | 通过 | `Playing 重庆…FM88.7` |
+| 退出设置 | 通过 | 返回菜单，无卡死/重启 |
+| 重启后保持 | 通过 | 重启后 `Restored cached radio catalog: 14 stations`（重庆目录） |
+| 启动堆余量 | 通过 | `post_radio_prewarm free=18640 largest=10752`（仅比基线少约 1KB） |
+
+### 第二轮补充（同一天，真机复测）
+
+除上面的崩溃与任务创建问题外，还修掉两个会让"切了城市又变回泉州"的次要原因：
+
+3. **NVS 写缓存失败**：`catalog cache save failed: ESP_ERR_NVS_NOT_ENOUGH_SPACE`。
+   覆盖写 ~6KB 的 `catalog_v3` 时旧条目仍占槽位，导致新城市目录没落盘、重启后
+   恢复旧列表。→ 写入前先 `nvs_erase_key` 再写。
+4. **缓存未与城市绑定**：新增 `catalog_city` 记录缓存对应的城市；启动时若与
+   `city_name` 不一致就作废缓存并强制重新搜索（自动定位的旧保护逻辑保留）。
+
+最终真机结果：切重庆不再崩溃、搜索任务正常创建并返回重庆电台、退出设置回到菜单、
+重启后仍恢复重庆目录（`Restored cached radio catalog: 14 stations`）。

@@ -533,6 +533,16 @@ static void network_task(void *argument)
                 int send_buffer = 8192;
                 setsockopt(accepted, SOL_SOCKET, SO_SNDBUF,
                            &send_buffer, sizeof(send_buffer));
+                // 控制平面不能抢走数据平面的 lwIP 内存。订阅时主机会一次性
+                // 重放整段事件积压(实测 32 条 x ~600B, 其中多数还是本设备
+                // **未订阅**的其它线程消息)。默认接收缓冲会把 lwIP 的 pbuf/
+                // 接收窗口吃光, 正在播的网络电台随即 alloc 失败, 表现为
+                // "eagain 连续 10~16 次"、声音停十几秒再重连(真机实测)。
+                // 这里把控制 socket 的接收缓冲压到最小, 让 Bridge 侧被 TCP
+                // 窗口限速, 突发被摊平; 电台的收包内存优先级因此得到保障。
+                int recv_buffer = 2048;
+                setsockopt(accepted, SOL_SOCKET, SO_RCVBUF,
+                           &recv_buffer, sizeof(recv_buffer));
                 int no_delay = 1;
                 setsockopt(accepted, IPPROTO_TCP, TCP_NODELAY,
                            &no_delay, sizeof(no_delay));

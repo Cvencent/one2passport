@@ -21,6 +21,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include "esp_wifi.h"
+
 #include <cerrno>
 #include <cmath>
 #include <cstddef>
@@ -689,6 +691,10 @@ struct NetworkFeed {
     std::atomic<bool> finished{false};
     std::atomic<bool> stop{false};
     std::atomic<uint32_t> max_read_us{0};
+    // 诊断: 本轮窗口内成功读到的字节数 / EAGAIN 次数 / 零读次数。
+    std::atomic<uint32_t> diag_bytes{0};
+    std::atomic<uint32_t> diag_eagain{0};
+    std::atomic<uint32_t> diag_zero{0};
     // 0 = running, 1 = idle timeout, 2 = read error, 3 = EOF.
     // The feed task never logs itself; the player task (4.6KB stack) prints.
     std::atomic<uint8_t> exit_reason{0};
@@ -729,6 +735,7 @@ void network_feed_task(void *argument) {
         // 需要在 2048B 栈上再要 1KB+, 2026-10-20 真机就是在这里踩穿栈保护。
         // 所有失败原因只写原子标志, 由 player_task 打印。
         if (received == -ESP_ERR_HTTP_EAGAIN) {
+            feed->diag_eagain.fetch_add(1U);
             if (!stall_start_us) stall_start_us = start;
             if (esp_timer_get_time() - stall_start_us >= kStallBudgetUs) {
                 feed->exit_reason.store(1U, std::memory_order_release);
@@ -742,6 +749,7 @@ void network_feed_task(void *argument) {
             break;
         }
         if (!received) {
+            feed->diag_zero.fetch_add(1U);
             if (esp_http_client_is_complete_data_received(feed->client) ||
                 ++eof_reads >= kEofReads) {
                 feed->exit_reason.store(3U, std::memory_order_release);
@@ -752,6 +760,7 @@ void network_feed_task(void *argument) {
         }
         eof_reads = 0;
         stall_start_us = 0;
+        feed->diag_bytes.fetch_add((uint32_t)received);
         std::size_t used = 0;
         while (used < static_cast<std::size_t>(received) &&
                !feed->stop.load() &&
@@ -1307,6 +1316,25 @@ bool stream_station(std::size_t station, uint32_t generation) {
                         last_write_end = esp_timer_get_time();
                         if (last_write_end - stats_start >= 10000000) {
                             max_read_us = feed.max_read_us.exchange(0);
+                            const uint32_t dbytes = feed.diag_bytes.exchange(0);
+                            const uint32_t deagain = feed.diag_eagain.exchange(0);
+                            const uint32_t dzero = feed.diag_zero.exchange(0);
+                            // 只在吞吐异常时打印: 正常窗口静默(否则这条日志本身
+                            // 也会占用串口与栈)。eagain 高说明 socket 长时间收不到
+                            // 数据, 是"播几秒卡十几秒"的直接指标。
+                            if (deagain >= 3U || dbytes < 20000U) {
+                                wifi_ap_record_t apinfo = {};
+                                int rssi_dbm = 0;
+                                if (esp_wifi_sta_get_ap_info(&apinfo) == ESP_OK) {
+                                    rssi_dbm = (int)apinfo.rssi;
+                                }
+                                ESP_LOGW(kTag,
+                                         "low throughput: bytes=%u eagain=%u zero=%u "
+                                         "avail=%u rssi=%d",
+                                         (unsigned)dbytes, (unsigned)deagain,
+                                         (unsigned)dzero, (unsigned)ring.available(),
+                                         rssi_dbm);
+                            }
                             ESP_LOGI(kTag, "audio stats: wall=%ums pcm=%ums read_max=%ums gap_max=%ums gaps30=%u clipped=%u rms=%u peak=%u rebuffers=%u queued=%u stack_free=%u",
                                      (unsigned)((last_write_end - stats_start) / 1000),
                                      (unsigned)(pcm_samples * 1000ULL / sample_rate),

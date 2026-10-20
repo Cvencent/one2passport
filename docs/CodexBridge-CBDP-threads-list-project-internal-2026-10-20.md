@@ -1,4 +1,11 @@
-# CodexBridge 待修复：CBDP `threads.list` 按项目过滤返回 INTERNAL（2026-10-20）
+# CodexBridge：CBDP `threads.list` 按项目过滤返回 INTERNAL（2026-10-20，**已修复**）
+
+> **状态：已解决（2026-10-20）** —— Bridge 已升级到 v2.1.17 并修复此问题：
+> `cbdp/gateway.py` 增加 `"project_ref": 0x0122` 映射并在 `_normalize_params()`
+> 中解析成 `project_id`，`protocol/commands.py` 的 `threads.list` 可选参数加入
+> `project_id`。设备端无需改动，真机已验证项目列表 → 任务列表 → 新建任务 →
+> 回复任务全部可用（详见 `firmware-verification-2026-10-20.md` 第五轮验证）。
+> 以下保留原始问题记录，仅供回溯。
 
 - 日期：2026-10-20
 - 设备端：AI Passport（ESP32-C3，MAC `98:c3:77:f5:52:70`，IP `192.168.0.39`），CBDP **text** profile

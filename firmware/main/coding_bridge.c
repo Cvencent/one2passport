@@ -101,6 +101,23 @@ static uint32_t s_thread_ref_for_topic;
 static uint32_t s_summary_scope_seq;
 
 static uint32_t s_last_acked_seq;
+// Bridge pushes only aggregate "unread terminal result" counters over CBDP
+// (system.codex_state, event 0x0704); individual turn.completed events are
+// not translated on that transport. Remember the previous counters here so a
+// rise in completed/failed still produces a local completion alert.
+static uint32_t s_last_codex_done_count;
+static uint32_t s_last_codex_failed_count;
+static bool s_codex_counts_initialized;
+// The unread counters oscillate while other clients read results
+// (2->3->2->3), so a plain "greater than last" test rang seven times in eleven
+// seconds on real hardware. Arm a pending alert on a rise and only ring if the
+// count is still elevated after a settle window; a genuine completion stays
+// unread, whereas the oscillation falls back within a second.
+static int64_t s_codex_alert_armed_us;
+static uint32_t s_codex_alert_armed_done;
+static uint32_t s_codex_alert_armed_failed;
+static bool s_codex_alert_armed_is_failure;
+#define CODEX_ALERT_SETTLE_US (4LL * 1000 * 1000)
 #define MAX_SUBSCRIPTIONS 6
 static uint32_t s_sub_topic[MAX_SUBSCRIPTIONS];
 static uint8_t s_sub_scope[MAX_SUBSCRIPTIONS];
@@ -1718,6 +1735,48 @@ static void wireless_handle_delta(const cbdp_frame_header_t *header,
         // 所以取两者较大值, 保证既不漏也不清零。
         if (done > s_background_state.done) s_background_state.done = done;
         if (failed > s_background_state.failed) s_background_state.failed = failed;
+
+        // Completion alert fallback. On CBDP the Bridge only sends this
+        // aggregate counter, so compare against the previous authoritative
+        // value. Replayed historical counts seed the baseline and stay silent;
+        // only a real increase after that rings.
+        if (!s_codex_counts_initialized) {
+            s_last_codex_done_count = done;
+            s_last_codex_failed_count = failed;
+            s_codex_counts_initialized = true;
+        } else {
+            const bool rose_done = done > s_last_codex_done_count;
+            const bool rose_failed = failed > s_last_codex_failed_count;
+            s_last_codex_done_count = done;
+            s_last_codex_failed_count = failed;
+            const int64_t now_us = esp_timer_get_time();
+            if (rose_done || rose_failed) {
+                // Arm and wait for the count to settle. Another client reading
+                // the same result makes these counters fall back within a
+                // second; a genuine completion stays unread.
+                s_codex_alert_armed_us = now_us;
+                s_codex_alert_armed_done = done;
+                s_codex_alert_armed_failed = failed;
+                s_codex_alert_armed_is_failure = rose_failed;
+            } else if (s_codex_alert_armed_us != 0 &&
+                       done >= s_codex_alert_armed_done &&
+                       failed >= s_codex_alert_armed_failed) {
+                if (now_us - s_codex_alert_armed_us >= CODEX_ALERT_SETTLE_US) {
+                    const bool alert_failed = s_codex_alert_armed_is_failure;
+                    s_codex_alert_armed_us = 0;
+                    if (alert_failed) {
+                        ui_sfx_play(UI_SFX_FAIL);
+                    } else {
+                        const app_voice_mode_t voice = app_settings_voice_mode();
+                        if (voice == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
+                        else if (voice == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
+                    }
+                }
+            } else if (s_codex_alert_armed_us != 0) {
+                // Count fell back: it was another client reading, not new work.
+                s_codex_alert_armed_us = 0;
+            }
+        }
         home_codex_state_changed();
         if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
             app_coding_bridge_state(running, s_background_state.done,

@@ -1399,8 +1399,17 @@ void radio_ui_set_playback(RadioPlaybackState state, const char *detail) {
     bsp_lvgl_unlock();
 }
 
+bool radio_ui_leo_page_visible() {
+    return s_page_visible;
+}
+
 void radio_ui_set_audio_levels(const uint8_t *levels, std::size_t count) {
     if (!levels) return;
+    // The home screen has no spectrum bars; only the full radio page consumes
+    // these levels. Skipping the copy/invalidate while the LEO tree is not
+    // visible removes one memory write and one LVGL invalidation per audio
+    // frame, which is a measurable share of the 12-18 ms inter-write gap.
+    if (!s_page_visible) return;
     const std::size_t copy_count = std::min(count, kMeterCount);
     std::memcpy(s_levels, levels, copy_count);
     if (copy_count < kMeterCount) {

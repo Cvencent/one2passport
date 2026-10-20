@@ -24,6 +24,10 @@ static bool     s_opened;
 // and the new codec starts from 0. Remembering the value here lets every open
 // restore the user's level instead of silently muting until the next write.
 static uint8_t  s_volume = 55;
+// Output ownership changes (radio <-> UI effect) must not leave the DAC
+// unmuted while the I2S DMA queue drains. Keep the last requested mute state
+// here so every open restores it together with the volume.
+static bool     s_muted;
 // 串行化 codec 的开关与读写。
 //
 // 【为什么必需】收音机(radio_player)与 Codex 页(ui_sfx 提示音、coding_bridge
@@ -215,10 +219,21 @@ esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch) {
     //   麦克风离喇叭较远时 30dB 明显不够(设备是桌面摆件, 人站在旁边说话)。
     esp_codec_dev_set_in_gain(s_dev, 40.0f);
     esp_codec_dev_set_out_vol(s_dev, s_volume);
+    esp_codec_dev_set_out_mute(s_dev, s_muted);
 
     s_opened = true; s_hz = hz; s_bits = bits; s_ch = ch;
     prime_output();
     ESP_LOGI(TAG, "codec 打开 %luHz/%ubit/%uch", (unsigned long)hz, bits, ch);
+    audio_unlock();
+    return ESP_OK;
+}
+
+esp_err_t bsp_audio_get_format(uint32_t *hz, uint8_t *bits, uint8_t *ch) {
+    if (!hz || !bits || !ch || !s_dev || !s_opened) return ESP_ERR_INVALID_STATE;
+    audio_lock();
+    *hz = s_hz;
+    *bits = s_bits;
+    *ch = s_ch;
     audio_unlock();
     return ESP_OK;
 }
@@ -245,5 +260,13 @@ void bsp_audio_set_volume(uint8_t percent) {
     if (!s_dev) return;
     audio_lock();
     esp_codec_dev_set_out_vol(s_dev, s_volume);
+    audio_unlock();
+}
+
+void bsp_audio_set_muted(bool muted) {
+    s_muted = muted;
+    if (!s_dev || !s_opened) return;
+    audio_lock();
+    esp_codec_dev_set_out_mute(s_dev, muted);
     audio_unlock();
 }

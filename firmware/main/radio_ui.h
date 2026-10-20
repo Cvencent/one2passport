@@ -36,6 +36,9 @@ void radio_ui_show_main();
 void radio_ui_show_home();
 // 显式进入 LEO 原版主界面(单卡片 + 大旋钮),用于对比两种风格。
 void radio_ui_show_leo_main();
+// True while the full LEO radio page owns the display. The player uses this
+// to skip spectrum analysis on the home screen where no meter consumes it.
+bool radio_ui_leo_page_visible();
 // 切到 plays/438 首页 / Codex 页前调用:让 LEO 的 50ms 刷新定时器停手。
 // 不调会导致该定时器往已销毁的 LVGL 对象上写,屏幕闪烁/花屏。
 void radio_ui_leave_leo_page();

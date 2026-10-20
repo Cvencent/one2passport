@@ -3,6 +3,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -20,12 +21,23 @@ esp_err_t bsp_audio_init(void);
 //   音调和速度都快一倍。故本函数在格式变化时先 close 再 open。
 esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch);
 
+// Read the currently opened codec format. Returns ESP_ERR_INVALID_STATE
+// before the first bsp_audio_set_format() call. Used by UI effects so they can
+// follow the radio clock instead of closing/reopening the codec at 16 kHz.
+esp_err_t bsp_audio_get_format(uint32_t *hz, uint8_t *bits, uint8_t *ch);
+
 // 播放 / 录音。bytes 为字节数(16bit 单声道时 = 采样数 x 2)。
 esp_err_t bsp_audio_write(const void *pcm, size_t bytes);
 esp_err_t bsp_audio_read(void *pcm, size_t bytes);
 
 // 输出音量 0..100(%)。
 void bsp_audio_set_volume(uint8_t percent);
+
+// Mute the DAC output without closing/reopening the codec. Used when audio
+// ownership changes between the radio and UI effects: I2S may keep running,
+// but the analog output is held at digital silence so DMA underruns cannot be
+// heard as a click or a burst of electrical noise.
+void bsp_audio_set_muted(bool muted);
 
 #ifdef __cplusplus
 }

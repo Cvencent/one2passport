@@ -2191,12 +2191,20 @@ esp_err_t coding_bridge_start_wireless(void)
             return resumed;
         }
         s_wireless_enabled = true;
+        /* 若传输层已经在运行且会话仍 ready, 直接恢复投递, 不再强制 disconnect()。
+         * 之前这里无条件断线, 会把一个本来健康的会话拆掉, 回首页还得等主机
+         * 下一次发现节拍(实测 11 秒), 用户感知就是切回首页必卡。 */
+        if (wireless_bridge_session_ready()) {
+            s_bridge_online = true;
+
+            home_codex_state_changed();
+            return ESP_OK;
+        }
         s_bridge_online = false;
         s_connected = false;
         codex_background_reset(&s_background_state);
         home_codex_state_changed();
-        /* Resume after full-screen foreground use: force one reconnect so the
-         * host replays messages/read state that arrived while we were mute. */
+        /* 会话真的断了才需要重连。 */
         wireless_bridge_disconnect();
         return ESP_OK;
     }
@@ -2219,10 +2227,18 @@ esp_err_t coding_bridge_start_wireless(void)
 
 void coding_bridge_stop_wireless(void)
 {
-    /* 传输任务跟随 WifiManager 的 netif 生命周期；完整收音机/小智前台期间
-     * 只停止把无线消息送进应用层，并放下当前鉴权会话。退出后由宿主重新拉起。 */
+    /* 完整收音机/小智前台期间释放桥接资源。
+     *
+     * 这里必须真正停掉传输任务: 它持有 12KB 任务栈(借自小智麦克风区)、
+     * 监听 socket 与 TCP 接收缓冲。真机实测"软暂停(只停投递)"会让收音机
+     * 进入后 dma 只剩 ~568 字节, 切台直接 Open failed —— 音频 socket 拿不到
+     * 收包内存, 得不偿失。
+     *
+     * 回首页的重连成本已通过另一条路径优化: 恢复时若会话仍然 ready 就直接
+     * 复用, 不再强制 disconnect()。 */
     s_wireless_enabled = false;
     wireless_bridge_stop();
+    s_wireless_started = false;
     s_allow_foreground_ui = false;
     s_bridge_online = false;
     s_connected = false;
@@ -2230,9 +2246,6 @@ void coding_bridge_stop_wireless(void)
     s_background_codex_state = APP_CODEX_OFFLINE;
     app_home_set_codex_counts(0U, 0U, 0U);
     app_home_set_codex_state(APP_CODEX_OFFLINE);
-    /* Drop the current PC session so the discovery loop reconnects and the
-     * host replays the latest unread/read state when we resume. */
-    wireless_bridge_disconnect();
 }
 
 bool coding_bridge_send_read_ack(const char *message_id)

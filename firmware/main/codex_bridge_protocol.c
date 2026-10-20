@@ -554,6 +554,19 @@ bool cbdp_build_subscribe(uint8_t *buffer, size_t capacity, size_t *length,
     return finish_frame(buffer, capacity, length, 0U);
 }
 
+bool cbdp_build_unsubscribe(uint8_t *buffer, size_t capacity, size_t *length,
+                            uint32_t request_id, uint32_t topic_id, uint8_t scope)
+{
+    if (!begin_frame(buffer, capacity, length, CBDP_MT_UNSUBSCRIBE, CBDP_FLAG_REQUEST,
+                     CBDP_QOS_CRITICAL, topic_id, 0U)) return false;
+    if (!cbdp_tlv_write_u32(buffer, capacity, length, CBDP_TLV_TOPIC_ID, topic_id) ||
+        !cbdp_tlv_write_u8(buffer, capacity, length, CBDP_TLV_SCOPE, scope) ||
+        !cbdp_tlv_write_u32(buffer, capacity, length, CBDP_TLV_REQUEST_ID, request_id)) {
+        return false;
+    }
+    return finish_frame(buffer, capacity, length, 0U);
+}
+
 bool cbdp_build_command(uint8_t *buffer, size_t capacity, size_t *length,
                         uint32_t request_id, uint16_t method_id,
                         const uint8_t *params, size_t params_length,

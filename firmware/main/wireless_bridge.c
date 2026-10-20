@@ -475,8 +475,8 @@ static void network_task(void *argument)
         // the host next broadcast/redial beat. CodexBridge presence listener
         // accepts this reply frame, so the PC connects in well under a second.
         if (s_wifi_connected && !s_presence_announced &&
-            s_wifi_connected_us != 0 &&
-            esp_timer_get_time() - s_wifi_connected_us > 8000000LL) {
+            (s_wifi_connected_us == 0 ||
+             esp_timer_get_time() - s_wifi_connected_us > 8000000LL)) {
             s_presence_announced = true;
             announce_presence(udp_fd);
         }
@@ -731,6 +731,14 @@ esp_err_t wireless_bridge_init(wireless_bridge_frame_cb_t frame_cb,
                                       NETWORK_TASK_STACK, NULL, 4,
                                       (StackType_t *)stack, &s_task_tcb);
     if (s_task_handle == NULL) return ESP_ERR_NO_MEM;
+    /* ⚠ 每次重建任务都必须重新通告一次。
+     * s_presence_announced 原先只在 WiFi 断开时清零, 而完整收音机会 stop/start
+     * 这个任务(WiFi 并不中断)。于是回首页重启后标志仍是 true, 设备再也不广播,
+     * 电脑端一直不知道它回来了 —— 真机表现为"回首页后 CBDP 会话迟迟不出现"。
+     * 这里清零, 并令 s_wifi_connected_us=0(表示"立刻通告"), 让重启路径跳过
+     * 开机时那 8 秒等待(那段等待只为给收音机首播让内存)。 */
+    s_presence_announced = false;
+    s_wifi_connected_us = 0;
     ESP_LOGI(TAG, "CBDP transport ready, token=%s", s_token[0] ? "loaded" : "missing");
     return ESP_OK;
 }

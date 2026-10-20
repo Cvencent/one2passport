@@ -1,5 +1,7 @@
 #include "ui_sfx.h"
 
+#include "esp_log.h"
+
 #include <stddef.h>
 #include <string.h>
 
@@ -16,6 +18,10 @@ static uint8_t s_volume = 50;
 static bool s_available;
 static volatile bool s_suspended;
 extern bool radio_is_playing_c(void);
+/* 收音机在播放时, 让它临时停止写 I2S 而继续解码/缓冲, 把音频设备借给提示音。
+ * 之前 ui_sfx 直接用 radio_is_playing_c() 丢弃提醒, 导致"播着电台时永远听不到
+ * 任务完成提示"。 */
+extern void radio_audio_yield(bool yield);
 
 typedef struct {
     ui_sfx_t effect;
@@ -59,6 +65,8 @@ static bool find_wav_pcm(const uint8_t *wav, size_t wav_size,
     return false;
 }
 
+// 让位播放期间收音机仍然"在播放", 不能用 radio_is_playing_c() 判断中断。
+static volatile bool s_radio_yielded;
 static void play_speech(const uint8_t *wav, size_t wav_size)
 {
     const uint8_t *pcm = NULL;
@@ -66,7 +74,7 @@ static void play_speech(const uint8_t *wav, size_t wav_size)
     if (!find_wav_pcm(wav, wav_size, &pcm, &remaining)) return;
 
     while (remaining > 0) {
-        if (radio_is_playing_c()) return;
+        if (s_radio_yielded) return;
         size_t count = remaining > 512 ? 512 : remaining;
         if (bsp_audio_write(pcm, count) != ESP_OK) return;
         pcm += count;
@@ -83,7 +91,7 @@ static void tone(uint16_t frequency_hz, uint16_t duration_ms)
     int emitted = 0;
 
     while (emitted < total) {
-        if (radio_is_playing_c()) return;
+        if (s_radio_yielded) return;
         int count = total - emitted;
         if (count > SFX_CHUNK_SAMPLES) count = SFX_CHUNK_SAMPLES;
         for (int i = 0; i < count; ++i) {
@@ -109,7 +117,7 @@ static void silence(uint16_t duration_ms)
     int16_t samples[SFX_CHUNK_SAMPLES] = {0};
     int remaining = SFX_SAMPLE_RATE * duration_ms / 1000;
     while (remaining > 0) {
-        if (radio_is_playing_c()) return;
+        if (s_radio_yielded) return;
         int count = remaining > SFX_CHUNK_SAMPLES ? SFX_CHUNK_SAMPLES : remaining;
         if (bsp_audio_write(samples, (size_t)count * sizeof(samples[0])) != ESP_OK) {
             return;
@@ -124,9 +132,23 @@ static void sfx_task(void *argument)
     sfx_request_t request;
     for (;;) {
         if (xQueueReceive(s_queue, &request, portMAX_DELAY) != pdTRUE) continue;
-        if (!s_available || s_suspended || s_volume == 0 || radio_is_playing_c()) continue;
-        if (bsp_audio_set_format(SFX_SAMPLE_RATE, 16, 1) != ESP_OK) continue;
+        if (!s_available || s_suspended || s_volume == 0) continue;
+        // 收音机正在播放时, 让它让出 I2S(继续解码/攒缓冲), 播完再交还。
+        // 否则"任务完成提示"会被正在播放的电台吞掉。
+        const bool yield_radio = radio_is_playing_c();
+        if (yield_radio) {
+            s_radio_yielded = true;
+            radio_audio_yield(true);
+            vTaskDelay(pdMS_TO_TICKS(60));
+        }
+        if (bsp_audio_set_format(SFX_SAMPLE_RATE, 16, 1) != ESP_OK) {
+            if (yield_radio) radio_audio_yield(false);
+            s_radio_yielded = false;
+            continue;
+        }
         bsp_audio_set_volume(s_volume);
+        ESP_LOGI("ui_sfx", "play effect=%d yield_radio=%d vol=%u",
+                 (int)request.effect, (int)yield_radio, (unsigned)s_volume);
 
         if (request.wav != NULL) {
             play_speech(request.wav, request.wav_size);
@@ -146,6 +168,12 @@ static void sfx_task(void *argument)
             tone(660, 130);
             silence(45);
             tone(330, 220);
+        }
+        if (yield_radio) {
+            // 交还音频设备, 收音机下一帧继续写 I2S。
+            s_radio_yielded = false;
+            radio_audio_yield(false);
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
 }
@@ -172,14 +200,14 @@ void ui_sfx_suspend(bool suspended)
 
 void ui_sfx_play(ui_sfx_t effect)
 {
-    if (s_queue == NULL || s_suspended || s_volume == 0 || radio_is_playing_c()) return;
+    if (s_queue == NULL || s_suspended || s_volume == 0) return;
     const sfx_request_t request = { .effect = effect };
     (void)xQueueSend(s_queue, &request, 0);
 }
 
 void ui_sfx_play_wav(const uint8_t *wav, size_t wav_size)
 {
-    if (s_queue == NULL || s_suspended || s_volume == 0 || radio_is_playing_c() ||
+    if (s_queue == NULL || s_suspended || s_volume == 0 ||
         wav == NULL || wav_size == 0) return;
     const sfx_request_t request = {
         .effect = UI_SFX_CONFIRM,

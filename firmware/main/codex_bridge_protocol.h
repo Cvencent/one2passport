@@ -541,6 +541,12 @@ bool cbdp_build_resync(uint8_t *buffer, size_t capacity, size_t *length,
 bool cbdp_build_subscribe(uint8_t *buffer, size_t capacity, size_t *length,
                           uint32_t request_id, uint32_t topic_id, uint8_t scope,
                           uint8_t qos, uint64_t cursor);
+
+/* Unsubscribe one topic/scope. Sending this before entering a memory-heavy
+ * full-screen app asks the host to stop streaming events to this device, so the
+ * idle CBDP session costs no receive buffers while the radio owns the heap. */
+bool cbdp_build_unsubscribe(uint8_t *buffer, size_t capacity, size_t *length,
+                            uint32_t request_id, uint32_t topic_id, uint8_t scope);
 bool cbdp_build_command(uint8_t *buffer, size_t capacity, size_t *length,
                         uint32_t request_id, uint16_t method_id,
                         const uint8_t *params, size_t params_length,

@@ -131,6 +131,10 @@ static bool s_catalog_cached;
 std::atomic<uint8_t> s_volume{55};
 std::atomic<uint32_t> s_generation{1};
 std::atomic<bool> s_stream_active{false};
+// ui_sfx 播放提示音时置 true: 收音机**继续解码/缓冲**, 但暂时不写 I2S,
+// 把音频设备让给提示音; 播完立即恢复。这样完成提醒不会被"正在播放"吞掉,
+// 也不会像暂停那样丢掉正在缓冲的音频(等价于临时静音一小段)。
+std::atomic<bool> s_audio_yield{false};
 // 最近一次 stream_station 失败的原因是否为"内存不足"(而非电台本身坏)。
 // 播放循环据此决定: 真坏台 -> 换台; 内存不足 -> 换台也没用, 用长退避等堆恢复。
 std::atomic<bool> s_last_fail_lowmem{false};
@@ -1312,6 +1316,11 @@ bool stream_station(std::size_t station, uint32_t generation) {
                             }
                         }
                         pcm_samples += mono_bytes / 2;
+                        if (s_audio_yield.load(std::memory_order_acquire)) {
+                            // 提示音占用音频设备: 这段时间不写 I2S。
+                            vTaskDelay(pdMS_TO_TICKS(5));
+                            continue;
+                        }
                         if (bsp_audio_write(frame.buffer, mono_bytes) != ESP_OK) continue;
                         last_write_end = esp_timer_get_time();
                         if (last_write_end - stats_start >= 10000000) {
@@ -1752,9 +1761,21 @@ void radio_player_set_station(std::size_t index) {
     index %= radio_player_station_count();
     s_station_index.store(index, std::memory_order_release);
     s_generation.fetch_add(1, std::memory_order_acq_rel);
-    save_setting("station", static_cast<uint8_t>(index));
     const RadioStation chosen = radio_player_station(index);
-    save_station_name(chosen.name);
+    // 切台时把"索引 + 名字"合并成一次 NVS 事务。
+    // 原来是 save_setting() 与 save_station_name() 各开一次 NVS 句柄并 commit,
+    // 每次切台等于两轮 flash 擦写, 会阻塞几十~上百毫秒并驱逐 NVS 页缓存 ——
+    // 用户感知就是"切台要卡很久"。
+    {
+        nvs_handle_t handle;
+        if (nvs_open("radio", NVS_READWRITE, &handle) == ESP_OK) {
+            nvs_set_u8(handle, "station", static_cast<uint8_t>(index));
+            if (chosen.name[0]) nvs_set_str(handle, "station_name", chosen.name);
+            else nvs_erase_key(handle, "station_name");
+            nvs_commit(handle);
+            nvs_close(handle);
+        }
+    }
     radio_ui_set_station(index, radio_player_station_count(), radio_player_station(index));
     if (radio_player_is_playing()) {
         radio_ui_set_playback(RadioPlaybackState::Connecting, "正在切换电台");
@@ -1894,6 +1915,13 @@ uint8_t radio_player_volume() {
 }
 
 // ---- C-linkage bridge for xiaozhi_client.c ----
+extern "C" void radio_audio_yield(bool yield) {
+    s_audio_yield.store(yield, std::memory_order_release);
+}
+extern "C" bool radio_audio_yielded(void) {
+    return s_audio_yield.load(std::memory_order_acquire);
+}
+
 extern "C" void radio_pause_for_xiaozhi(void) {
     radio_player_set_playing(false);
     radio_player_wait_idle(2000);

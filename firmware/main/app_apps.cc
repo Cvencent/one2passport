@@ -30,6 +30,59 @@ extern "C" {
 #include "esp_log.h"
 extern "C" void xz_heap_report(const char *tag);
 
+// ---------------------------------------------------------------------------
+// 字体兜底: 云端(小智 STT/TTS)返回的文本里可能带本机字体没有的字符,
+// 例如全角波浪号 ～(U+FF5E)、部分中日韩标点。缺字形时 LVGL 会画成"口"。
+// 这里在写标签前做一次清洗: 用 lv_font_get_glyph_dsc() 逐字检查,
+// 缺字形时替换成字形相近且有覆盖的等价字符(如 ～ -> ~), 再缺就丢弃,
+// 保证界面不再出现方框。
+// ---------------------------------------------------------------------------
+static void xz_font_safe_copy(const char *src, char *dst, std::size_t dst_size) {
+    if (dst == nullptr || dst_size == 0U) return;
+    if (src == nullptr) { dst[0] = '\0'; return; }
+    const lv_font_t *font = ui_cn_font();
+    std::size_t out = 0U;
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(src);
+    while (*p != 0U && out + 1U < dst_size) {
+        uint32_t cp = 0U;
+        int extra = 0;
+        if (*p < 0x80U) { cp = *p; }
+        else if ((*p & 0xE0U) == 0xC0U) { cp = *p & 0x1FU; extra = 1; }
+        else if ((*p & 0xF0U) == 0xE0U) { cp = *p & 0x0FU; extra = 2; }
+        else if ((*p & 0xF8U) == 0xF0U) { cp = *p & 0x07U; extra = 3; }
+        else { ++p; continue; }
+        bool valid = true;
+        for (int i = 1; i <= extra; ++i) {
+            if ((p[i] & 0xC0U) != 0x80U) { valid = false; break; }
+            cp = (cp << 6) | (p[i] & 0x3FU);
+        }
+        if (!valid) { ++p; continue; }
+        const unsigned char *next = p + 1 + extra;
+        lv_font_glyph_dsc_t dsc = {};
+        if (lv_font_get_glyph_dsc(font, &dsc, cp, 0U)) {
+            for (int i = 0; i < 1 + extra && out + 1U < dst_size; ++i) dst[out++] = (char)p[i];
+        } else {
+            // 字形缺失: 尽量换成 ASCII 等价物, 否则直接丢弃
+            const char *alt = nullptr;
+            switch (cp) {
+                case 0xFF5E: case 0x301C: case 0x223C: alt = "~"; break;
+                case 0xFF0F: alt = "/"; break;
+                case 0xFF3C: alt = "\\"; break;
+                case 0x2018: case 0x2019: alt = "'"; break;
+                case 0x201C: case 0x201D: alt = "\""; break;
+                case 0x2014: case 0x2015: alt = "-"; break;
+                case 0x00B7: alt = "."; break;
+                default: alt = nullptr; break;
+            }
+            if (alt != nullptr) {
+                for (const char *q = alt; *q != '\0' && out + 1U < dst_size; ++q) dst[out++] = *q;
+            }
+        }
+        p = next;
+    }
+    dst[out] = '\0';
+}
+
 // ---- main.cc 提供的桥(C 链接) ----
 extern "C" void app_radio_request_catalog(void);
 extern "C" void app_radio_request_city(const char *city, const char *display);
@@ -39,7 +92,6 @@ extern "C" void app_wifi_xiaozhi_mode(bool active);
 
 static const char *kTag = "app_apps";
 static bool s_settings_open;
-static bool s_bluetooth_placeholder;
 static void settings_open_menu(void);
 bool settings_app_enter(void);
 void settings_app_key(bsp_btn_t btn, bsp_btn_ev_t ev);
@@ -316,8 +368,10 @@ static void xz_evt_timer_cb(lv_timer_t *) {
         // 全部被忽略 —— 表现就是"卡住后再按 OK 完全没用"。
         xiaozhi_client_abort_turn();
         char buf[400];
-        snprintf(buf, sizeof(buf), "问: %s\n答: (无响应, 请重试)",
-                 xiaozhi_client_stt()[0] ? xiaozhi_client_stt() : "(未识别)");
+        char safe[160];
+        xz_font_safe_copy(xiaozhi_client_stt()[0] ? xiaozhi_client_stt() : "(未识别)",
+                          safe, sizeof(safe));
+        snprintf(buf, sizeof(buf), "问: %s\n答: (无响应, 请重试)", safe);
         if (xz_msg) lv_label_set_text(xz_msg, buf);
         xz_apply_state(8);
     }
@@ -360,7 +414,9 @@ static void xz_evt_timer_cb(lv_timer_t *) {
             }
         } else if (ev == XZ_EV_STT) {
             char buf[400];
-            snprintf(buf, sizeof(buf), "问: %s\n答: (思考中)", xiaozhi_client_stt());
+            char safe[160];
+            xz_font_safe_copy(xiaozhi_client_stt(), safe, sizeof(safe));
+            snprintf(buf, sizeof(buf), "问: %s\n答: (思考中)", safe);
             if (xz_msg) lv_label_set_text(xz_msg, buf);
             xz_apply_state(2);
             // 云端已经认可这一轮了(它靠自己的 VAD 判定"说完了")。
@@ -376,8 +432,11 @@ static void xz_evt_timer_cb(lv_timer_t *) {
             xz_turn_answered = true;
         } else if (ev == XZ_EV_TTS_START) {
             char buf[400];
-            snprintf(buf, sizeof(buf), "问: %s\n答: %s",
-                     xiaozhi_client_stt(), xiaozhi_client_tts());
+            char safe_q[150];
+            char safe_a[150];
+            xz_font_safe_copy(xiaozhi_client_stt(), safe_q, sizeof(safe_q));
+            xz_font_safe_copy(xiaozhi_client_tts(), safe_a, sizeof(safe_a));
+            snprintf(buf, sizeof(buf), "问: %s\n答: %s", safe_q, safe_a);
             if (xz_msg) lv_label_set_text(xz_msg, buf);
             xz_apply_state(3);
             // 云端已经回答, 这一轮结束了。
@@ -673,7 +732,7 @@ void settings_app_exit(void) {
 }
 // ---- 设置应用: 完整子页导航 ----
 // 页面模型与 radio_ui 的 RadioSettingsPage 一一对应:
-//   Menu(音量/城市电台/定时播放/屏幕设置/网络设置/蓝牙/返回)
+//   Menu(音量/城市电台/定时播放/屏幕设置/网络设置/返回)
 //   Volume(上下调节,OK返回) City(8行,OK选择) SleepTimer(OK开始定时)
 //   Display(OK切换) WifiMenu(连接新网络/已存网络/返回)
 // 长按UP = 返回上一级(框架统一回菜单, 这里处理子页间回退)。
@@ -743,17 +802,11 @@ void start_sleep_timer() {
 
 static void settings_open_menu(void) {
     s_settings_open = true;
-    s_bluetooth_placeholder = false;
     show(RadioSettingsPage::Menu, 0);
 }
 
 bool settings_app_back(void) {
     if (!s_settings_open) return false;
-    if (s_bluetooth_placeholder) {
-        s_bluetooth_placeholder = false;
-        show(RadioSettingsPage::Menu, 5);
-        return true;
-    }
     switch (s_page) {
         case RadioSettingsPage::SavedWifi: show(RadioSettingsPage::WifiMenu, 1); break;
         case RadioSettingsPage::WifiAction: show(RadioSettingsPage::SavedWifi, s_saved_network_index); break;
@@ -773,11 +826,6 @@ bool settings_app_back(void) {
 }
 
 void settings_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
-    if (s_bluetooth_placeholder) {
-        if ((btn == BSP_BTN_OK && ev == BSP_BTN_CLICK) ||
-            (btn == BSP_BTN_UP && ev == BSP_BTN_LONG)) settings_app_back();
-        return;
-    }
     const std::size_t rows = page_rows(s_page);
     if (ev == BSP_BTN_LONG &&
         (btn == BSP_BTN_UP || (btn == BSP_BTN_OK &&
@@ -829,11 +877,8 @@ void settings_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
                 case 2: show(RadioSettingsPage::SleepTimer, 0); break;
                 case 3: show(RadioSettingsPage::Display, 0); break;
                 case 4: show(RadioSettingsPage::WifiMenu, 0); break;
+                // 蓝牙占位项已从菜单移除(本机无蓝牙硬件), 索引整体前移一格。
                 case 5:
-                    s_bluetooth_placeholder = true;
-                    radio_ui_show_easter_egg("暂无蓝牙功能\n长按上键返回");
-                    break;
-                case 6:
                     if (!settings_app_back()) app_framework_go_menu();
                     break;
             }

@@ -295,7 +295,11 @@ lv_obj_t *make_box(lv_obj_t *parent, int x, int y, int width, int height,
 }
 
 lv_obj_t *make_label(lv_obj_t *parent, const char *text, int x, int y, int width,
-                     uint32_t color, const lv_font_t *font = &radio_font) {
+                     uint32_t color, const lv_font_t *font = nullptr) {
+    // 默认字体改成全量中文字体。radio_font 是**白名单**字体(约 450 字),
+    // 城市名(番禺/嘉陵/北碚…)、提示语("翻页"…)只要不在名单里就渲染成"口"。
+    // lv_font_cn_16 覆盖 GB2312 全集, 已在固件内, 不增加体积。
+    if (font == nullptr) font = ui_cn_font();
     lv_obj_t *object = lv_label_create(parent);
     lv_label_set_text(object, text);
     lv_obj_set_pos(object, x, y);
@@ -631,7 +635,7 @@ void build_config(const char *ssid, const char *url) {
     std::memset(s_meter_height, 0, sizeof(s_meter_height));
     std::memset(s_meter_color, 0, sizeof(s_meter_color));
 
-    make_label(s_screen, "联网收音机", 12, 12, 216, kText, &radio_font);
+    make_label(s_screen, "联网收音机", 12, 12, 216, kText, ui_cn_font());
     lv_obj_t *tag = make_label(s_screen, "首次配网", 12, 45, 216, kAmber);
     set_centered(tag);
     s_pair_dot = make_box(s_screen, 112, 77, 16, 16, kRed, LV_RADIUS_CIRCLE);
@@ -733,7 +737,7 @@ void build_settings(RadioSettingsPage page, std::size_t selected, uint8_t volume
 
     if (page == RadioSettingsPage::Volume) {
         lv_obj_t *title = make_label(s_screen, "音量", 12, 16, 216, kText,
-                                     &radio_font);
+                                     ui_cn_font());
         set_centered(title);
         s_volume_value = make_label(s_screen, "55%", 12, 84, 216, kAmber,
                                     &lv_font_montserrat_20);
@@ -754,7 +758,8 @@ void build_settings(RadioSettingsPage page, std::size_t selected, uint8_t volume
     }
 
     static constexpr const char *kMenuItems[] = {
-        "音量", "城市电台", "定时播放", "屏幕设置", "网络设置", "蓝牙", "返回",
+        // NOTE: 本机硬件没有蓝牙, 菜单不再列出"蓝牙"占位项。
+        "音量", "城市电台", "定时播放", "屏幕设置", "网络设置", "返回",
     };
     static constexpr const char *kSleepTimerItems[] = {
         "无定时", "15 分钟", "30 分钟", "60 分钟", "90 分钟", "返回",
@@ -848,7 +853,7 @@ void build_settings(RadioSettingsPage page, std::size_t selected, uint8_t volume
     }
 
     lv_obj_t *title = make_label(s_screen, title_text, 12, 13, 216, kText,
-                                 &radio_font);
+                                 ui_cn_font());
     set_centered(title);
     for (std::size_t i = 0; i < render_count; ++i) {
         const int y = first_y + static_cast<int>(i) * row_gap;
@@ -880,7 +885,7 @@ void build_saved_wifi(const char *const *ssids, std::size_t count,
     selected = std::min(selected, total - 1);
 
     lv_obj_t *title = make_label(s_screen, "已存网络", 12, 12, 216, kText,
-                                 &radio_font);
+                                 ui_cn_font());
     set_centered(title);
     lv_obj_t *state = make_label(s_screen,
                                  count ? "上下选择  确定设置" : "无保存网络",
@@ -901,7 +906,7 @@ void build_saved_wifi(const char *const *ssids, std::size_t count,
         const char *text = index < count ? ssids[index] : "返回";
         s_settings_labels[row] = make_label(
             s_settings_rows[row], text, 8, 6, 188, active ? kText : kMuted,
-            index < count ? ssid_font(text) : &radio_font);
+            index < count ? ssid_font(text) : ui_cn_font());
         set_centered(s_settings_labels[row]);
     }
     lv_obj_t *hint = make_label(s_screen, "长按确定返回", 12, 286, 216, kMuted);
@@ -914,7 +919,7 @@ void build_wifi_action(const char *ssid, std::size_t selected) {
     s_settings_selected = selected % 3;
     s_settings_row_count = 3;
     lv_obj_t *title = make_label(s_screen, "网络设置", 12, 13, 216, kText,
-                                 &radio_font);
+                                 ui_cn_font());
     set_centered(title);
     lv_obj_t *network = make_label(s_screen, ssid ? ssid : "WIFI", 12, 45, 216,
                                    kAmber, ssid_font(ssid));
@@ -938,7 +943,7 @@ void build_wifi_delete_confirm(const char *ssid, std::size_t selected) {
     s_settings_selected = selected % 2;
     s_settings_row_count = 2;
     lv_obj_t *title = make_label(s_screen, "确认删除", 12, 18, 216, kText,
-                                 &radio_font);
+                                 ui_cn_font());
     set_centered(title);
     lv_obj_t *network = make_label(s_screen, ssid ? ssid : "WIFI", 12, 55, 216,
                                    kAmber, ssid_font(ssid));
@@ -960,7 +965,7 @@ void build_wifi_delete_confirm(const char *ssid, std::size_t selected) {
 void build_easter_egg(const char *message) {
     reset_transient_objects(Page::EasterEgg);
     lv_obj_t *title = make_label(s_screen, "蓝牙", 12, 12, 216, kAmber,
-                                 &radio_font);
+                                 ui_cn_font());
     set_centered(title);
     s_easter_message = make_label(s_screen, message ? message : "正在加载彩蛋",
                                   12, 146, 216, kText);
@@ -1020,7 +1025,7 @@ void build_wifi_list(const WifiNetworkView *networks, std::size_t count,
     reset_transient_objects(Page::WifiList);
     // The compact UI font contains the complete setup vocabulary. The larger
     // station-title font intentionally contains only station-name glyphs.
-    make_label(s_screen, "选择无线网络", 12, 12, 216, kText, &radio_font);
+    make_label(s_screen, "选择无线网络", 12, 12, 216, kText, ui_cn_font());
     s_wifi_state = make_label(s_screen, "", 12, 42, 216, kMuted);
     set_centered(s_wifi_state);
 
@@ -1085,7 +1090,7 @@ void build_wifi_keyboard(const char *ssid, std::size_t password_length,
                          WifiKeyboardPage page, std::size_t selected,
                          const char *status) {
     reset_transient_objects(Page::WifiKeyboard);
-    make_label(s_screen, "网络设置", 12, 10, 216, kText, &radio_font);
+    make_label(s_screen, "网络设置", 12, 10, 216, kText, ui_cn_font());
     s_wifi_keyboard_network = make_label(s_screen, "", 12, 39, 216, kAmber,
                                           &lv_font_montserrat_14);
     set_centered(s_wifi_keyboard_network);
@@ -1124,7 +1129,7 @@ void build_wifi_keyboard(const char *ssid, std::size_t password_length,
 void build_wifi_connecting(const char *ssid, const char *detail) {
     reset_transient_objects(Page::WifiConnecting);
     make_label(s_screen, "正在连接无线网络", 12, 37, 216, kText,
-               &radio_font);
+               ui_cn_font());
     lv_obj_t *network = make_label(s_screen, ssid ? ssid : "WIFI", 12, 102, 216,
                                    kAmber, ssid_font(ssid));
     set_centered(network);

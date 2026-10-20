@@ -151,7 +151,12 @@ static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, uint32_t colo
 static const lv_font_t *font_for_size(int size_px) {
     if (size_px >= 24) return &radio_font_big;
     if (size_px >= 18) return &radio_font_title;
-    return &radio_font;
+    // ⚠ 这里曾经返回 &radio_font —— 那是按**白名单**生成的约 450 字字体,
+    // 首页/菜单上任何不在名单里的汉字都会显示成"口"(用户反馈"好多口口")。
+    // lv_font_cn_16 覆盖 GB2312 全集且已在固件内, 换成它彻底消除方框。
+    // 18/24px 两档仍用专用字体: 它们只渲染固定的时间/日期字符, 白名单够用,
+    // 且需要更大的字号。
+    return ui_cn_font();
 }
 
 static lv_obj_t *label(lv_obj_t *parent, const char *text, int size_px, uint32_t color) {

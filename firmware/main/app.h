@@ -71,6 +71,8 @@ void app_coding_catalog_begin(const char *scope);
 void app_coding_catalog_item(const char *scope, const char *id,
                              const char *title, const char *detail);
 void app_coding_catalog_end(const char *scope);
+// 取消/失败时离开列表加载态, 避免卡在"加载中"。
+void app_coding_catalog_abort(const char *message);
 // 选中会话。last_message 为该会话**最后一段**助手文本(可为 NULL);
 // 只显示这一段, 不加载整段对话 —— 设备内存有限, 全量传入会卡。
 void app_coding_task_selected(const char *title, const char *project,

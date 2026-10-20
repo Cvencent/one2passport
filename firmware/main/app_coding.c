@@ -1176,6 +1176,23 @@ void app_coding_catalog_end(const char *scope)
     coding_render_deferred();
 }
 
+/* Leave the project/thread picker on an error instead of a permanent loading
+ * screen. A create/select request whose reply never arrives must not strand the
+ * device: clear the catalog state machine and show why. */
+void app_coding_catalog_abort(const char *message)
+{
+    coding_bridge_cancel_catalog();
+    s_selecting_thread = false;
+    s_discard_selection_updates = false;
+    s_catalog_mode = CATALOG_NONE;
+    s_catalog_count = 0;
+    s_catalog_selected = 0;
+    s_catalog_window_start = 0;
+    coding_flow_set_error(&s_flow,
+                          message != NULL ? message : "操作没有完成，请重试");
+    coding_render_deferred();
+}
+
 void app_coding_task_selected(const char *title, const char *project,
                               const char *last_message)
 {

@@ -50,5 +50,30 @@ int main(void)
     assert(codex_background_mark_read(&fresh, "result:first"));
     assert(fresh.done == 0U);
 
+    /* The CBDP layer must drive one convergence helper for every state-bearing
+     * notification, so the home pet/badge and the background completion alert
+     * work even while the full Codex page is closed. */
+    codex_background_state_t routed = {0};
+    assert(codex_background_apply_notice(&routed, "state", NULL, NULL, 2U));
+    assert(routed.running == 2U);
+    assert(routed.connected);
+    assert(codex_background_pet_state(&routed) == CODEX_BACKGROUND_BUSY);
+    assert(codex_background_apply_notice(&routed, "state", NULL, NULL, 0U));
+    assert(routed.running == 0U);
+    assert(codex_background_apply_notice(&routed, "result", "evt:1", "completed", 0U));
+    assert(routed.done == 1U);
+    assert(codex_background_pet_state(&routed) == CODEX_BACKGROUND_DONE);
+    /* A replay of the same immutable result must not double count or re-alert. */
+    assert(!codex_background_apply_notice(&routed, "result", "evt:1", "completed", 0U));
+    assert(routed.done == 1U);
+    assert(codex_background_apply_notice(&routed, "result", "evt:2", "failed", 0U));
+    assert(routed.failed == 1U);
+    assert(codex_background_pet_state(&routed) == CODEX_BACKGROUND_FAIL);
+    /* A notice without an identity cannot be tracked; it must be rejected
+     * rather than silently inflating the unread badge. */
+    assert(!codex_background_apply_notice(&routed, "result", "", "completed", 0U));
+    assert(routed.done == 1U);
+    assert(!codex_background_apply_notice(&routed, "unknown", NULL, NULL, 0U));
+
     return 0;
 }

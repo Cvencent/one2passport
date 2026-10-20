@@ -101,13 +101,25 @@ static inline void codex_background_apply(
     uint32_t running
 )
 {
-    (void)status;
     if (state == NULL) return;
     state->connected = true;
-    if (kind != NULL && strcmp(kind, "status") == 0) {
-        state->running = running;
+    if (kind == NULL ||
+        (strcmp(kind, "status") != 0 && strcmp(kind, "task") != 0)) {
+        return;
     }
-    if (kind != NULL && strcmp(kind, "task") == 0) {
+    // A single status/task record carries its own status word, not an
+    // aggregate tally. Trust the word first: "working" means at least one turn
+    // is live, and a terminal/idle word clears the count. Only fall back to the
+    // caller-supplied running value when the status is unknown, so a legacy
+    // caller that supplies an explicit count keeps working.
+    if (status != NULL && strcmp(status, "working") == 0) {
+        state->running = running > 0U ? running : 1U;
+    } else if (status != NULL &&
+               (strcmp(status, "idle") == 0 || strcmp(status, "completed") == 0 ||
+                strcmp(status, "failed") == 0 || strcmp(status, "interrupted") == 0 ||
+                strcmp(status, "done") == 0)) {
+        state->running = 0U;
+    } else {
         state->running = running;
     }
 }
@@ -137,6 +149,49 @@ static inline bool codex_background_apply_result(
                                       CODEX_BACKGROUND_RESULT_DONE_UNREAD);
     }
     return true;
+}
+
+/* Single convergence entry point for every state-bearing notification the
+ * CBDP layer receives. Keeping the dispatch in one place means the home pet,
+ * the home badge counters and the background completion alert all update from
+ * the same rules no matter which transport or event carried the update, and a
+ * replayed immutable event stays idempotent.
+ *
+ * kind:
+ *   "state"  -- aggregate counters (running/done/failed) carried by one notice
+ *   "task"   -- a single task record's live status
+ *   "status" -- a live status record
+ *   "result" -- an immutable terminal record, deduplicated by event identity
+ *
+ * message_id is required for "result" (it is the dedup key); running is only
+ * consulted for "state" / "task" / "status".
+ * Returns true when the notice changed or newly recorded state. */
+static inline bool codex_background_apply_notice(
+    codex_background_state_t *state,
+    const char *kind,
+    const char *message_id,
+    const char *status,
+    uint32_t running
+)
+{
+    if (state == NULL || kind == NULL) return false;
+    if (strcmp(kind, "result") == 0) {
+        return codex_background_apply_result(state, message_id, status);
+    }
+    if (strcmp(kind, "state") == 0) {
+        // Aggregate tally: the notice already carries the authoritative count,
+        // so record it verbatim.
+        const bool changed = !state->connected || state->running != running;
+        state->connected = true;
+        state->running = running;
+        return changed;
+    }
+    if (strcmp(kind, "task") == 0 || strcmp(kind, "status") == 0) {
+        const bool changed = !state->connected || state->running != running;
+        codex_background_apply(state, kind, status, running);
+        return changed;
+    }
+    return false;
 }
 
 /* Clears the local unread badge for one result. The host sends read_state to

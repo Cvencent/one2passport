@@ -1448,23 +1448,105 @@ static void wireless_handle_result(const cbdp_frame_header_t *header,
         s_last_message_us = esp_timer_get_time();
         return;
     }
+    // 19.4: an AUDIO_* transaction is answered with RESULT(method=AUDIO_BEGIN)
+    // carrying the transcript. The device previously handled only the legacy
+    // JSON "transcript" message, so a CBDP recording ended on a vague error and
+    // the user never reached the confirm screen.
+    if (method_id == 0x0013U && state <= 1U) {
+        char transcript[CODING_TRANSCRIPT_MAX] = {0};
+        if (!copy_utf8_field(tlv, tlv_len, CBDP_TLV_TRANSCRIPT,
+                             transcript, sizeof(transcript))) {
+            copy_utf8_field(result_tlv, result_len, CBDP_TLV_TRANSCRIPT,
+                            transcript, sizeof(transcript));
+        }
+        if (transcript[0] != '\0' && coding_bridge_foreground_ui_active() &&
+            bsp_lvgl_lock(500)) {
+            app_coding_bridge_transcript(transcript);
+            bsp_lvgl_unlock();
+        } else {
+            ESP_LOGW(TAG, "audio result without transcript");
+            if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+                app_coding_bridge_error("没有识别到语音，请重试");
+                bsp_lvgl_unlock();
+            }
+        }
+        s_last_message_us = esp_timer_get_time();
+        return;
+    }
+
     if (method_id == CBDP_METHOD_TURN_START || method_id == CBDP_METHOD_TURN_STEER ||
         method_id == CBDP_METHOD_THREAD_START) {
         uint32_t thread_ref = 0U;
         uint32_t turn_ref = 0U;
-        cbdp_tlv_read_u32(cbdp_tlv_find(result_tlv, result_len, CBDP_TLV_THREAD_REF),
-                          &thread_ref);
-        cbdp_tlv_read_u32(cbdp_tlv_find(result_tlv, result_len, CBDP_TLV_TURN_REF),
-                          &turn_ref);
+        uint32_t topic_id = 0U;
+        char thread_id[CODEX_BRIDGE_ID_MAX] = {0};
+        // RESULT fields live in the frame header (the gateway's _result()
+        // writes them top-level); some hosts additionally nest them under
+        // TAG_RESULT. Read the header first and fall back to the nested block
+        // so both wire shapes are accepted.
+        if (!cbdp_tlv_read_u32(cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_THREAD_REF),
+                               &thread_ref)) {
+            cbdp_tlv_read_u32(cbdp_tlv_find(result_tlv, result_len, CBDP_TLV_THREAD_REF),
+                              &thread_ref);
+        }
+        if (!cbdp_tlv_read_u32(cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_TURN_REF),
+                               &turn_ref)) {
+            cbdp_tlv_read_u32(cbdp_tlv_find(result_tlv, result_len, CBDP_TLV_TURN_REF),
+                              &turn_ref);
+        }
+        if (!cbdp_tlv_read_u32(cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_TOPIC_ID),
+                               &topic_id)) {
+            cbdp_tlv_read_u32(cbdp_tlv_find(result_tlv, result_len, CBDP_TLV_TOPIC_ID),
+                              &topic_id);
+        }
+        if (!copy_utf8_field(tlv, tlv_len, CBDP_TLV_THREAD_ID,
+                             thread_id, sizeof(thread_id))) {
+            copy_utf8_field(result_tlv, result_len, CBDP_TLV_THREAD_ID,
+                            thread_id, sizeof(thread_id));
+        }
+        if (thread_ref == 0U && thread_id[0] == '\0') {
+            // A thread.start reply that selects nothing would strand the picker
+            // on its loading screen forever. Surface a real error instead of a
+            // silent dead end, and drop out of the catalog state machine.
+            ESP_LOGW(TAG, "thread.start returned no thread selector");
+            coding_bridge_cancel_catalog();
+            if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+                app_coding_catalog_abort(NULL);
+                bsp_lvgl_unlock();
+            }
+            s_last_message_us = esp_timer_get_time();
+            return;
+        }
         if (thread_ref != 0U) {
             s_active_thread_ref = thread_ref;
             snprintf(s_active_thread_id, sizeof(s_active_thread_id), "%lu",
                      (unsigned long)thread_ref);
+        } else {
+            s_active_thread_ref = 0U;
+            snprintf(s_active_thread_id, sizeof(s_active_thread_id), "%s", thread_id);
         }
         if (turn_ref != 0U) {
             s_active_turn_ref = turn_ref;
             snprintf(s_active_turn_id, sizeof(s_active_turn_id), "%lu",
                      (unsigned long)turn_ref);
+        }
+        if (topic_id != 0U) {
+            wireless_bind_thread(s_active_thread_ref, topic_id);
+        }
+        // thread.start answers with the new thread selector but not its topic,
+        // so reuse the exact thread.read path that normal selection uses: it
+        // returns the thread object (with topic_id) plus the last message, which
+        // lands the picker on the new task instead of leaving it loading.
+        if (method_id == CBDP_METHOD_THREAD_START && thread_ref != 0U) {
+            uint8_t read_params[64];
+            size_t read_length = 0U;
+            if (cbdp_tlv_write_u32(read_params, sizeof(read_params), &read_length,
+                                   CBDP_TLV_THREAD_REF, thread_ref) &&
+                cbdp_tlv_write_u16(read_params, sizeof(read_params), &read_length,
+                                   CBDP_TLV_HISTORY_DEPTH, 2U)) {
+                wireless_build_and_send_command(CBDP_METHOD_THREAD_READ,
+                                                read_params, read_length);
+            }
         }
     } else if (method_id == CBDP_METHOD_TURN_INTERRUPT && state <= 1U) {
         clear_active_turn();
@@ -1603,10 +1685,40 @@ static void wireless_handle_delta(const cbdp_frame_header_t *header,
                 clear_active_turn();
             }
         }
+        // Terminal turn events drive the home pet/badge and the completion
+        // alert even while the full Codex page is closed. Previously this ran
+        // only for the foreground UI, so a task finishing in the background
+        // produced no sound and never lit the home indicator.
+        const bool failed = event.event_type == CBDP_EVENT_TURN_FAILED;
+        const char *result_kind = failed ? "failed" : "completed";
+        char identity[CODEX_BRIDGE_ID_MAX + 16] = {0};
+        if (turn_id[0] != '\0') {
+            snprintf(identity, sizeof(identity), "turn:%s", turn_id);
+        } else if (thread_id[0] != '\0') {
+            snprintf(identity, sizeof(identity), "thread:%s", thread_id);
+        } else {
+            snprintf(identity, sizeof(identity), "seq:%lu",
+                     (unsigned long)event.global_seq);
+        }
+        if (codex_background_apply_notice(&s_background_state, "result",
+                                          identity, result_kind, 0U)) {
+            home_codex_state_changed();
+            // Alert only for a newly delivered result, not for a replay, and
+            // honour the user's notification mode exactly like the in-page
+            // path does (speech / tone / silent).
+            const app_voice_mode_t voice = app_settings_voice_mode();
+            if (failed) {
+                ui_sfx_play(UI_SFX_FAIL);
+            } else if (voice == APP_VOICE_SPEECH) {
+                ui_sfx_play(UI_SFX_DONE_SPEECH);
+            } else if (voice == APP_VOICE_TONE) {
+                ui_sfx_play(UI_SFX_CONFIRM);
+            }
+        }
         if (body[0] != '\0' && ui_budget_available() &&
             coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
             app_coding_result_identity(thread_id, turn_id);
-            if (event.event_type == CBDP_EVENT_TURN_FAILED) {
+            if (failed) {
                 app_coding_bridge_error(body);
             } else {
                 app_coding_bridge_done(body);

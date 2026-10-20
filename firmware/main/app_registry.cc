@@ -86,8 +86,13 @@ static lv_obj_t *s_home_date;
 static lv_obj_t *s_home_np_card;    // 正在播放卡
 static lv_obj_t *s_home_np_name;
 static lv_obj_t *s_home_batt;
-static lv_obj_t *s_home_codex;
-static char s_home_codex_last[64] = "\x01";
+// Codex 计数徽标: 宠物右侧的"进行中 / 已完成 / 失败"。
+// 用色块 + 数字表达, 不再用一整行文字(原先那行会被下方播放卡压住, 且
+// 240px 宽下三组中文既挤又挡)。索引 0=进行中 1=已完成 2=失败。
+static lv_obj_t *s_home_badge[3];
+static lv_obj_t *s_home_badge_dot[3];
+static lv_obj_t *s_home_badge_num[3];
+static int32_t s_home_badge_last[3] = {-1, -1, -1};
 // 顶栏信号格: 首页/菜单共用一组(单页面驻留, 同一时刻只有一棵树 + 一个 s_home_batt)
 static lv_obj_t *s_home_sig[4];
 static lv_timer_t *s_home_tick;
@@ -188,7 +193,9 @@ static lv_obj_t *pet_build(lv_obj_t *parent, int x, int y) {
     box(pet, 6, 38, 9, 5, 0x4FCE9A);
     box(pet, 57, 38, 9, 5, 0x4FCE9A);
 
-    s_home_deco = box(parent, x + 78, y + 4, 36, 24, C_BG);
+    // 状态装饰(\"z Z\" / \"*\" / \"!\" / \"x\")放到**宠物左侧**: 右侧已让给
+    // Codex 计数徽标, 原来在 x+78 会与徽标重叠。
+    s_home_deco = box(parent, x - 40, y + 10, 36, 24, C_BG);
     lv_obj_set_style_bg_opa(s_home_deco, LV_OPA_TRANSP, 0);
     return pet;
 }
@@ -214,6 +221,21 @@ static void pet_apply_codex_state(codex_state_t st) {
         lv_obj_t *d = label(s_home_deco, deco_txt, 10, deco_fg);
         lv_obj_center(d);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Codex 计数徽标: 宠物右侧竖排三枚"色点 + 数字"。
+// 顺序固定为 进行中 / 已完成 / 失败, 靠颜色区分(黄绿 / 亮绿 / 红)。
+// 计数为 0 的徽标整体隐藏, 所以空闲时右侧是干净的。
+// ---------------------------------------------------------------------------
+static void codex_badge_build(lv_obj_t *parent, int index, int y, uint32_t color) {
+    s_home_badge[index] = box(parent, 166, y, 64, 20, C_BG);
+    lv_obj_set_style_bg_opa(s_home_badge[index], LV_OPA_TRANSP, 0);
+    s_home_badge_dot[index] = box(s_home_badge[index], 0, 7, 6, 6, color);
+    lv_obj_set_style_radius(s_home_badge_dot[index], LV_RADIUS_CIRCLE, 0);
+    s_home_badge_num[index] = label(s_home_badge[index], "0", 16, color);
+    lv_obj_set_pos(s_home_badge_num[index], 12, 0);
+    lv_obj_add_flag(s_home_badge[index], LV_OBJ_FLAG_HIDDEN);
 }
 
 // ---------------------------------------------------------------------------
@@ -317,32 +339,33 @@ static void home_eq_tick(lv_timer_t *timer) {
     lv_obj_invalidate(s_home_np_card);
 }
 
-// Render the Codex badge line from the shared unread counts. Layout is 240px
-// wide; short Chinese labels keep it comfortably within one line.
+// 把聚合计数写进宠物右侧的三个徽标。数字为 0 时隐藏该徽标, 避免首页出现
+// 一串 0。只在数字变化时改文案, 不做每秒重绘。
 static void refresh_home_codex(void) {
-    if (!s_home_codex) return;
-    const uint32_t running = s_home_codex_running;
-    const uint32_t done = s_home_codex_done;
-    const uint32_t failed = s_home_codex_failed;
-    char text[64];
-    if (running == 0 && done == 0 && failed == 0) {
-        text[0] = '\0';
-    } else {
-        snprintf(text, sizeof(text), "运行 %u  完成 %u  失败 %u",
-                 (unsigned)running, (unsigned)done, (unsigned)failed);
+    const uint32_t values[3] = {s_home_codex_running, s_home_codex_done,
+                                s_home_codex_failed};
+    for (int i = 0; i < 3; ++i) {
+        if (s_home_badge_num[i] == nullptr) continue;
+        const int32_t v = (int32_t)values[i];
+        if (v == s_home_badge_last[i]) continue;
+        s_home_badge_last[i] = v;
+        char text[12];
+        snprintf(text, sizeof(text), "%d", (int)v);
+        lv_label_set_text(s_home_badge_num[i], text);
+        // 计数为 0 时整枚徽标隐藏(含圆点与数字)。
+        if (v > 0) lv_obj_remove_flag(s_home_badge[i], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_home_badge[i], LV_OBJ_FLAG_HIDDEN);
     }
-    if (strcmp(text, s_home_codex_last) == 0) return;
-    strcpy(s_home_codex_last, text);
-    lv_label_set_text(s_home_codex, text);
-    lv_obj_set_style_text_color(
-        s_home_codex,
-        lv_color_hex(failed > 0 ? C_DANGER
-                                : (done > 0 ? C_FG
-                                            : (running > 0 ? C_ACCENT : C_MUTED))),
-        0);
 }
 
 // ---------------------------------------------------------------------------
+// 文案去抖缓存。必须与页面生命周期绑定: 首页/菜单切换会销毁并重建标签,
+// 新标签回到占位符("--:--"/"--"), 而缓存里仍是旧值 -> strcmp 相等就直接跳过,
+// 于是标签永远停在占位符。日期只在跨天时变化, 所以一旦命中会整天显示"--"。
+// 归零后下一次 tick 必然写入真实值。
+static char s_last_clock[8] = "";
+static char s_last_date[32] = "";
+
 static void home_tick(lv_timer_t *timer) {
     (void)timer;
     if (!s_home_scr) return;
@@ -360,14 +383,12 @@ static void home_tick(lv_timer_t *timer) {
                  W[local.tm_wday % 7]);
         // 只有文案真的变了才 set_text: LVGL 的 set_text 会无条件失效重绘,
         // 逐秒重画是首页闲置发热的来源之一。
-        static char last_clock[8] = "";
-        static char last_date[32] = "";
-        if (strcmp(last_clock, t) != 0) {
-            strcpy(last_clock, t);
+        if (strcmp(s_last_clock, t) != 0) {
+            strcpy(s_last_clock, t);
             lv_label_set_text(s_home_clock, t);
         }
-        if (strcmp(last_date, d) != 0) {
-            strcpy(last_date, d);
+        if (strcmp(s_last_date, d) != 0) {
+            strcpy(s_last_date, d);
             lv_label_set_text(s_home_date, d);
         }
     }
@@ -399,8 +420,9 @@ static void home_tick(lv_timer_t *timer) {
 }
 
 static void home_build(void) {
-    s_home_codex_last[0] = '\x01';
-    s_home_codex_last[1] = '\0';
+    // 复位去抖缓存: 新标签内容是占位符, 缓存必须同步失效(见 s_last_clock 注释)。
+    s_last_clock[0] = '\0';
+    s_last_date[0] = '\0';
     s_home_scr = box(nullptr, 0, 0, 240, 320, C_BG);
 
     // 顶栏
@@ -430,12 +452,14 @@ static void home_build(void) {
     lv_obj_set_width(s_home_date, 240);
     lv_obj_set_style_text_align(s_home_date, LV_TEXT_ALIGN_CENTER, 0);
 
-    // Codex 待办行: 运行中 + 未读完成/失败。
-    // 只在数字变化时调 lv_label_set_text, 避免逐秒重绘导致发热。
-    s_home_codex = label(s_home_scr, "", 10, C_MUTED);
-    lv_obj_set_pos(s_home_codex, 0, 183);
-    lv_obj_set_width(s_home_codex, 240);
-    lv_obj_set_style_text_align(s_home_codex, LV_TEXT_ALIGN_CENTER, 0);
+    // Codex 计数徽标: 宠物右侧竖排(166..230, 40..112), 与宠物同一视觉带。
+    // 旧实现是一整行 240px 宽的中文, 位于 y=183, 而播放卡从 y=196 开始,
+    // 且该标签实际用 16px 字体, 于是"运行"被卡片压掉一半 —— 用户反馈的
+    // "已完成被框挡住"。改为数字徽标后彻底避开卡片区域。
+    for (int i = 0; i < 3; ++i) s_home_badge_last[i] = -1;
+    codex_badge_build(s_home_scr, 0, 40, C_ACCENT);   // 进行中
+    codex_badge_build(s_home_scr, 1, 66, C_FG);       // 已完成
+    codex_badge_build(s_home_scr, 2, 92, C_DANGER);   // 失败
 
     // 正在播放卡(196..276, 卡片内坐标 0..80)
     s_home_np_card = box(s_home_scr, 12, 196, 216, 80, C_SURFACE);
@@ -567,7 +591,10 @@ static void destroy_home(void) {
     if (s_home_scr) { lv_obj_delete(s_home_scr); s_home_scr = nullptr; }
     s_home_pet = s_home_body = s_home_deco = s_home_clock = s_home_date = nullptr;
     s_home_np_card = s_home_np_name = s_home_batt = nullptr;
-    s_home_codex = nullptr;
+    for (int i = 0; i < 3; ++i) {
+        s_home_badge[i] = s_home_badge_dot[i] = s_home_badge_num[i] = nullptr;
+        s_home_badge_last[i] = -1;
+    }
     for (int i = 0; i < 4; ++i) s_home_sig[i] = nullptr;
 }
 
@@ -763,7 +790,7 @@ void app_home_set_codex_counts(uint32_t running, uint32_t done,
     s_home_codex_running = running;
     s_home_codex_done = done;
     s_home_codex_failed = failed;
-    if (s_level == APP_LEVEL_HOME && s_home_codex) {
+    if (s_level == APP_LEVEL_HOME && s_home_badge_num[0] != nullptr) {
         if (bsp_lvgl_lock(200)) {
             refresh_home_codex();
             bsp_lvgl_unlock();

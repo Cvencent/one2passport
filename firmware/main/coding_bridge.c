@@ -99,6 +99,16 @@ static uint32_t s_thread_scope_seq;
 static uint64_t s_thread_scope_cursor;
 static uint32_t s_thread_ref_for_topic;
 static uint32_t s_summary_scope_seq;
+// summary 订阅的恢复重试。主机的订阅重放会查事件库; 若该查询失败(实测:
+// CodexBridge 的 cbdp-events.sqlite3 索引损坏时 WHERE topic_id=? 直接报
+// "database disk image is malformed"), 主机回 ERROR INTERNAL, 设备原来的
+// 实现只发一次订阅, 于是整场会话都收不到 codex_state, 首页计数永远为空。
+// 这里在"会话已就绪但还没收到过聚合计数"时做有界重试, 订阅成功后立即停止。
+#define SUMMARY_SUB_RETRY_US (15LL * 1000LL * 1000LL)
+#define SUMMARY_SUB_MAX_RETRIES 8U
+static int64_t s_summary_sub_retry_us;
+static uint8_t s_summary_sub_retries;
+static bool s_summary_events_seen;
 static uint32_t s_last_acked_seq;
 #define MAX_SUBSCRIPTIONS 6
 static uint32_t s_sub_topic[MAX_SUBSCRIPTIONS];
@@ -1696,6 +1706,8 @@ static void wireless_handle_delta(const cbdp_frame_header_t *header,
         const uint32_t running = running16;
         const uint32_t done = done16;
         const uint32_t failed = failed16;
+        // 收到聚合计数即视为 summary 订阅已生效, 停掉恢复重试。
+        s_summary_events_seen = true;
         ESP_LOGI(TAG, "codex_state: running=%u done=%u failed=%u",
                  (unsigned)running, (unsigned)done, (unsigned)failed);
         s_background_state.connected = true;
@@ -2028,6 +2040,9 @@ static void process_wireless_frame(const cbdp_frame_header_t *header,
             }
             wireless_reset_subscriptions();
             wireless_subscribe(0x50000003U, CBDP_SCOPE_SUMMARY, 0U);
+            s_summary_sub_retries = 0U;
+            s_summary_events_seen = false;
+            s_summary_sub_retry_us = esp_timer_get_time();
             // 15.4: re-attach the selected thread topic so message events keep
             // flowing across a transport reconnect without another UI action.
             if (s_thread_topic_id != 0U) {
@@ -2073,6 +2088,20 @@ static void bridge_tick(void)
 {
     if (!s_wireless_enabled) return;
     wireless_ack_flush();
+
+    // 会话就绪但迟迟收不到 codex_state: 可能是主机的订阅重放失败(见上方注释)。
+    // 低频、有界地重发一次 summary 订阅; 一旦收到计数就永久停止。
+    if (s_connected && wireless_bridge_session_active() && !s_summary_events_seen &&
+        s_summary_sub_retries < SUMMARY_SUB_MAX_RETRIES &&
+        s_summary_sub_retry_us != 0 &&
+        esp_timer_get_time() - s_summary_sub_retry_us > SUMMARY_SUB_RETRY_US) {
+        ++s_summary_sub_retries;
+        s_summary_sub_retry_us = esp_timer_get_time();
+        ESP_LOGW(TAG, "no codex_state yet; re-subscribing summary (attempt %u/%u)",
+                 (unsigned)s_summary_sub_retries,
+                 (unsigned)SUMMARY_SUB_MAX_RETRIES);
+        wireless_subscribe(0x50000003U, CBDP_SCOPE_SUMMARY, 0U);
+    }
 
     if (s_catalog_pending_request_id != 0U && s_catalog_pending_since_us != 0 &&
         esp_timer_get_time() - s_catalog_pending_since_us >

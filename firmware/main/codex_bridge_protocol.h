@@ -198,6 +198,10 @@ enum {
     CBDP_TLV_REVISION = 0x0036,
     CBDP_TLV_EVENT_TYPE = 0x0037,
     CBDP_TLV_EVENT_PAYLOAD = 0x0038,
+    /* Aggregate counter tags carried inside a CBDP_EVENT_CODEX_STATE payload. */
+    CBDP_TLV_RUNNING_COUNT = 0x00BC,
+    CBDP_TLV_COMPLETED_UNREAD = 0x00BD,
+    CBDP_TLV_FAILED_UNREAD = 0x00BE,
     CBDP_TLV_SNAPSHOT_REVISION = 0x003C,
     CBDP_TLV_PAGE_INDEX = 0x003D,
     CBDP_TLV_PAGE_COUNT = 0x003E,
@@ -340,6 +344,10 @@ enum {
     CBDP_EVENT_APPROVAL_RESOLVED = 0x0402,
     CBDP_EVENT_APPROVAL_EXPIRED = 0x0403,
     CBDP_EVENT_SYSTEM_RESYNC_REQUIRED = 0x0701,
+    /* Aggregate home-screen counters (running/completed_unread/failed_unread)
+     * published by the host on the summary topic. Values live in the event
+     * payload under the tags below. */
+    CBDP_EVENT_CODEX_STATE = 0x0704,
     CBDP_EVENT_ACTIVE_THREAD_CHANGED = 0x0E08,
     CBDP_EVENT_ACTIVE_TURN_CHANGED = 0x0E09,
     CBDP_EVENT_RESUME_REQUIRED = 0x0E0B,

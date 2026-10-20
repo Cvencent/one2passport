@@ -192,3 +192,47 @@ audio stats: wall=10010ms pcm=9960ms read_max=854ms gaps30=0 rebuffers=0 queued=
 
 仍依赖 Bridge 下发聚合计数 `codex_state`（设备端已具备消费逻辑），
 见 `docs/CodexBridge-CBDP-status-push-issue-2026-10-19.md`。
+
+
+## 第四轮修复：首页 Codex 运行状态与运行中数量（2026-10-20 深夜）
+
+用户反馈："首页那个机器人为什么是在睡觉？现在 Codex 明明在运行，应该有运行状态和运行中数量。"
+
+### 根因（设备端）
+
+Bridge 侧其实**一直在推送**聚合计数。真机串口确认：
+
+```
+I  wireless_bridge: CBDP session ready
+I  coding_bridge: SUBSCRIBE topic=0x50000003 scope=0 cursor=0
+I  coding_bridge: codex_state: running=6 done=5 failed=0
+```
+
+但设备端 **没有消费它**：
+
+- Bridge 在 summary 主题上以事件 `0x0704` 推送计数，payload 用
+  `TAG_RUNNING_COUNT=0x00BC / TAG_COMPLETED_UNREAD=0x00BD / TAG_FAILED_UNREAD=0x00BE`。
+- 固件的 `codex_bridge_protocol.h` **没有定义**这个事件号与这三个 tag；
+  `coding_bridge.c` 的事件分发也**没有对应分支**。于是事件到达后被静默丢弃，
+  `s_background_state.running` 永远是 0 →
+  首页机器人停在 `CODEX_BACKGROUND_IDLE`（睡姿 `z Z`）、计数行为空。
+
+（对比：USB 旧 JSON 那条 `codex_state` 分支是存在的，所以只有无线 CBDP 路径失效。）
+
+### 修复
+
+- `codex_bridge_protocol.h`：新增 `CBDP_EVENT_CODEX_STATE = 0x0704` 与三个计数 tag。
+- `coding_bridge.c`：新增该事件分支，读取 running/completed_unread/failed_unread，
+  写入 `s_background_state`，再走 `home_codex_state_changed()` 刷新首页；
+  未读终态计数取"较大值"合并，避免把本机刚收到的结果计数覆盖成 0。
+
+### 真机验证
+
+| 项目 | 结果 | 证据 |
+|---|---|---|
+| 收到运行计数 | 通过 | `codex_state: running=6 done=5 failed=0` |
+| 首页机器人不再睡觉 | 通过 | 截屏：黄色身体 + `*`（BUSY 态，对应 `CODEX_STATE_BUSY`），无 `z Z` |
+| 运行中数量显示 | 通过 | 截屏：`运行 6  完成 5  失败 0` |
+
+> 说明：计数来自 Bridge 的聚合状态（含其它 Codex 会话），所以 `运行 6` 是
+> 电脑端当时的真实在跑任务数，不是设备端自己编的。

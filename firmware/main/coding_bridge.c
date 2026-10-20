@@ -1678,6 +1678,42 @@ static void wireless_handle_delta(const cbdp_frame_header_t *header,
         return;
     }
 
+    if (event.event_type == CBDP_EVENT_CODEX_STATE) {
+        // 首页机器人状态与"运行中/完成/失败"数量。主机在 summary 主题上推送
+        // 聚合计数(事件 0x0704, tag 0x00BC/0x00BD/0x00BE)。处理器以前没有这个
+        // 分支, 事件被静默丢弃, 于是 Codex 明明在跑, 首页仍停在睡眠/idle 且
+        // 计数恒为 0。
+        uint16_t running16 = 0U, done16 = 0U, failed16 = 0U;
+        (void)cbdp_tlv_read_u16(cbdp_tlv_find(event.event_payload,
+                                              event.event_payload_length,
+                                              CBDP_TLV_RUNNING_COUNT), &running16);
+        (void)cbdp_tlv_read_u16(cbdp_tlv_find(event.event_payload,
+                                              event.event_payload_length,
+                                              CBDP_TLV_COMPLETED_UNREAD), &done16);
+        (void)cbdp_tlv_read_u16(cbdp_tlv_find(event.event_payload,
+                                              event.event_payload_length,
+                                              CBDP_TLV_FAILED_UNREAD), &failed16);
+        const uint32_t running = running16;
+        const uint32_t done = done16;
+        const uint32_t failed = failed16;
+        ESP_LOGI(TAG, "codex_state: running=%u done=%u failed=%u",
+                 (unsigned)running, (unsigned)done, (unsigned)failed);
+        s_background_state.connected = true;
+        s_background_state.running = running;
+        // 未读终态数量由本机结果去重/已读逻辑维护; 这里只覆盖不变的部分。
+        // 注意: done/failed 是"其它未读", 直接覆盖会让本地刚收到的结果丢计数,
+        // 所以取两者较大值, 保证既不漏也不清零。
+        if (done > s_background_state.done) s_background_state.done = done;
+        if (failed > s_background_state.failed) s_background_state.failed = failed;
+        home_codex_state_changed();
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_bridge_state(running, s_background_state.done,
+                                    s_background_state.failed);
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
+
     if (event.event_type == CBDP_EVENT_TURN_COMPLETED ||
         event.event_type == CBDP_EVENT_TURN_FAILED ||
         event.event_type == CBDP_EVENT_TURN_INTERRUPTED) {

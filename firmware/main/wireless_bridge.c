@@ -65,6 +65,11 @@ static int64_t s_last_rx_us;
 static int64_t s_last_ping_us;
 static int64_t s_client_connected_us;
 static volatile bool s_task_stop_requested;
+// Cleared when WiFi drops so the next connection announces again.
+static volatile bool s_presence_announced;
+// Radio playback starts right after WiFi; letting it settle first keeps the
+// CBDP buffers from stealing the few KB the HTTP client needs.
+static int64_t s_wifi_connected_us;
 static TaskHandle_t s_task_handle;
 static StaticTask_t s_task_tcb;
 extern uint8_t *xiaozhi_bridge_stack(size_t *size);
@@ -262,6 +267,31 @@ static bool transmit_discovery_reply(int fd, const struct sockaddr_in *source,
                   source_length) == (int)length;
 }
 
+// Announce ourselves on the discovery port right after the socket exists.
+// CodexBridge runs a presence listener that accepts the same reply frame a
+// broadcast gets, and its own comment says the device "carries the low-latency
+// path itself". Without this the PC only finds us on its next broadcast/redial
+// beat (up to ~15s), which is exactly the "enter Codex is slow / shows
+// disconnected" report. Send a few copies so one lost datagram is harmless.
+static void announce_presence(int fd)
+{
+    struct sockaddr_in target = {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(DISCOVERY_PORT);
+    target.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    uint8_t nonce[16];
+    esp_fill_random(nonce, sizeof(nonce));
+    uint8_t frame[256];
+    size_t length = 0U;
+    if (!cbdp_build_discovery_reply(frame, sizeof(frame), &length, nonce)) return;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        (void)sendto(fd, frame, length, 0, (struct sockaddr *)&target,
+                     sizeof(target));
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    ESP_LOGI(TAG, "presence announced on UDP %d", DISCOVERY_PORT);
+}
+
 static void process_client_frame(const uint8_t *frame, size_t length)
 {
     cbdp_frame_header_t header;
@@ -441,6 +471,16 @@ static void network_task(void *argument)
         int ready = select(max_fd + 1, &read_set, NULL, NULL, &timeout);
         if (ready < 0) continue;
 
+        // As soon as WiFi is up, tell the LAN we exist instead of waiting for
+        // the host next broadcast/redial beat. CodexBridge presence listener
+        // accepts this reply frame, so the PC connects in well under a second.
+        if (s_wifi_connected && !s_presence_announced &&
+            s_wifi_connected_us != 0 &&
+            esp_timer_get_time() - s_wifi_connected_us > 8000000LL) {
+            s_presence_announced = true;
+            announce_presence(udp_fd);
+        }
+
         // Section 12 liveness. Handshake stages are bounded by 10s, and a
         // READY session tolerates 3 x heartbeat_seconds without any inbound
         // frame before it is considered dead. PING keeps an idle link warm.
@@ -592,7 +632,9 @@ void wireless_bridge_set_wifi_configure(wireless_bridge_wifi_configure_t configu
 
 void wireless_bridge_set_wifi_state(bool connected, const char *ip)
 {
+    if (connected && !s_wifi_connected) s_wifi_connected_us = esp_timer_get_time();
     s_wifi_connected = connected;
+    if (!connected) s_presence_announced = false;
     strlcpy(s_ip, ip != NULL ? ip : "", sizeof(s_ip));
     if (!connected) client_replace(-1);
     if (s_status_cb != NULL) {

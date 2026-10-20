@@ -98,3 +98,97 @@
 
 最终真机结果：切重庆不再崩溃、搜索任务正常创建并返回重庆电台、退出设置回到菜单、
 重启后仍恢复重庆目录（`Restored cached radio catalog: 14 stations`）。
+
+
+## 第三轮修复与真机验证（2026-10-20 晚，用户反馈“电台一直换台/没声音”“进 Codex 很慢且显示断线”）
+
+### A. 收音机“一直切台、没声音”
+
+真机串口先出现两种失败并存：
+
+```
+radio_player: Open failed: ... / HTTP status -1
+wireless_bridge / wifi:mem fail        <- WiFi 收包缓冲分配失败
+radio_player: Station N unreachable, skipping to the next one
+```
+
+定位过程（每一步都有真机日志对照）：
+
+| 尝试 | 结果 |
+|---|---|
+| 任务栈 2048B → 2560B / 3072B（+512B / +1KB `.bss`） | `wifi:mem fail`，TCP 吞吐 11.7KB/s → ~300B/s，仍不停换台 |
+| 栈 2048B、读缓冲 256B | 吞吐恢复，但 `radio_network` 仍触发 **Stack protection fault → RTC_SW_CPU_RST 自动重启** |
+| 栈 2048B + 去掉本任务全部日志 | 仍崩（addr2line 定位在 `esp_http_client_read → lwIP → FreeRTOS `xQueueSemaphoreTake` / newlib `lock_acquire_generic`） |
+
+结论：**2048B 栈不够，而 C3 的 `.bss` 连 +512B 都受不了**。最终方案：
+
+- `radio_network` 的 4KB 任务栈改成从小智**关闭时闲置的静态麦克风区**里划分
+  （`xiaozhi_radio_stack()`），不再占新的 `.bss`；
+- 抖动环同时使用小智麦克风区余量 + 小智 **TTS 静态栈**（收音机运行时同样闲置），
+  回到 **20KB / 20 块**；
+- 环形缓冲恢复 1024B 读块；恢复阈值上限改为环容量的 1/3（约 5~6KB），
+  避免小环里“要等 11.5KB 才恢复”把一次欠载放大成长期静音。
+
+真机结果（连续 130 秒，无人工干预）：
+
+```
+network buffer: blocks=20 capacity=20480 source=idle-xiaozhi-stack
+Playing 中国之声 at 48000Hz/2ch -> mono
+audio stats: wall=10010ms pcm=9960ms read_max=854ms gaps30=0 rebuffers=0 queued=20480
+```
+
+| 项目 | 结果 |
+|---|---|
+| `wifi:mem fail` | 0 次（修复前反复出现） |
+| `Stack protection` / `Guru Meditation` | 0 次（修复前每 20~40 秒一次重启） |
+| `Open failed` | 0 次（偶发 1 次为源站侧） |
+| 持续出声 | 出现 9960ms/10000ms 的完整播放窗口 |
+| 切换电台 | 不再出现“一直换台”循环 |
+
+> 仍有部分 10 秒窗口 PCM 偏低，原因已用电脑侧直连同一电台验证：源站本身会长时间
+> 停发（电脑侧 TCP 采样同样出现秒级、十几秒级空档），不是设备端缺陷。
+
+### B. 进入 Codex 很慢 / 显示“连接断开”
+
+两个设备端原因，均已修复：
+
+1. **退出 Codex 会拆掉 CBDP 会话**：`codex_app_exit()` 里曾调用
+   `coding_bridge_stop_wireless()`，每退一次就要等电脑端下一次发现/握手
+   （实测 20~30s），用户看到的正是“卡半天 + 进去说未连接”。现已移除该调用，
+   解码池仍在退出时立即抢回。
+2. **进入 Codex 时连接状态是旧值**：`s_flow.connected` 只在收到消息时更新，
+   于是刚进页面会显示“未连接”。现在进入时同步
+   `coding_bridge_is_connected()`。
+
+另外新增设备端**主动 presence 通告**（WiFi 连上 8s 后向 UDP 8764 广播
+`discovery_reply`，连发 3 次），不再等电脑端下一次广播，CBDP 会话建立时间从
+~22–30s 降到 ~18s（实测 18.3s / 19.4s）。
+
+### C. Codex 项目/任务列表卡住
+
+真机复现：页面停在“正在读取真实 Codex 项目…”。两类问题：
+
+1. **设备端 bug（已修）**：`app_coding_enter()` 在前台标志
+   `coding_bridge_set_foreground_ui(true)` **之前**就发出 `projects.list`，
+   回复到达时前台标志仍为 false，整条 RESULT 被丢弃（连 `catalog_end` 都没走到），
+   于是永久加载。现在前台标志置位后若目录仍在 loading 会重新请求一次；
+   同时目录请求会记录 `request_id`，收到 `ERROR` 或 20 秒无响应即退出加载态并
+   显示明确错误，不再永久卡住。
+2. **Bridge 侧问题（未改 Bridge，已出文档）**：设备选择项目后发
+   `threads.list`（`project_ref = 0x0122`），Bridge 回
+   `ERROR code=0x0015 (INTERNAL)`。因为 `gateway.PARAM_TAGS` 没有
+   `project_ref` 映射，且上游 `service.list_threads()` 不支持按项目过滤。
+   见 `docs/CodexBridge-CBDP-threads-list-project-internal-2026-10-20.md`。
+
+真机验证（Bridge v2.1.16）：
+
+| 项目 | 结果 | 证据 |
+|---|---|---|
+| 项目列表 | 通过 | 截屏 `选择项目 1-8/8`，8 个真实项目 |
+| 不再永久卡加载 | 通过 | `threads.list` 失败后显示“发生错误 / INTERNAL”+“重新录音/切换任务” |
+| 任务列表/新建任务 | 待 Bridge 修复 | 设备端已就绪，等 `threads.list` 支持项目过滤 |
+
+### D. 首页 Codex 运行状态
+
+仍依赖 Bridge 下发聚合计数 `codex_state`（设备端已具备消费逻辑），
+见 `docs/CodexBridge-CBDP-status-push-issue-2026-10-19.md`。

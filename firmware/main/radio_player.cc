@@ -73,8 +73,7 @@ static_assert(kPcmCapacity + kSharedNetworkBlocks * kInputSize <= kOutputSize,
 constexpr std::size_t kDecoderMinBlock = 20 * 1024;
 constexpr std::size_t kLevelCount = 18;
 // 电台列表容量。兜底表 10 项(7 中文 + 3 国际)已占大半, 再给目录搜索结果
-// 留几个位置。RadioStation ≈ 418B, 14 项 ≈ 5.9KB 静态(比 12 项多 836B,
-// 在 C3 上可接受)。
+// 留几个位置。RadioStation ≈ 418B, 14 项 ≈ 5.9KB 静态。
 constexpr std::size_t kMaxStations = 14;
 // Consecutive silent failures tolerated before moving to the next station.
 // Public directories are full of dead entries; retrying the same address just
@@ -636,15 +635,19 @@ namespace {
 
 // 网络抖动缓冲上限。正常路径借用小智空闲的 25.6KB 麦克风栈，形成约
 // 27KB 环形缓冲；heap 分配只作为 borrow 不可用时的兜底。
-constexpr std::size_t kNetworkBlocks = 28;
+// 借用小智栈后的可用环: 25.6KB - 12KB(bridge) - 4KB(网络任务栈) ≈ 9.4KB,
+// 即 9 个 1KB 块。heap 兜底分支仍按实际空闲堆尽量多分。
+// 可用环 = 小智麦克风区余量 10KB + 小智 TTS 静态栈 10KB = 20 个 1KB 块。
+// 两块内存都只在收音机运行时闲置, 且不进 .bss, 因此不会挤 WiFi 收包缓冲。
+constexpr std::size_t kNetworkBlocks = 20;
 // 启动预缓冲 2KB: 切台后尽快出声。实测源端会周期性停顿 0.5~2s, 所以每次
 // 欠载后把"恢复阈值"翻倍(见 stream_station 里的 wait_bytes), 但上限必须
 // 明显小于环容量: 27KB 环里等 20KB 再出声会在源端断续时制造 1.5s 以上的
 // 静音, 而且剩余空间不足以吸收下一段突发(实测 rebuffers 连续累积)。
 // 2026-10-13: 4KB 起播首响更快, 但真机首个 10s 窗口仍欠载一次; 8KB 已能
 // 消除这一轮空转。取 6KB 折中, 临界源端若仍欠载, 恢复阈值会继续翻倍。
-constexpr std::size_t kPrebufferTarget = 6 * 1024;
-constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
+constexpr std::size_t kPrebufferTarget = 3 * 1024;
+constexpr std::size_t kMaxResumePrebuffer = 4 * 1024;
 
 // network_feed_task 的栈**静态分配**: 动态申请要求在播放时凑出一块连续堆,
 // 而那时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 必然失败
@@ -659,13 +662,24 @@ constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
 // 崩溃时 Stack bounds 为 2032B, SP 已越过下界约 320B —— 正好说明 2048B 不够。
 // 本任务还持有 uint8_t bytes[kInputSize]=1024B 的局部数组, 切城市触发重连时
 // 那条 lwIP 日志路径再要一块栈, 于是越界 -> 任务崩溃 -> RTC_SW_CPU_RST 重启。
-// 3072B 相对原来只多占 1KB 静态 DRAM(.bss, 不参与堆竞争), 给该路径留出约 2KB
-// 余量; 在 ESP32-C3 极紧的内部内存下这是最小安全增量。
-constexpr std::size_t kNetworkFeedStack = 3072;
-static_assert(kNetworkFeedStack >= 3072,
-              "radio_network needs room for bytes[1024] plus the lwIP logging path");
+// radio_network 的任务栈**不放在 .bss**, 而是从小智关闭时闲置的静态麦克风
+// 区(residual 13KB)里划出 4KB, 见 xiaozhi_radio_stack()。原因(均为真机复现):
+//   - 2048B 栈会在 esp_http_client_read -> lwIP/FreeRTOS 锁路径上踩穿栈保护,
+//     任务 "radio_network" 每 ~20-40s 触发一次 RTC_SW_CPU_RST 自动重启;
+//   - 把栈加到 2560/3072B(或把电台表扩回 14 项)会让 .bss 增长 512B~1KB,
+//     直接挤掉 C3 的 WiFi 收包缓冲, 串口刷 "wifi:mem fail", TCP 吞吐从
+//     11.7KB/s 掉到 300B/s, 表现就是收音机不停换台、没声音。
+// 从小智静态区借用则两个问题都不存在, .bss 反而比原来更小。
+// 读缓冲: 任务改用借用栈后 C3 栈预算充裕, 无需再用 256B 妥协。
+constexpr std::size_t kNetworkFeedReadSize = 1024;
+// 网络任务栈大小。实际存储由 xiaozhi_radio_stack() 从小智静态区提供;
+// 4KB 是实测能覆盖 esp_http_client_read -> lwIP/FreeRTOS/newlib 锁路径的值。
+constexpr std::size_t kNetworkFeedStack = 4096;
+
+extern "C" uint8_t *xiaozhi_radio_stack(std::size_t *size);
+extern "C" uint8_t *xiaozhi_tts_idle_buffer(std::size_t *size);
 StaticTask_t s_network_feed_tcb;
-StackType_t  s_network_feed_stack[kNetworkFeedStack];
+
 
 struct NetworkFeed {
     esp_http_client_handle_t client;
@@ -675,6 +689,9 @@ struct NetworkFeed {
     std::atomic<bool> finished{false};
     std::atomic<bool> stop{false};
     std::atomic<uint32_t> max_read_us{0};
+    // 0 = running, 1 = idle timeout, 2 = read error, 3 = EOF.
+    // The feed task never logs itself; the player task (4.6KB stack) prints.
+    std::atomic<uint8_t> exit_reason{0};
 };
 
 // 2026-10-17: 把"空读次数"改成"空读时长预算"。
@@ -694,9 +711,9 @@ constexpr unsigned kEofReads = 3;
 
 void network_feed_task(void *argument) {
     auto *feed = static_cast<NetworkFeed *>(argument);
-    // 先预留任务栈，等 HTTP 和环形缓冲就绪后才开始读取。
+    // 预留任务栈，等 HTTP 和环形缓冲就绪后才开始读取。
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    uint8_t bytes[kInputSize];
+    uint8_t bytes[kNetworkFeedReadSize];
     unsigned eof_reads = 0;
     int64_t stall_start_us = 0;
     while (!feed->stop.load() && request_still_current(feed->generation, feed->station)) {
@@ -704,27 +721,32 @@ void network_feed_task(void *argument) {
         const int received = esp_http_client_read(feed->client,
                                                   reinterpret_cast<char *>(bytes),
                                                   sizeof(bytes));
-        const uint32_t elapsed = esp_timer_get_time() - start;
+        const uint32_t elapsed = (uint32_t)(esp_timer_get_time() - start);
         uint32_t maximum = feed->max_read_us.load();
         while (maximum < elapsed &&
                !feed->max_read_us.compare_exchange_weak(maximum, elapsed)) {}
+        // ⚠ 本任务禁止调用 ESP_LOG*/printf: 那条 esp_log -> vfprintf 调用链
+        // 需要在 2048B 栈上再要 1KB+, 2026-10-20 真机就是在这里踩穿栈保护。
+        // 所有失败原因只写原子标志, 由 player_task 打印。
         if (received == -ESP_ERR_HTTP_EAGAIN) {
             if (!stall_start_us) stall_start_us = start;
             if (esp_timer_get_time() - stall_start_us >= kStallBudgetUs) {
-                ESP_LOGW(kTag, "network feed idle %us, reconnecting",
-                         (unsigned)((esp_timer_get_time() - stall_start_us) / 1000000));
+                feed->exit_reason.store(1U, std::memory_order_release);
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
         if (received < 0) {
-            ESP_LOGW(kTag, "network feed stopped: read=%d", received);
+            feed->exit_reason.store(2U, std::memory_order_release);
             break;
         }
         if (!received) {
             if (esp_http_client_is_complete_data_received(feed->client) ||
-                ++eof_reads >= kEofReads) break;
+                ++eof_reads >= kEofReads) {
+                feed->exit_reason.store(3U, std::memory_order_release);
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -889,16 +911,29 @@ bool stream_station(std::size_t station, uint32_t generation) {
     // XiaoZhi is closed, its 25.6KB mic stack is dead RAM and makes an ideal
     // jitter pool: no heap allocation, no fragmentation, ~3s at 64kbps.
     uint8_t *borrowed_network = nullptr;
+    uint8_t *borrowed_tts = nullptr;
     std::size_t borrowed_blocks = 0;
+    std::size_t borrowed_mic_blocks = 0;
     std::size_t heap_network_start = kSharedNetworkBlocks;
     {
         std::size_t borrowed_size = 0;
         borrowed_network = xiaozhi_idle_buffer(&borrowed_size);
         if (borrowed_network && borrowed_size >= kInputSize) {
-            borrowed_blocks = std::min(borrowed_size / kInputSize,
-                                       kNetworkBlocks - kSharedNetworkBlocks);
+            borrowed_mic_blocks = std::min(borrowed_size / kInputSize,
+                                           kNetworkBlocks - kSharedNetworkBlocks);
+            borrowed_blocks = borrowed_mic_blocks;
         } else {
             borrowed_network = nullptr;
+        }
+        // TTS 静态栈同样只在收音机运行时闲置, 追加到同一环形缓冲后面。
+        std::size_t tts_size = 0;
+        borrowed_tts = xiaozhi_tts_idle_buffer(&tts_size);
+        if (borrowed_tts != nullptr && tts_size >= kInputSize) {
+            borrowed_blocks += std::min(tts_size / kInputSize,
+                                        kNetworkBlocks - kSharedNetworkBlocks -
+                                            borrowed_blocks);
+        } else {
+            borrowed_tts = nullptr;
         }
     }
 
@@ -912,9 +947,12 @@ bool stream_station(std::size_t station, uint32_t generation) {
             for (std::size_t i = 0; i < kSharedNetworkBlocks; ++i) {
                 network_blocks[i] = output + kPcmCapacity + i * kInputSize;
             }
+            // 先铺满小智麦克风区余量, 再用 TTS 静态栈续上。
             for (std::size_t i = 0; i < borrowed_blocks; ++i) {
                 network_blocks[kSharedNetworkBlocks + i] =
-                    borrowed_network + i * kInputSize;
+                    i < borrowed_mic_blocks
+                        ? borrowed_network + i * kInputSize
+                        : borrowed_tts + (i - borrowed_mic_blocks) * kInputSize;
             }
             heap_network_start = block_count;
             ESP_LOGI(kTag,
@@ -928,9 +966,17 @@ bool stream_station(std::size_t station, uint32_t generation) {
         // socket 刚有数据时就排空, 否则 44.1kHz 立体声解码把 CPU 占满时
         // 窗口排不空 -> 源端停发 -> 缓冲见底 -> 周期性卡顿。仍低于
         // WiFi(23)/tcpip(18), 不会饿死网络栈。
+        std::size_t radio_stack_size = 0U;
+        uint8_t *radio_stack = xiaozhi_radio_stack(&radio_stack_size);
+        if (radio_stack == nullptr || radio_stack_size < kNetworkFeedStack) {
+            s_last_fail_lowmem.store(true, std::memory_order_release);
+            ESP_LOGW(kTag, "radio network stack unavailable (size=%u)",
+                     (unsigned)radio_stack_size);
+            break;
+        }
         network_task = xTaskCreateStatic(network_feed_task, "radio_network",
                                        kNetworkFeedStack, &feed, 7,
-                                       s_network_feed_stack, &s_network_feed_tcb);
+                                       (StackType_t *)radio_stack, &s_network_feed_tcb);
         if (network_task == nullptr) {
             s_last_fail_lowmem.store(true, std::memory_order_release);
             ESP_LOGW(kTag, "network feed task create failed");
@@ -1009,8 +1055,12 @@ bool stream_station(std::size_t station, uint32_t generation) {
         bool buffering = true;
         // 本次等待的预缓冲阈值: 起步用 prebuffer_bytes(2KB), 每欠载一次翻倍。
         std::size_t wait_bytes = prebuffer_bytes ? prebuffer_bytes : kPrebufferTarget;
-        const std::size_t wait_limit = std::min(kMaxResumePrebuffer,
-                                                (block_count * kInputSize) * 3 / 4);
+        // 2026-10-20: 常驻 Codex bridge 12KB + 网络任务栈 4KB 从小智静态区
+        // 借走后, 收音机抖动环只剩 ~9.4KB。沿用"最多等 11.5KB 才恢复"会让
+        // 小环几乎不可能攒满 -> 永久缓冲。上限取环容量的 1/3(约 3KB), 恢复快,
+        // 且始终留出 2/3 环吸收突发。
+        const std::size_t wait_limit = std::min(
+            kMaxResumePrebuffer, (block_count * kInputSize) / 3);
         bool playback_announced = false;
         uint32_t rebuffers = 0;
         int decode_fail_streak = 0;   // 连续解码失败计数(内存不足/坏流): 达限放弃本电台, 防3ms风暴
@@ -1307,6 +1357,14 @@ bool stream_station(std::size_t station, uint32_t generation) {
         xTaskNotifyGive(network_task);
         while (!feed.finished.load(std::memory_order_acquire)) vTaskDelay(pdMS_TO_TICKS(5));
         vTaskDelete(network_task);
+        // 读线程自己不能打日志(栈太浅), 在这里(4.6KB 栈)统一上报。
+        const uint8_t reason = feed.exit_reason.load(std::memory_order_acquire);
+        if (reason == 1U) {
+            ESP_LOGW(kTag, "network feed idle %us, reconnecting",
+                     (unsigned)(kStallBudgetUs / 1000000));
+        } else if (reason == 2U) {
+            ESP_LOGW(kTag, "network feed stopped by read error");
+        }
     }
     // 只释放 heap 兜底路径真正 malloc 出来的块；借用小智麦克风静态栈时
     // heap_network_start == block_count，这里不会误 free 静态内存。

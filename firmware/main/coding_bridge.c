@@ -85,6 +85,15 @@ static codex_background_state_t s_background_state;
 static volatile bool s_capture_requested;
 static volatile bool s_capture_cancelled;
 static uint32_t s_catalog_request_id;
+// Request id of the in-flight projects/threads list command, and its method.
+// A host ERROR frame carries only request_id + code; without this mapping the
+// catalog state machine stayed on "loading projects" forever (observed on a
+// real device when CodexBridge answered projects.list with INTERNAL).
+static uint32_t s_catalog_pending_request_id;
+static uint16_t s_catalog_pending_method;
+// When the list request went out; a host that never answers must not leave the
+// picker on "loading" forever.
+static int64_t s_catalog_pending_since_us;
 static uint32_t s_thread_topic_id;
 static uint32_t s_thread_scope_seq;
 static uint64_t s_thread_scope_cursor;
@@ -515,6 +524,8 @@ static void background_read_state_changed(const char *message_id)
     home_codex_state_changed();
 }
 
+bool app_coding_catalog_is_loading(void);
+
 void coding_bridge_set_foreground_ui(bool active)
 {
     s_allow_foreground_ui = active;
@@ -526,6 +537,15 @@ void coding_bridge_set_foreground_ui(bool active)
     if (active && bsp_lvgl_lock(500)) {
         app_coding_bridge_connected(s_connected);
         bsp_lvgl_unlock();
+    }
+
+    // Re-issue the catalog request now that background delivery is on.
+    // app_coding_enter() asks for projects before this function runs, so the
+    // first RESULT can arrive while s_allow_foreground_ui is still false and be
+    // dropped (items skipped and no END), which stranded the picker on
+    // "正在读取真实 Codex 项目…". Asking again here is cheap and idempotent.
+    if (active && app_coding_catalog_is_loading()) {
+        coding_bridge_request_projects();
     }
 }
 
@@ -1226,6 +1246,12 @@ static bool wireless_build_and_send_command(uint16_t method_id,
     size_t length = 0U;
     uint8_t idem[CBDP_IDEM_BYTES];
     ++s_wireless_request_id;
+    if (method_id == CBDP_METHOD_PROJECTS_LIST ||
+        method_id == CBDP_METHOD_THREADS_LIST) {
+        s_catalog_pending_request_id = s_wireless_request_id;
+        s_catalog_pending_method = method_id;
+        s_catalog_pending_since_us = esp_timer_get_time();
+    }
     make_idem_for(idem, s_wireless_request_id, method_id, params, params_length);
     if (!cbdp_build_command(frame, sizeof(frame), &length, s_wireless_request_id,
                             method_id, params, params_length, idem)) {
@@ -1301,6 +1327,8 @@ static void wireless_set_connected(bool connected)
     s_background_state.connected = connected;
     if (!connected) {
         s_bridge_online = false;
+        s_catalog_pending_request_id = 0U;
+        s_catalog_pending_since_us = 0;
         codex_background_reset(&s_background_state);
     }
     home_codex_state_changed();
@@ -1444,6 +1472,10 @@ static void wireless_handle_result(const cbdp_frame_header_t *header,
         if (is_list && coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
             app_coding_catalog_end(list_scope);
             bsp_lvgl_unlock();
+        }
+        if (is_list) {
+            s_catalog_pending_request_id = 0U;
+            s_catalog_pending_since_us = 0;
         }
         s_last_message_us = esp_timer_get_time();
         return;
@@ -1885,6 +1917,28 @@ static void wireless_handle_error(const cbdp_frame_header_t *header,
 
     s_last_message_us = esp_timer_get_time();
 
+    // 8.4 catalog requests: a failed projects.list/threads.list used to leave
+    // the picker on "正在读取真实 Codex 项目…" forever, because only a RESULT
+    // drove the state machine. Match the request_id in the ERROR frame and
+    // surface a real, actionable message instead of an endless spinner.
+    uint32_t error_request_id = 0U;
+    (void)cbdp_tlv_read_u32(cbdp_tlv_find(tlv, tlv_len, CBDP_TLV_REQUEST_ID),
+                            &error_request_id);
+    if (s_catalog_pending_request_id != 0U &&
+        (error_request_id == 0U ||
+         error_request_id == s_catalog_pending_request_id)) {
+        char catalog_error[96];
+        snprintf(catalog_error, sizeof(catalog_error), "桥接错误(%.48s)", message);
+        s_catalog_pending_request_id = 0U;
+        s_catalog_pending_since_us = 0;
+        coding_bridge_cancel_catalog();
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_catalog_abort(catalog_error);
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
+
     // 21.3: only authentication errors end the session. A peer ERROR such as
     // INVALID_FRAME or INVALID_STATE must not, and per 21.3 the device must not
     // answer an ERROR with another ERROR.
@@ -1974,10 +2028,27 @@ static void process_usb_line(const char *line)
     process_line(line, true);
 }
 
+// Host replied to nothing: a projects/threads list that never produces a
+// RESULT (dropped frame, older bridge, or a session that reconnected mid
+// request) left the picker loading indefinitely. Time it out and say so.
+#define CATALOG_REPLY_TIMEOUT_US (20LL * 1000LL * 1000LL)
+
 static void bridge_tick(void)
 {
     if (!s_wireless_enabled) return;
     wireless_ack_flush();
+
+    if (s_catalog_pending_request_id != 0U && s_catalog_pending_since_us != 0 &&
+        esp_timer_get_time() - s_catalog_pending_since_us >
+            CATALOG_REPLY_TIMEOUT_US) {
+        s_catalog_pending_request_id = 0U;
+        s_catalog_pending_since_us = 0;
+        coding_bridge_cancel_catalog();
+        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+            app_coding_catalog_abort("连接超时，未取到任务列表");
+            bsp_lvgl_unlock();
+        }
+    }
     // Section 12 keeps heartbeat liveness in the transport: the socket layer
     // sends PING on idle links and tears the session down after
     // 3 x heartbeat_seconds without any inbound frame. The application layer

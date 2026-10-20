@@ -1164,6 +1164,17 @@ void app_coding_catalog_item(const char *scope, const char *id,
              title != NULL ? title : "未命名");
 }
 
+/* True while the project/thread picker is waiting for its list RESULT.
+ * app_coding_enter() fires the request before coding_bridge_set_foreground_ui()
+ * has run, so the reply could arrive while s_allow_foreground_ui was still
+ * false and was dropped — leaving the page on "正在读取真实 Codex 项目…"
+ * forever. The bridge re-issues the request once the page is really in front. */
+bool app_coding_catalog_is_loading(void)
+{
+    return s_catalog_mode == CATALOG_LOADING_PROJECTS ||
+           s_catalog_mode == CATALOG_LOADING_THREADS;
+}
+
 void app_coding_catalog_end(const char *scope)
 {
     bool threads = scope != NULL && strcmp(scope, "threads") == 0;
@@ -1454,6 +1465,12 @@ void app_coding_enter(void)
         return;
     }
     s_full_ui_active = true;
+
+    // The bridge may already be connected while this page was closed (its
+    // session outlives the page). s_flow.connected only flips when a message
+    // arrives, so entering Codex right after boot showed "未连接" even though
+    // the PC link was up. Sync the real transport state on entry.
+    coding_flow_set_connected(&s_flow, coding_bridge_is_connected());
 
     // 进入 Codex 时更新首页状态
     radio_home_set_codex_status(s_flow.connected ? "工作中" : "离线");

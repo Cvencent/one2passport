@@ -1000,6 +1000,17 @@ static bool s_encoder_gave_up;
 // task stack. 7 KB overflowed on the first real delta event; 12 KB leaves
 // room for the complete authenticated message path.
 #define XZ_BRIDGE_STACK_BYTES 12288
+// Layout of the 25.6KB idle microphone storage while XiaoZhi is closed:
+//   [ 12KB always-on Codex bridge ][ 4KB radio network task ][ rest = radio ring ]
+// All three owners are mutually exclusive with a running XiaoZhi session
+// (entering it stops both the bridge and the radio first), so the regions never
+// overlap at runtime. Carving the radio_network stack from this already-static
+// RAM is what lets the radio task have a safe 4KB stack WITHOUT growing .bss:
+// the C3's internal DMA pool is so tight that +512B of .bss already breaks
+// WiFi RX buffer allocation ("wifi:mem fail", throughput 11.7KB/s -> 300B/s)
+// and a 2048B stack on this FreeRTOS/newlib lock path panics with a stack
+// protection fault. Both failure modes were reproduced on real hardware.
+#define XZ_RADIO_STACK_BYTES 4096
 static StackType_t s_mic_stack_storage[XZ_MIC_STACK_WORDS]
     __attribute__((aligned(16)));
 static StaticTask_t s_mic_tcb;
@@ -1588,6 +1599,18 @@ uint8_t *xiaozhi_bridge_stack(size_t *size)
     return s_mic_stack_storage;
 }
 
+// The TTS playback task stack (10KB static) is idle whenever no XiaoZhi speech
+// is playing. Radio playback and XiaoZhi speech never overlap (entering XiaoZhi
+// stops the radio first), so while the radio runs this whole array is dead RAM
+// that can serve as extra jitter blocks instead of growing .bss.
+uint8_t *xiaozhi_tts_idle_buffer(size_t *size)
+{
+    if (size) *size = 0;
+    if (s_tts_task != NULL || s_tts_running) return NULL;
+    if (size) *size = sizeof(s_tts_stack_storage);
+    return (uint8_t *)s_tts_stack_storage;
+}
+
 // Radio borrows the remainder as a jitter ring. Ownership is exclusive by
 // lifecycle: entering XiaoZhi stops the radio stream first, and this returns
 // NULL while any XiaoZhi task or WS owns the stack.
@@ -1595,7 +1618,21 @@ uint8_t *xiaozhi_idle_buffer(size_t *size)
 {
     if (size) *size = 0;
     if (!xz_mic_stack_is_idle()) return NULL;
-    if (size) *size = sizeof(s_mic_stack_storage) - XZ_BRIDGE_STACK_BYTES;
+    const size_t used = XZ_BRIDGE_STACK_BYTES + XZ_RADIO_STACK_BYTES;
+    if (sizeof(s_mic_stack_storage) <= used) return NULL;
+    if (size) *size = sizeof(s_mic_stack_storage) - used;
+    return s_mic_stack_storage + used;
+}
+
+// Static 4KB stack for the always-on radio network feeder task. Lives in the
+// same idle microphone storage, directly after the bridge stack; see the
+// layout comment above XZ_RADIO_STACK_BYTES. Keeping it here instead of a new
+// .bss array is what keeps the C3's internal DMA pool intact.
+uint8_t *xiaozhi_radio_stack(size_t *size)
+{
+    if (size) *size = 0;
+    if (!xz_mic_stack_is_idle()) return NULL;
+    if (size) *size = XZ_RADIO_STACK_BYTES;
     return s_mic_stack_storage + XZ_BRIDGE_STACK_BYTES;
 }
 

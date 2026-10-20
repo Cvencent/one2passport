@@ -168,18 +168,18 @@ bool codex_app_enter(void) {
 void codex_app_exit(void) {
     app_coding_exit();
     coding_bridge_set_foreground_ui(false);
-    // ⚠⚠ 内存顺序(与 app_framework_minimize_services 的"先收音机后桥接"一致):
-    //   进入完整 Codex 时 release_pool() 把 20KB 连续解码块还给了堆; 退出时
-    //   必须**先**停掉无线桥接、把 socket/接收缓冲还给堆, 再让框架去抢解码池。
-    //   否则桥接仍占着堆时抢不到 20KB 连续块, 预热失败 -> 回收音机就是
-    //   "内存不足 稍后重试" 长退避。停掉桥接后框架会按正确顺序重新拉起。
-    coding_bridge_stop_wireless();
     // Reclaim the 20KB decoder block *now*: the Codex page is already destroyed
     // and the menu/home tree has not been rebuilt yet, so this is the last
     // moment the heap is still contiguous enough. Deferring to
     // app_framework_minimize_services() runs after ensure_menu() fragments the
     // heap, and the pool then fails to re-acquire -> radio stuck on
     // "内存不足 稍后重试".
+    //
+    // ⚠ 2026-10-20: 这里**不要**停无线桥接。之前为了腾内存调用了
+    //   coding_bridge_stop_wireless(), 结果每退一次 Codex 就拆掉 CBDP 会话,
+    //   下次进 Codex 要等电脑端下一次发现/握手(实测 20~30s), 用户看到的就是
+    //   "进 Codex 卡半天, 进去还说未连接"。桥接常驻才能秒进。
+    //   解码池在此刻仍能抢到(退出 Codex 后 largest≈30KB > 20KB), 无需拆桥。
     radio_player_ensure_pool();
 }
 void codex_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {

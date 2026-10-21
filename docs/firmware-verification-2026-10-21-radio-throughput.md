@@ -179,3 +179,60 @@ ESP-IDF 这份 lwIP 未提供 `TCP_WINDOW` sockopt。唯一杠杆是**全局**
 请确认是否要：
 1. 先出 Bridge 侧对接文档（把聚合计数放进 UDP presence 或独立轻量通道），或
 2. 先按 9.3 做设备侧缓解，让首页播放至少稳定可用。
+
+---
+
+## 11. 已实施：首页不再占用 CBDP TCP（2026-10-21 晚）
+
+Bridge v2.1.25 按第 9 节实现了 UDP 计数通道
+（`codexbridge/devices/home_counters.py`，帧类型 `TYPE_HOME_COUNTERS = 0x1E`，
+计数放在 **header TLVs**，只向主动 announce 过的设备单播，2 秒一拍、变化即推）。
+设备端已完成对应的一半：
+
+### 11.1 设备改动
+
+| 文件 | 改动 |
+|---|---|
+| `wireless_bridge.c/.h` | 新增 `wireless_bridge_set_home_only()`；首页/菜单态**拒绝 CBDP TCP 连接**，只保留 UDP；UDP 分支新增 `0x1E` 解析 |
+| `coding_bridge.c/.h` | 把 `0x0704` 内联的计数处理抽成 `apply_codex_counts()`，新增 `coding_bridge_apply_udp_home_counters()` 由 UDP 路径调用。两条通道共用同一实现，不会重复计数 |
+| `app_registry.cc` | 开机即 home-only；进入任意全屏应用时清除，Codex 页照常建 TCP |
+| `codex_bridge_protocol.h` | 新增 `CBDP_MT_HOME_COUNTERS = 0x1E` |
+
+### 11.2 实测（COM4，Bridge v2.1.25 在跑）
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| 满速窗口占比 | 2~3 / 21 | **10 / 19** |
+| 单窗口播放时长 | 多为 1~4s | 多为 **10008ms / 10005ms** |
+| `wifi:mem fail` | 每轮都有 | 250s 长测 **0 次** |
+| 首页 TCP 会话 | 常开 | **0**（日志 4~11 次 `home-only: refused`） |
+| 首页计数刷新 | 靠 TCP `0x0704` | 纯 UDP，`codex_state` 每 ~2s 一次 |
+| Codex 项目/任务列表 | 正常 | **正常**（进应用后建 TCP，截图为证） |
+
+首页截屏可见宠物右侧徽标显示 `6`/`1`，同时收音机在播。
+
+### 11.3 残余问题（未根除）
+
+播放期 `dma` 空闲仍常掉到 **300~2000 字节**，而 WiFi 每个动态接收缓冲需要
+约 **1600 字节连续 DMA 内存**。低于该值时驱动仍会丢帧，TCP 退避重传，于是
+仍有 9/19 的坏窗口。
+
+根因是硬件限制：**ESP32-C3 无 PSRAM，内部 RAM 全部 DMA 可寻址**，所以
+"内部堆"和"DMA 堆"是同一块。开机链条已贴顶：
+
+```text
+post_framework_pre_wifi  free=99476 dma=91748
+post_wifi_init           free=67052 dma=59324   (-32.4K)
+post_audio_init          free=56364 dma=48636   (-10.7K)
+post_radio_prewarm       free=20024 dma=12296   (-36.3K)  <- 解码器池
+post_coding_bridge       free=10148 dma=2420    (-9.9K)   <- 最小化桥接
+播放期                     free=3.6~4.7K dma=0.9~2.0K
+```
+
+### 11.4 下一步可选项（按收益排序）
+
+1. **把解码器池改成非 DMA 需求**：不可行 —— C3 内部 RAM 全 DMA 可寻址。
+2. **缩解码器池**：`kOutputSize = 4608 + 2×1024`。MP3 满帧 4608 不能动，
+   但共享的 2 个 1KB 块可评估。收益 ≤2KB，风险中等。
+3. **降低首页播放码率上限**：优先选 ≤64kbps 源，缓解但非根治。
+4. **接受现状**：目前 10/19 满速 + 偶发停顿，已是无 PSRAM 硬件下的实际可行水平。

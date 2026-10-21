@@ -664,14 +664,27 @@ namespace {
 // 可用环 = 小智麦克风区余量 10KB + 小智 TTS 静态栈 10KB = 20 个 1KB 块。
 // 两块内存都只在收音机运行时闲置, 且不进 .bss, 因此不会挤 WiFi 收包缓冲。
 constexpr std::size_t kNetworkBlocks = 20;
-// 启动预缓冲 2KB: 切台后尽快出声。实测源端会周期性停顿 0.5~2s, 所以每次
-// 欠载后把"恢复阈值"翻倍(见 stream_station 里的 wait_bytes), 但上限必须
-// 明显小于环容量: 27KB 环里等 20KB 再出声会在源端断续时制造 1.5s 以上的
-// 静音, 而且剩余空间不足以吸收下一段突发(实测 rebuffers 连续累积)。
-// 2026-10-13: 4KB 起播首响更快, 但真机首个 10s 窗口仍欠载一次; 8KB 已能
-// 消除这一轮空转。取 6KB 折中, 临界源端若仍欠载, 恢复阈值会继续翻倍。
-constexpr std::size_t kPrebufferTarget = 3 * 1024;
-constexpr std::size_t kMaxResumePrebuffer = 4 * 1024;
+// 抖动缓冲目标 12KB(20KB 环的 60%)。
+//
+// 2026-10-21 真机实测(北碚综合广播 / 中国之声, COM4):
+//   切台后前两个 10s 窗口播放占比只有 2% 和 12%, 第三个窗口才回到 100%。
+//   原因既不是内存也不是解码器, 而是 CDN 启动期只给 ~1KB/s(音频要 8KB/s),
+//   每个窗口的 read_max 都打满 1001ms 超时。
+//
+//   旧配置(起播 3KB / 恢复上限 4KB)在慢源下的表现是:
+//     播 0.5 秒 -> 停 4 秒 -> 又播 0.5 秒
+//   因为 4KB 只等于 0.5 秒音频, 一攒满就被 8KB/s 的消费速度吃空。
+//
+//   改成 12KB(1.5 秒音频)后, 慢源期间是**一段安静等待**, 不再高频抽搐;
+//   而且等待期间不消费, 环只进不出, 反而更快攒够 —— 等 CDN 爬坡结束,
+//   环已接近满(实测窗口 6~8 稳定 20480 满环 + 100% 播放)。
+//
+//   代价: 切台首响变慢(慢源下最多等十几秒), 这是用户明确接受的取舍。
+constexpr std::size_t kPrebufferTarget = 12 * 1024;
+// 欠载后的恢复阈值上限, 与起播目标一致: 每次欠载都重新攒到 12KB 再出声。
+// stream_station 还会把它夹到环容量的 3/4 以内, 保证任何时候都留 1/4 环
+// 吸收突发(小环/堆兜底路径下也不会去等一个永远填不满的量而卡死)。
+constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
 
 // network_feed_task 的栈**静态分配**: 动态申请要求在播放时凑出一块连续堆,
 // 而那时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 必然失败
@@ -1084,14 +1097,14 @@ bool stream_station(std::size_t station, uint32_t generation) {
         bool format_ready = false;
         uint8_t source_channels = 1;
         bool buffering = true;
-        // 本次等待的预缓冲阈值: 起步用 prebuffer_bytes(2KB), 每欠载一次翻倍。
-        std::size_t wait_bytes = prebuffer_bytes ? prebuffer_bytes : kPrebufferTarget;
-        // 2026-10-20: 常驻 Codex bridge 12KB + 网络任务栈 4KB 从小智静态区
-        // 借走后, 收音机抖动环只剩 ~9.4KB。沿用"最多等 11.5KB 才恢复"会让
-        // 小环几乎不可能攒满 -> 永久缓冲。上限取环容量的 1/3(约 3KB), 恢复快,
-        // 且始终留出 2/3 环吸收突发。
+        // 恢复阈值上限 = 环容量的 3/4, 且不超过 kMaxResumePrebuffer(12KB)。
+        // 先算上限、再夹起播阈值 —— 否则堆兜底路径下环可能只有 1~2KB,
+        // 却去等 12KB, 永远等不满(表现为一直停在"正在缓冲")。
         const std::size_t wait_limit = std::min(
-            kMaxResumePrebuffer, (block_count * kInputSize) / 3);
+            kMaxResumePrebuffer, (block_count * kInputSize) * 3 / 4);
+        // 本次等待的预缓冲阈值: 慢源从 12KB 起, 每次欠载仍可翻倍(但已顶到上限)。
+        std::size_t wait_bytes = std::min(
+            prebuffer_bytes ? prebuffer_bytes : kPrebufferTarget, wait_limit);
         bool playback_announced = false;
         uint32_t rebuffers = 0;
         int decode_fail_streak = 0;   // 连续解码失败计数(内存不足/坏流): 达限放弃本电台, 防3ms风暴

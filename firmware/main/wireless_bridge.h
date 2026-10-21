@@ -56,6 +56,11 @@ int wireless_bridge_seconds_since_rx(void);
  * negative when another task briefly holds the socket lock. */
 bool wireless_bridge_session_active(void);
 
+/* EXPERIMENT: when true the transport refuses new CBDP TCP sessions and keeps
+ * only the UDP discovery port. The home layer uses this to leave the WiFi RX
+ * path to the radio stream. */
+void wireless_bridge_set_home_only(bool home_only);
+
 #ifdef __cplusplus
 }
 #endif

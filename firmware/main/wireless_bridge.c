@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "codex_bridge_protocol.h"
+#include "coding_bridge.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -67,6 +68,13 @@ static int64_t s_client_connected_us;
 static volatile bool s_task_stop_requested;
 // Cleared when WiFi drops so the next connection announces again.
 static volatile bool s_presence_announced;
+// EXPERIMENT (2026-10-21): while the home layer is showing, the device must not
+// hold a CBDP TCP session next to the radio stream. Set by the framework on
+// layer changes; when true, accepted TCP connections are closed immediately so
+// the radio stream owns the WiFi RX path. Only UDP discovery + home counters
+// run in this state. See docs/CodexBridge-UDP-home-counters-2026-10-21.md.
+static volatile bool s_home_only_mode;
+void wireless_bridge_set_home_only(bool home_only) { s_home_only_mode = home_only; }
 // Radio playback starts right after WiFi; letting it settle first keeps the
 // CBDP buffers from stealing the few KB the HTTP client needs.
 static int64_t s_wifi_connected_us;
@@ -521,6 +529,13 @@ static void network_task(void *argument)
 
         if (FD_ISSET(tcp_fd, &read_set)) {
             int accepted = accept(tcp_fd, NULL, NULL);
+            if (accepted >= 0 && s_home_only_mode) {
+                // Drop immediately: the host will retry after its redial
+                // cooldown, and the home layer needs no control channel.
+                close(accepted);
+                accepted = -1;
+                ESP_LOGW(TAG, "home-only: refused CBDP TCP while minimized");
+            }
             if (accepted >= 0) {
                 struct timeval send_timeout = {.tv_sec = 2, .tv_usec = 0};
                 setsockopt(accepted, SOL_SOCKET, SO_SNDTIMEO,
@@ -565,6 +580,14 @@ static void network_task(void *argument)
                                        (struct sockaddr *)&source, &source_length);
             if (count > 0) {
                 cbdp_frame_header_t header;
+                if (cbdp_frame_validate(udp_input, (size_t)count, &header) &&
+                    header.message_type == CBDP_MT_HOME_COUNTERS) {
+                    // Bridge -> device aggregate counters over UDP; the home
+                    // layer holds no TCP session, so this is its only source.
+                    (void)coding_bridge_apply_udp_home_counters(
+                        udp_input + CBDP_FIXED_HEADER_BYTES,
+                        header.header_len - CBDP_FIXED_HEADER_BYTES);
+                }
                 if (cbdp_frame_validate(udp_input, (size_t)count, &header) &&
                     header.message_type == CBDP_MT_DISCOVERY) {
                     const cbdp_tlv_t *nonce = cbdp_tlv_find(

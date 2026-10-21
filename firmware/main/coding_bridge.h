@@ -39,6 +39,11 @@ void coding_bridge_request_review(void);
 bool coding_bridge_result_seen(const char *thread_id, const char *turn_id);
 bool coding_bridge_is_connected(void);
 
+/* Apply the aggregate home-screen counters the Bridge pushes over UDP 8764
+ * (frame type 0x1E, values in the header TLVs). Lets the home layer keep its
+ * numbers fresh while it holds no CBDP TCP session. */
+bool coding_bridge_apply_udp_home_counters(const uint8_t *header_tlv, size_t header_tlv_len);
+
 #ifdef __cplusplus
 }
 #endif

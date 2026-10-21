@@ -80,6 +80,10 @@ typedef enum {
     CBDP_MT_FRAGMENT = 0x1B,
     CBDP_MT_DISCOVERY = 0x1C,
     CBDP_MT_DISCOVERY_REPLY = 0x1D,
+    /* Bridge -> device: aggregate home-screen counters pushed over the UDP
+     * discovery port (see docs/CodexBridge-UDP-home-counters-2026-10-21.md).
+     * The three counters travel in the frame header TLVs. */
+    CBDP_MT_HOME_COUNTERS = 0x1E,
 } cbdp_message_type_t;
 
 enum {

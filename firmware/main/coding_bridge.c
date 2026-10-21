@@ -1618,6 +1618,87 @@ static void wireless_handle_result(const cbdp_frame_header_t *header,
     s_last_message_us = esp_timer_get_time();
 }
 
+// Shared by both counter channels: the CBDP TCP event 0x0704 and the UDP
+// home-counters frame 0x1E the Bridge pushes on the discovery port. Keeping one
+// implementation means the two paths cannot drift or double-count.
+static void apply_codex_counts(uint32_t running, uint32_t done, uint32_t failed) {
+    ESP_LOGI(TAG, "codex_state: running=%u done=%u failed=%u",
+             (unsigned)running, (unsigned)done, (unsigned)failed);
+    s_background_state.connected = true;
+    s_background_state.running = running;
+    // 未读终态数量由本机结果去重/已读逻辑维护; 这里只覆盖不变的部分。
+    // 注意: done/failed 是"其它未读", 直接覆盖会让本地刚收到的结果丢计数,
+    // 所以取两者较大值, 保证既不漏也不清零。
+    if (done > s_background_state.done) s_background_state.done = done;
+    if (failed > s_background_state.failed) s_background_state.failed = failed;
+
+    // Completion alert fallback. On CBDP the Bridge only sends this
+    // aggregate counter, so compare against the previous authoritative
+    // value. Replayed historical counts seed the baseline and stay silent;
+    // only a real increase after that rings.
+    if (!s_codex_counts_initialized) {
+        s_last_codex_done_count = done;
+        s_last_codex_failed_count = failed;
+        s_codex_counts_initialized = true;
+    } else {
+        const bool rose_done = done > s_last_codex_done_count;
+        const bool rose_failed = failed > s_last_codex_failed_count;
+        s_last_codex_done_count = done;
+        s_last_codex_failed_count = failed;
+        const int64_t now_us = esp_timer_get_time();
+        if (rose_done || rose_failed) {
+            // Arm and wait for the count to settle. Another client reading
+            // the same result makes these counters fall back within a
+            // second; a genuine completion stays unread.
+            s_codex_alert_armed_us = now_us;
+            s_codex_alert_armed_done = done;
+            s_codex_alert_armed_failed = failed;
+            s_codex_alert_armed_is_failure = rose_failed;
+        } else if (s_codex_alert_armed_us != 0 &&
+                   done >= s_codex_alert_armed_done &&
+                   failed >= s_codex_alert_armed_failed) {
+            if (now_us - s_codex_alert_armed_us >= CODEX_ALERT_SETTLE_US) {
+                const bool alert_failed = s_codex_alert_armed_is_failure;
+                s_codex_alert_armed_us = 0;
+                if (alert_failed) {
+                    ui_sfx_play(UI_SFX_FAIL);
+                } else {
+                    const app_voice_mode_t voice = app_settings_voice_mode();
+                    if (voice == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
+                    else if (voice == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
+                }
+            }
+        } else if (s_codex_alert_armed_us != 0) {
+            // Count fell back: it was another client reading, not new work.
+            s_codex_alert_armed_us = 0;
+        }
+    }
+    home_codex_state_changed();
+    if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
+        app_coding_bridge_state(running, s_background_state.done,
+                                s_background_state.failed);
+        bsp_lvgl_unlock();
+    }
+}
+
+// Bridge -> device over UDP 8764 (message type 0x1E). The counters travel in
+// the frame header TLVs, not a payload, matching the discovery frames on this
+// channel. Used by the home layer, which keeps no CBDP TCP session.
+bool coding_bridge_apply_udp_home_counters(const uint8_t *header_tlv, size_t header_tlv_len) {
+    if (header_tlv == NULL || header_tlv_len == 0U) return false;
+    uint16_t running16 = 0U, done16 = 0U, failed16 = 0U;
+    if (cbdp_tlv_find(header_tlv, header_tlv_len, CBDP_TLV_RUNNING_COUNT) == NULL ||
+        cbdp_tlv_find(header_tlv, header_tlv_len, CBDP_TLV_COMPLETED_UNREAD) == NULL ||
+        cbdp_tlv_find(header_tlv, header_tlv_len, CBDP_TLV_FAILED_UNREAD) == NULL) {
+        return false;
+    }
+    (void)cbdp_tlv_read_u16(cbdp_tlv_find(header_tlv, header_tlv_len, CBDP_TLV_RUNNING_COUNT), &running16);
+    (void)cbdp_tlv_read_u16(cbdp_tlv_find(header_tlv, header_tlv_len, CBDP_TLV_COMPLETED_UNREAD), &done16);
+    (void)cbdp_tlv_read_u16(cbdp_tlv_find(header_tlv, header_tlv_len, CBDP_TLV_FAILED_UNREAD), &failed16);
+    apply_codex_counts(running16, done16, failed16);
+    return true;
+}
+
 static void wireless_handle_delta(const cbdp_frame_header_t *header,
                                   const uint8_t *tlv, size_t tlv_len)
 {
@@ -1726,63 +1807,7 @@ static void wireless_handle_delta(const cbdp_frame_header_t *header,
         const uint32_t running = running16;
         const uint32_t done = done16;
         const uint32_t failed = failed16;
-        ESP_LOGI(TAG, "codex_state: running=%u done=%u failed=%u",
-                 (unsigned)running, (unsigned)done, (unsigned)failed);
-        s_background_state.connected = true;
-        s_background_state.running = running;
-        // 未读终态数量由本机结果去重/已读逻辑维护; 这里只覆盖不变的部分。
-        // 注意: done/failed 是"其它未读", 直接覆盖会让本地刚收到的结果丢计数,
-        // 所以取两者较大值, 保证既不漏也不清零。
-        if (done > s_background_state.done) s_background_state.done = done;
-        if (failed > s_background_state.failed) s_background_state.failed = failed;
-
-        // Completion alert fallback. On CBDP the Bridge only sends this
-        // aggregate counter, so compare against the previous authoritative
-        // value. Replayed historical counts seed the baseline and stay silent;
-        // only a real increase after that rings.
-        if (!s_codex_counts_initialized) {
-            s_last_codex_done_count = done;
-            s_last_codex_failed_count = failed;
-            s_codex_counts_initialized = true;
-        } else {
-            const bool rose_done = done > s_last_codex_done_count;
-            const bool rose_failed = failed > s_last_codex_failed_count;
-            s_last_codex_done_count = done;
-            s_last_codex_failed_count = failed;
-            const int64_t now_us = esp_timer_get_time();
-            if (rose_done || rose_failed) {
-                // Arm and wait for the count to settle. Another client reading
-                // the same result makes these counters fall back within a
-                // second; a genuine completion stays unread.
-                s_codex_alert_armed_us = now_us;
-                s_codex_alert_armed_done = done;
-                s_codex_alert_armed_failed = failed;
-                s_codex_alert_armed_is_failure = rose_failed;
-            } else if (s_codex_alert_armed_us != 0 &&
-                       done >= s_codex_alert_armed_done &&
-                       failed >= s_codex_alert_armed_failed) {
-                if (now_us - s_codex_alert_armed_us >= CODEX_ALERT_SETTLE_US) {
-                    const bool alert_failed = s_codex_alert_armed_is_failure;
-                    s_codex_alert_armed_us = 0;
-                    if (alert_failed) {
-                        ui_sfx_play(UI_SFX_FAIL);
-                    } else {
-                        const app_voice_mode_t voice = app_settings_voice_mode();
-                        if (voice == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
-                        else if (voice == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
-                    }
-                }
-            } else if (s_codex_alert_armed_us != 0) {
-                // Count fell back: it was another client reading, not new work.
-                s_codex_alert_armed_us = 0;
-            }
-        }
-        home_codex_state_changed();
-        if (coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
-            app_coding_bridge_state(running, s_background_state.done,
-                                    s_background_state.failed);
-            bsp_lvgl_unlock();
-        }
+        apply_codex_counts(running, done, failed);
         return;
     }
 

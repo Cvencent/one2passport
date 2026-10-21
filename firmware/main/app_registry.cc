@@ -28,6 +28,7 @@ extern "C" {
 }
 #include "radio_player.h"
 #include "coding_bridge.h"
+#include "wireless_bridge.h"
 #include "radio_font.h"
 #include "app.h"
 #include "bsp_battery.h"
@@ -678,6 +679,8 @@ void app_framework_go_menu(void) { go_menu(); }
 
 static void enter_app(app_id_t id) {
     ESP_LOGI(kTag, "enter_app id=%d name=%s", (int)id, APPS[id].name);
+    // A full-screen app may need the control channel.
+    wireless_bridge_set_home_only(false);
     xz_heap_report("enter_app_in");
     const app_entry_t &app = APPS[id];
     // 记住进入完整应用前的最小化收音机状态。Codex/小智会暂时停播并释放
@@ -807,6 +810,8 @@ app_level_t app_framework_level(void) { return s_level; }
 app_id_t    app_framework_active(void) { return s_active; }
 
 void app_framework_init(void) {
+    // Boot lands on the home layer, so start in home-only transport mode.
+    wireless_bridge_set_home_only(true);
     // 只建首页; 菜单与各应用页都在被使用时才建(单页面驻留, 见 go_menu/enter_app)。
     s_level = APP_LEVEL_HOME;
     if (bsp_lvgl_lock(1000)) {
@@ -831,6 +836,8 @@ void radio_app_resume(void) { /* 不自动恢复播放; 用户回收音机应用
 
 void app_framework_minimize_services(bool restore_radio) {
     if (s_level != APP_LEVEL_HOME && s_level != APP_LEVEL_MENU) return;
+    // Home/menu: no CBDP TCP session; only UDP discovery + counters.
+    wireless_bridge_set_home_only(true);
     if (s_defer_minimized_services) {
         // A cancelled XiaoZhi connect worker is still winding down and may
         // hold the Opus arena / TLS buffers. Pulling the radio decoder or the

@@ -52,9 +52,19 @@ static inline codex_background_pet_t codex_background_pet_state(
 )
 {
     if (state == NULL || !state->connected) return CODEX_BACKGROUND_OFFLINE;
-    if (state->failed > 0U) return CODEX_BACKGROUND_FAIL;
+    /* 2026-10-22 产品口径(用户明确指定), 优先级从高到低:
+     *   有任务运行中                    -> BUSY
+     *   没有运行中、有已完成             -> DONE
+     *   没有运行中、没有完成、有失败     -> FAIL
+     *   都没有                          -> IDLE
+     *
+     * 旧实现把 failed 判在 running 前面: 只要历史里还剩一个未读失败,
+     * 哪怕此刻正有任务在跑, 首页机器人也一直显示"失败" —— 这正是
+     * "明明在跑却显示不对"的直接原因。running 必须最先判定。
+     * 完成/失败同时存在时按用户给定顺序取 DONE。 */
     if (state->running > 0U) return CODEX_BACKGROUND_BUSY;
     if (state->done > 0U) return CODEX_BACKGROUND_DONE;
+    if (state->failed > 0U) return CODEX_BACKGROUND_FAIL;
     return CODEX_BACKGROUND_IDLE;
 }
 
@@ -135,7 +145,10 @@ static inline bool codex_background_apply_result(
 {
     if (state == NULL || message_id == NULL || message_id[0] == '\0') return false;
     state->connected = true;
-    state->running = 0U;
+    /* ⚠ 2026-10-22: 这里原来无条件 `state->running = 0U;` —— 一条终态结果
+     * 只代表**那一条**任务结束, 不代表全局没有任务在跑。多任务并发时它会把
+     * "运行中"清零, 首页机器人瞬间掉出 BUSY, 正是"明明在跑却显示不对"。
+     * running 只由 Bridge 的聚合计数(Bridge 权威)改写。 */
     const uint32_t hash = codex_background_hash(message_id);
     if (codex_background_result_seen(state, hash)) return false;
     const bool failed = status != NULL && strcmp(status, "failed") == 0;

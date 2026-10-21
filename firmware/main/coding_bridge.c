@@ -1626,11 +1626,18 @@ static void apply_codex_counts(uint32_t running, uint32_t done, uint32_t failed)
              (unsigned)running, (unsigned)done, (unsigned)failed);
     s_background_state.connected = true;
     s_background_state.running = running;
-    // 未读终态数量由本机结果去重/已读逻辑维护; 这里只覆盖不变的部分。
-    // 注意: done/failed 是"其它未读", 直接覆盖会让本地刚收到的结果丢计数,
-    // 所以取两者较大值, 保证既不漏也不清零。
-    if (done > s_background_state.done) s_background_state.done = done;
-    if (failed > s_background_state.failed) s_background_state.failed = failed;
+    // ⚠ 2026-10-22: done/failed 改为**直接跟随 Bridge**, 不再取 max。
+    //
+    // 这三个数字是 Bridge 用全局已读状态算出来的权威值: 用户在手机/电脑上
+    // 读掉一条结果, Bridge 下一次推送就会把 completed_unread 降下来。
+    // 旧代码写的是 `if (done > state.done) state.done = done;` —— 只增不减,
+    // 于是首页那个"已完成"角标一旦亮起就永远不消失, 就是用户说的
+    // "数量老是不对"。
+    //
+    // 本机 codex_background_apply_result() 里的乐观 +1 只用于即时反馈和
+    // 提示音去重; 它最多领先 Bridge 一个推送周期(1~2s), 之后由这里对齐。
+    s_background_state.done = done;
+    s_background_state.failed = failed;
 
     // Completion alert fallback. On CBDP the Bridge only sends this
     // aggregate counter, so compare against the previous authoritative

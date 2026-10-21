@@ -58,7 +58,21 @@ constexpr std::size_t kPcmCapacity = 4608;
 // 网络块全部现分配 malloc, 而那正是堆碎到 largest<2.4KB 的时刻, UI 重绘
 // 拿不到内存 -> LVGL 卡死 -> task_wdt 每 5s 触发一次 -> CPU 满载, 就是
 // "一进收音机就发烫" 的根因。static_assert 就是为了让它再也回不来。
-constexpr std::size_t kSharedNetworkBlocks = 2;
+// 2026-10-21: 2 -> 1.
+//
+// 真机实测收音机页(桥接已停)的 dma 空闲地板是 1496B, 而 WiFi 每个动态接收
+// 缓冲需要约 1600B **连续** DMA 内存 —— 就差这 100B, 于是收包缓冲周期性
+// 分配失败: 设备不 ACK -> 服务器重传退避 -> 约 15s 后主动 RST。日志表现为
+// 每 ~17s 一条 `transport_base: tcp_read error, errno=Software caused
+// connection abort` + "network feed stopped by read error", 之后重建流又要
+// 3.6KB, 堆随之在 7.4K/13K 之间摆动 —— 这就是收音机页"一卡一卡"的真凶
+// (与 Codex 无关: 桥接在进入收音机页时已经停掉)。
+//
+// MP3 解码只需 kPcmCapacity(4608) 作为输出缓冲, 尾部那 2 个 1KB 块纯粹是
+// 顺手给环形缓冲用的。砍到 1 块可把 1KB 还给通用堆, 使 dma 地板升到约
+// 2500B, 足以稳定供出 1600B 的收包缓冲。环形缓冲只少 1KB(约 5%), 对抖动
+// 吸收影响可忽略, 换来的是连接不再被服务器掐断。
+constexpr std::size_t kSharedNetworkBlocks = 1;
 constexpr std::size_t kOutputSize = kPcmCapacity + kSharedNetworkBlocks * kInputSize;
 // 编译期自检: 上面三行一旦被改回 kPcmCapacity == kOutputSize, 共享块会静默
 // 归零(播放期改走 malloc, 挤死 UI 缓冲 -> LVGL 卡死 -> 满载发热)。这里让它

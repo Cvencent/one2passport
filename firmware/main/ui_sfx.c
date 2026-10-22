@@ -1,5 +1,7 @@
 #include "ui_sfx.h"
 
+#include "esp_err.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 
 #include <stddef.h>
@@ -27,6 +29,7 @@ static QueueHandle_t s_queue;
 static uint8_t s_volume = 50;
 static bool s_available;
 static volatile bool s_suspended;
+static int64_t s_last_drop_log_us;
 extern bool radio_is_playing_c(void);
 /* 收音机在播放时, 让它临时停止写 I2S 而继续解码/缓冲, 把音频设备借给提示音。
  * 之前 ui_sfx 直接用 radio_is_playing_c() 丢弃提醒, 导致"播着电台时永远听不到
@@ -171,7 +174,20 @@ static void sfx_task(void *argument)
     sfx_request_t request;
     for (;;) {
         if (xQueueReceive(s_queue, &request, portMAX_DELAY) != pdTRUE) continue;
-        if (!s_available || s_suspended || s_volume == 0) continue;
+        if (!s_available || s_suspended || s_volume == 0) {
+            // 2026-10-22: 这里原来直接 continue, 提示音被丢掉时**一条日志都没有**,
+            // 用户报"息屏后 Codex 提示音没了"时完全查不出是没触发、被挂起、
+            // 还是音量被清 0。现在把丢弃原因打出来(限频, 避免刷屏)。
+            const int64_t now = esp_timer_get_time();
+            if (now - s_last_drop_log_us > 2000000LL) {
+                s_last_drop_log_us = now;
+                ESP_LOGW("ui_sfx",
+                         "drop effect=%d available=%d suspended=%d vol=%u",
+                         (int)request.effect, (int)s_available,
+                         (int)s_suspended, (unsigned)s_volume);
+            }
+            continue;
+        }
 
         // 收音机正在播放时, 让它让出 I2S(继续解码/攒缓冲), 播完再交还。
         // 否则"任务完成提示"会被正在播放的电台吞掉。
@@ -193,7 +209,21 @@ static void sfx_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(SFX_RADIO_MUTE_SETTLE_MS));
         }
 
-        if (bsp_audio_set_format(output_rate, 16, 1) != ESP_OK) {
+        // 2026-10-22: 设备空闲一段时间后堆很紧(largest 常见 1~4KB),而
+        // bsp_audio_set_format() 内部可能要 close+open 编解码器。失败时原来
+        // 也是静默 continue —— 提示音就这么没了。现在重试一次并把失败原因
+        // 打出来, 让"息屏后没声音"能在串口上一眼定位。
+        esp_err_t fmt = bsp_audio_set_format(output_rate, 16, 1);
+        if (fmt != ESP_OK) {
+            ESP_LOGW("ui_sfx", "set_format(%luHz) failed: %s, retrying",
+                     (unsigned long)output_rate, esp_err_to_name(fmt));
+            vTaskDelay(pdMS_TO_TICKS(20));
+            fmt = bsp_audio_set_format(output_rate, 16, 1);
+        }
+        if (fmt != ESP_OK) {
+            ESP_LOGW("ui_sfx", "set_format(%luHz) failed: %s, dropping effect=%d",
+                     (unsigned long)output_rate, esp_err_to_name(fmt),
+                     (int)request.effect);
             if (yield_radio) radio_audio_yield(false);
             else bsp_audio_set_muted(false);
             continue;

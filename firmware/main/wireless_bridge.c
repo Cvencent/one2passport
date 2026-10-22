@@ -68,6 +68,10 @@ static int64_t s_client_connected_us;
 static volatile bool s_task_stop_requested;
 // Cleared when WiFi drops so the next connection announces again.
 static volatile bool s_presence_announced;
+// Last time we broadcast presence. The Bridge forgets its UDP counter targets
+// when its process restarts, so the device must keep re-announcing.
+static int64_t s_last_presence_us;
+static const int64_t kPresenceIntervalUs = 15LL * 1000 * 1000;
 // EXPERIMENT (2026-10-21): while the home layer is showing, the device must not
 // hold a CBDP TCP session next to the radio stream. Set by the framework on
 // layer changes; when true, accepted TCP connections are closed immediately so
@@ -479,13 +483,26 @@ static void network_task(void *argument)
         int ready = select(max_fd + 1, &read_set, NULL, NULL, &timeout);
         if (ready < 0) continue;
 
-        // As soon as WiFi is up, tell the LAN we exist instead of waiting for
-        // the host next broadcast/redial beat. CodexBridge presence listener
-        // accepts this reply frame, so the PC connects in well under a second.
-        if (s_wifi_connected && !s_presence_announced &&
+        // Presence keep-alive.
+        //
+        // 2026-10-22: 之前这里只在**每次 WiFi 连上后播报一次**
+        // (`!s_presence_announced`)。而 CodexBridge 的首页计数推送器
+        // (devices/home_counters.py: HomeCounterSender) 是按 presence 注册来
+        // 决定推给谁的 —— Bridge 进程一重启, 内存里的 targets 就清空了。
+        // 设备以为"我已经播报过了", 于是**永远不再播报**, 那台设备从此收不到
+        // 0x1E 计数帧, 首页角标就冻在最后一次的值上。用户反馈的
+        // "电脑上点掉已完成了, 设备还显示 5 个已完成" 就是这个。
+        //
+        // 改成每 kPresenceIntervalUs 重播一次: 正常情况下只是每 15s 三个 UDP
+        // 小包; Bridge 重启后最多 15s 就能重新发现并恢复计数, 不需要重启设备
+        // 或断一次 WiFi。
+        if (s_wifi_connected &&
             (s_wifi_connected_us == 0 ||
-             esp_timer_get_time() - s_wifi_connected_us > 8000000LL)) {
+             esp_timer_get_time() - s_wifi_connected_us > 8000000LL) &&
+            (!s_presence_announced ||
+             esp_timer_get_time() - s_last_presence_us > kPresenceIntervalUs)) {
             s_presence_announced = true;
+            s_last_presence_us = esp_timer_get_time();
             announce_presence(udp_fd);
         }
 

@@ -211,6 +211,30 @@ bool codex_app_enter(void) {
     radio_player_set_playing(false);
     radio_player_wait_idle(1500);
     radio_player_release_pool();
+    /* ⚠⚠ 2026-10-23 竞态修复(修"进 Codex 说请启动电脑端桥接")。
+     *
+     * 真机日志(COM4)长这样:
+     *   W radio_player: radio pool released by caller (heap largest=10240)
+     *   E wireless_bridge: idle stack unavailable for bridge (size=0)   <- 只隔 1ms
+     *   W coding_bridge: wireless bridge unavailable: ESP_ERR_NO_MEM
+     *
+     * 桥接任务需要一块 12KB 静态栈, 它是从小智的"麦克风空闲区"里切出来的;
+     * 而收音机的**网络喂流任务**(radio_network)此刻还占着同一片区的 4KB。
+     * release_pool() 只释放解码器池, 不等网络任务退出, 所以紧接着的申请就
+     * 拿到 size=0, 桥接起不来 -> 界面显示"请启动电脑端桥接", 而用户电脑上
+     * 的 Bridge 明明在跑。
+     *
+     * 这里显式等到网络任务真正退出再建桥。上限 2s: 网络任务是阻塞读,
+     * 单轮最多卡一个 1s 超时, 所以正常几百毫秒内就会退干净。
+     */
+    for (int waited_ms = 0;
+         radio_player_is_stream_active() && waited_ms < 2000;
+         waited_ms += 20) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (radio_player_is_stream_active()) {
+        ESP_LOGW(kTag, "radio stream still active after 2s; bridging anyway");
+    }
     esp_err_t bridge_result = coding_bridge_start_wireless();
     app_coding_enter();   // app_coding 内部自管理锁
     coding_bridge_set_foreground_ui(app_coding_full_ready());
@@ -411,6 +435,17 @@ static void xz_evt_timer_cb(lv_timer_t *) {
                 lv_label_set_text(xz_msg,
                                   m[0] ? m
                                        : "请访问 xiaozhi.me\n输入上方设备码完成绑定");
+            }
+        } else if (ev == XZ_EV_PROGRESS) {
+            /* 连接阶段的进度。之前界面在"开始连接"到"成功/失败"之间完全不动,
+             * 最长十几秒(拉配置 + TLS + WS 握手), 用户以为卡死了。
+             * 现在每个阶段都刷一行, 让等待可见。 */
+            const char *progress = xiaozhi_client_progress();
+            if (xz_status && progress[0]) {
+                lv_label_set_text(xz_status, progress);
+            }
+            if (xz_msg && progress[0]) {
+                lv_label_set_text(xz_msg, "首次连接需要十几秒，请稍候…");
             }
         } else if (ev == XZ_EV_STT) {
             char buf[400];

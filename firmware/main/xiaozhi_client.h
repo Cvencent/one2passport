@@ -21,6 +21,11 @@ typedef enum {
     XZ_EV_TTS_STOP,        // 播报结束
     XZ_EV_ERROR,
     XZ_EV_ACTIVATION,      // 设备未激活: 需在 xiaozhi.me 输入设备码(见下方 getter)
+    /* 2026-10-23: 连接阶段的进度事件。
+     * 之前 UI 只在"开始连接"和"成功/失败"两端有状态, 中间那段(拉配置、
+     * TLS 握手、WS 握手)最长十几秒, 用户看到的就是"界面不动 -> 直接失败",
+     * 分不清是在干活还是已经死了。现在每进入一个阶段都推一条, 界面跟着变。 */
+    XZ_EV_PROGRESS,        // 连接阶段变化, 文本见 xiaozhi_client_progress()
 } xz_ui_event_t;
 
 bool xiaozhi_client_init(void);          // 建事件队列(可重入)
@@ -43,6 +48,8 @@ const char *xiaozhi_client_activation_message(void);
 QueueHandle_t xiaozhi_client_events(void);
 bool xiaozhi_opus_prewarm(void);             // 启动早期预分配 opus 编码器内存
 void xiaozhi_opus_release(void);             // 退出小智时释放编码器(还给收音机)
+// 当前连接阶段的简短中文描述(供进度页显示), 无连接时为空串。
+const char *xiaozhi_client_progress(void);
 
 #ifdef __cplusplus
 }

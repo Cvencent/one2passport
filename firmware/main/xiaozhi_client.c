@@ -76,6 +76,9 @@ static char s_tts_text[256];     // last tts sentence
 // 输入此码完成设备绑定(官方固件同款流程)。
 static char s_activation_code[32];
 static char s_activation_msg[192];
+/* 连接进度文本。UI 只读, 写入方只有连接任务, 用最简单的"整串重写"即可 ——
+ * 最长的一条也就 40 字节, 在 32 位访问下不会读出半个字。 */
+static char s_progress[64];
 static bool s_activated;         // 已激活(OTA 未返回 activation 段)
 static bool s_config_cached;     // OTA 成功过: 已缓存 ws url/token, 重连时可跳过 TLS OTA
 static int  s_cached_ver = 3;   // 缓存的协议版本
@@ -86,6 +89,20 @@ static QueueHandle_t s_event_queue;   // ui events: enum xz_ui_event + text ptr
 // only the task that owns the connection is allowed to close it.
 static xz_connect_guard_t s_connect_guard;
 static portMUX_TYPE s_connect_guard_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// 连接阶段上报: 更新进度文本并发一条 XZ_EV_PROGRESS, 让进度页立刻刷新。
+// 不持任何锁 —— 队列是线程安全的, 文本只是给 UI 读的一个快照。
+static void xz_report_progress(const char *text)
+{
+    if (text == NULL) return;
+    snprintf(s_progress, sizeof(s_progress), "%s", text);
+    ESP_LOGI(TAG, "progress: %s", s_progress);
+    if (s_event_queue == NULL) return;
+    xz_ui_event_t ev = XZ_EV_PROGRESS;
+    (void)xQueueSend(s_event_queue, &ev, 0);
+}
+
+const char *xiaozhi_client_progress(void) { return s_progress; }
 
 static bool xz_cancel_requested(void)
 {
@@ -1041,15 +1058,28 @@ static bool xz_opus_arena_ensure(void)
                  need, XZ_OPUS_STATE_CAPACITY);
         return false;
     }
-    s_opus_state = heap_caps_malloc(XZ_OPUS_STATE_CAPACITY,
+    /* Allocate the real requirement, not the cap.
+     *
+     * 2026-10-24 (COM4): this used to ask for XZ_OPUS_STATE_CAPACITY (24576)
+     * even though opus_encoder_get_size(1) and opus_decoder_get_size(1) are
+     * both smaller. While XiaoZhi is in the foreground this C3 only has a
+     * 20480 largest contiguous internal block, so the request could never
+     * succeed and the UI spun on "connecting" forever:
+     *     E xiaozhi: opus arena alloc failed: need=24576 largest=20480
+     * Requesting `need` (already computed above as max(encoder, decoder))
+     * still satisfies both per-use requirements, so every existing guard
+     * that compares against s_opus_state_size keeps working.
+     */
+    const int alloc_size = (need + 15) & ~15;
+    s_opus_state = heap_caps_malloc((size_t)alloc_size,
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (s_opus_state == NULL) {
         ESP_LOGE(TAG, "opus arena alloc failed: need=%d largest=%u",
-                 XZ_OPUS_STATE_CAPACITY,
+                 alloc_size,
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return false;
     }
-    s_opus_state_size = XZ_OPUS_STATE_CAPACITY;
+    s_opus_state_size = alloc_size;
     ESP_LOGI(TAG, "opus shared arena ready: %d bytes (encoder=%d decoder=%d)",
              s_opus_state_size, encoder_need, decoder_need);
     return true;
@@ -1485,17 +1515,37 @@ bool xiaozhi_client_connect(void)
     }
     if (xz_cancel_requested()) goto done;
     xz_heap_report("xz_connect_pre");
-    // 先在堆还完整时抢下 Opus(24.5KB 连续块): 进小智时收音机池已释放、
-    // 桥接已停, 此刻连续块最富余。若让 OTA 先跑, TLS 会把这块切碎, Opus
-    // 往往就再也拿不到(实测曾固定卡在 largest 20480 < 24524 失败)。
-    if (!xiaozhi_opus_prewarm()) goto done;
+
+    // ⚠⚠ 2026-10-23 顺序调整(修"进小智连很久然后失败")。
+    //
+    // 旧顺序是**先抢 Opus 的 24.5KB 连续块, 再跑 TLS**。注释里的理由是
+    // "OTA 先跑会把堆切碎, Opus 就拿不到了"。但真机实测(COM4)恰恰相反:
+    //
+    //   pre-OTA heap: free=31512 largest=10240
+    //   E esp-tls-mbedtls: mbedtls_ssl_handshake returned -0x3000
+    //   E xiaozhi: OTA http open failed: ESP_ERR_HTTP_CONNECT
+    //
+    // -0x3000 = MBEDTLS_ERR_SSL_ALLOC_FAILED。Opus 先把那块 24KB 连续内存
+    // 吃掉之后, TLS 握手峰值(证书链 + SSL 上下文 + 收发缓冲)再也拿不到足
+    // 够的连续块, 于是 **OTA 永远连不上 -> 拿不到 activation -> 设备码永远
+    // 不弹**, 用户看到的就是"进小智一直连, 最后连接失败"。
+    //
+    // 现在改成: **先 TLS 拿配置, 再预热 Opus**。TLS 是一次性的短命高峰,
+    // 握手完就归还; Opus 是常驻的, 放在它后面用剩下的连续块。这样两者不
+    // 再抢同一块内存, OTA 能过, 设备码才有机会弹出来。
+    //
+    // 注意 ws_connect_and_hello() 之前必须确保 Opus 已就绪 —— 会话中要用。
+    // 所以预热挪到"OTA 拿到配置之后、建 WS 之前"。
 
     // Fast path: reuse the last OTA result. The token and WS endpoint are
     // stable until the device is re-bound, so a normal re-entry should go
     // straight to the WebSocket handshake instead of repeating HTTPS OTA.
     xz_cache_load();
     if (s_config_cached && s_url[0]) {
+        xz_report_progress("正在读取本机配置…");
         ESP_LOGI(TAG, "trying cached WS config first");
+        if (!xiaozhi_opus_prewarm()) goto done;   // 建 WS 前必须有编解码器
+        xz_report_progress("正在建立连接…");
         if (ws_connect_and_hello()) {
             success = true;
         } else {
@@ -1503,15 +1553,23 @@ bool xiaozhi_client_connect(void)
             ESP_LOGW(TAG, "cached WS failed; refreshing OTA config");
             xiaozhi_client_close();
             xz_cache_clear();
+            // 缓存这条路失败了。把 Opus 先还回去, 免得紧接着的 TLS 又抢不到
+            // 连续块 —— 那正是旧顺序踩的坑。OTA 之后会重新预热。
+            xiaozhi_opus_release();
         }
     }
 
     // Cold path / cached-token fallback: fetch a fresh OTA config, then
     // connect once. If the server is rotating configs this also refreshes NVS.
     if (!success) {
+        xz_report_progress("正在获取小智配置…");
         if (!ota_fetch_config()) goto done;
         s_cached_ver = s_proto_version;
         if (xz_cancel_requested()) goto done;
+        // OTA 已过, TLS 的峰值内存已归还 —— 现在才预热常驻的 Opus。
+        xz_report_progress("正在准备语音引擎…");
+        if (!xiaozhi_opus_prewarm()) goto done;
+        xz_report_progress("正在建立连接…");
         if (!ws_connect_and_hello()) goto done;
         success = true;
     }

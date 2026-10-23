@@ -582,11 +582,19 @@ static void network_task(void *argument)
                 input_length = 0U;
                 client = accepted;
                 client_fd = accepted;
-                if (s_token[0] != '\0') {
-                    if (!transmit_hello(accepted)) client_replace(-1);
-                } else {
-                    ESP_LOGW(TAG, "CBDP pairing token missing; TCP session closed");
+                // Protocol 3 / 11.2: in Device Listener Binding the device MUST send
+                // HELLO first, immediately after TCP is established. HELLO needs no
+                // token; authentication happens later in the AUTH stage. The old code
+                // closed the connection whenever no token was stored, which violated
+                // that MUST and left the Bridge with no HELLO at all (the desktop was
+                // running but the device kept reporting it was disconnected).
+                // The token is provisioned out of band into NVS by
+                // wireless_bridge_configure(); it is never carried on 8765.
+                if (!transmit_hello(accepted)) {
                     client_replace(-1);
+                } else if (s_token[0] == 0) {
+                    ESP_LOGW(TAG, "HELLO sent but no pairing token stored; "
+                                  "AUTH will fail until the token is provisioned");
                 }
             }
         }

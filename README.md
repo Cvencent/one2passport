@@ -76,15 +76,57 @@ python -m pip install -e ".[tray]"
 python -m codexbridge
 ```
 
-### 第 4 步：在 CodexBridge 里批准设备
+### 第 4 步：在 CodexBridge 里批准设备（自动配对）
 
 CodexBridge 启动后会自动发现同一局域网里的设备（UDP 8764）。
 
 1. 打开托盘菜单，等待设备出现在列表里。
-2. 批准这台设备，并按需开启它的能力（状态、任务、结果、审批、语音、已读回执等）。
-3. 设备上报的标识形如 `aipassport-<mac>`，型号为 `FoloOS-AI-Passport`。
+2. 点击**批准**。设备会以 `aipassport-<mac>` 出现，型号 `FoloOS-AI-Passport`。
+3. 批准后**不需要在设备上做任何操作**，也不需要手动抄写令牌：Bridge 会主动连到
+   设备的 8765 端口把配对令牌交给它，设备随即完成鉴权。
+4. 批准时按需开启该设备的能力（状态、任务、结果、审批、语音、已读回执等）。
 
-设备联网、Bridge 批准完成后，首页会通过 UDP 收到任务计数，进入 Codex 页即可看到已连接状态。
+配对是**自动完成**的，原理如下：
+
+- 设备没有令牌时，会在 CBDP `HELLO` 里带上 `pairing_state=request`；Bridge 批准后
+  在 `PAIRING(0x1F)` 消息里下发令牌，设备写入 NVS 后立即用标准 HMAC 完成 `AUTH`。
+- 令牌只落在设备 NVS 里，**不会显示在屏幕上，也不会出现在任何日志中**。
+- 设备停留在首页时也能完成配对：未配对设备会临时接受 Bridge 的连接，配对一结束就
+  立刻释放该连接，恢复首页的省电流量模式。
+
+> 需要 CodexBridge **含 CBDP `PAIRING(0x1F)` 的版本**（Bridge 提交 `c062200` 起）。
+> 更早的 Bridge 只会发 UDP 发现、不会下发令牌，此时需按下面"手动兜底"处理。
+
+<details>
+<summary>手动兜底（旧版 Bridge 或想自己写入令牌时）</summary>
+
+旧版 Bridge 在管理页批准设备时会报 `registration_nonce_missing`，因为它期待一条
+本设备并不使用的旧 JSON 配对通道。此时可以手动写入令牌：
+
+1. 在 CodexBridge 管理接口生成令牌：
+
+   ```sh
+   curl "http://127.0.0.1:8788/api/admin/pairing?device_id=aipassport-<mac>"
+   ```
+
+2. 用 USB 串口把令牌写进设备（`COM4` 换成实际串口），只需发一条 JSON 行：
+
+   ```json
+   {"type":"wifi_setup","token":"<上一步返回的 token>"}
+   ```
+
+   设备会回两行 `wifi_status`：先一行 `status=error, text=ESP_ERR_INVALID_ARG`，
+   再一行 `status=connected`。**这是正常现象**：令牌在写 Wi-Fi 之前就已经存入 NVS，
+   第一行的错误只是因为这条命令没带 `ssid`（没有要切换的网络）。设备重启日志里出现
+   `CBDP transport ready, token=loaded` 即为写入成功。
+
+设备重启后进入 Codex 页即可连接。令牌一旦写入，之后 Bridge 升级到新版也会继续沿用，
+不会重复配对。
+
+</details>
+
+设备联网、Bridge 批准并完成配对后，首页会通过 UDP 收到任务计数，进入 Codex 页即可
+看到已连接状态。
 
 ### 第 5 步：开始日常使用
 
@@ -396,20 +438,26 @@ python firmware/merge_bin.py --build-dir firmware/build --out AI-Passport-MERGED
 - PC 端桥接器位于 [Cvencent/CodexBridge](https://github.com/Cvencent/CodexBridge)。
 - 旧版内置 Windows 客户端 `windows-client/` 已不再随本仓库发布或维护。
 
-设备端使用统一协议：
+设备端使用统一协议 **CBDP v1**（Codex Bridge Device Protocol）：
 
 ```text
-发现请求：CODEXBRIDGE_DISCOVER
-发现应答：{"device": "...", "device_id": "...", "name": "...", "port": 8765, "capabilities": [...]}
-握手顺序：bridge_auth -> bridge_auth_ok -> bridge_ready
-消息类型：message、capabilities_update、read_state、read_ack、error
+发现：UDP 8764，CBDP DISCOVERY(0x1C) / DISCOVERY_REPLY(0x1D)
+会话：TCP 8765，设备监听、Bridge 拨入
+握手：HELLO(0x01) -> WELCOME(0x02) -> AUTH(0x03) -> AUTH_OK(0x04)
+配对：设备无令牌时 HELLO 带 pairing_state=request，
+      Bridge 批准后在 PAIRING(0x1F) 下发 pairing_token
+鉴权：HMAC-SHA256，密钥为配对令牌
+心跳：READY 后双方向 PING(0x05) / PONG(0x06)
 ```
 
-- 设备以 MAC 派生稳定 `device_id`（`aipassport-<mac>`），型号 `FoloOS-AI-Passport`。
-- 固件声明支持 `status`、`text`、`tasks`、`results`、`read_ack`；实际启用项由
-  CodexBridge 按设备配置，未启用的能力不会下发到设备。
-- 结果页停留满 2 秒上报一次 `read_ack`，多台设备的已读状态由 CodexBridge 广播同步。
-- 首页/菜单只通过 UDP 接收发现与任务计数，不建立 CBDP TCP 会话。
+- 设备以 MAC 派生稳定 `device_id`，形如 `aipassport-98c377f55270`；型号
+  `FoloOS-AI-Passport`、名称 `AI Passport`。device_id 与 IP 无关，换网不变。
+- 固件声明能力位（`supported_caps`），实际生效项 = 声明 ∩ Bridge 策略 ∩ 传输，
+  未启用的能力不会下发到设备。
+- 结果页停留满 2 秒上报一次 `read_ack`，多台设备的已读状态由 CodexBridge 同步。
+- 首页/菜单保持"最小化"流量模式：正常只走 UDP 发现与任务计数，不挂 CBDP 会话，
+  把 TCP 接收缓冲让给正在播放的电台。**唯一例外是未配对设备**——它会临时接受一次
+  Bridge 拨号以接收配对令牌，配对完成后立即释放该连接。
 
 ## 测试
 
@@ -463,10 +511,14 @@ Quick start after flashing:
 3. Join the hotspot and open `http://192.168.4.1`, or enter Wi-Fi credentials
    directly on the device screen (2.4 GHz only).
 4. Install and start CodexBridge on a Windows PC, then approve the device in
-   the tray menu.
+   the tray menu. **Pairing is automatic**: the Bridge dials the device and
+   hands over the token over CBDP `PAIRING(0x1F)`; nothing has to be typed or
+   copied on the device.
 5. Use the on-device UI: Home, Radio, Settings, Codex and XiaoZhi AI.
 
 See the Chinese sections above for full per-screen documentation and screenshots.
-The device speaks the unified CodexBridge protocol
-(`CODEXBRIDGE_DISCOVER` plus `bridge_auth -> bridge_auth_ok -> bridge_ready`).
+The device speaks **CBDP v1** only: UDP 8764 discovery, a device-hosted TCP 8765
+session (`HELLO -> WELCOME -> AUTH -> AUTH_OK`), a one-shot `PAIRING(0x1F)`
+token hand-off for devices that have none yet, and HMAC-SHA256 authentication
+with the pairing token as the key.
 Licensed under MIT; see `firmware/LICENSE`.

@@ -20,3 +20,7 @@ nvs_backup*
 .idea/
 .DS_Store
 *.swp
+
+# CodeGraph local index (machine-specific)
+.codegraph/
+.cursor/

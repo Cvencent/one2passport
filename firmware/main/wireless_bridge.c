@@ -96,6 +96,19 @@ static esp_err_t save_token(const char *token)
     return result;
 }
 
+// Drop a token the Bridge has told us is no longer usable (revoked or
+// rotated). The next HELLO then carries pairing_state=request again.
+static void clear_token(void)
+{
+    s_token[0] = '\0';
+    nvs_handle_t handle = 0;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        (void)nvs_erase_key(handle, NVS_TOKEN_KEY);
+        (void)nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
 static void load_token(void)
 {
     nvs_handle_t handle = 0;
@@ -229,10 +242,14 @@ static uint32_t now_ms(void)
 
 static bool transmit_hello(int fd)
 {
-    uint8_t frame[256];
+    // 11.8: advertise pairing_state=request only while no usable token exists.
+    // A provisioned device sends the byte-identical pre-pairing HELLO.
+    const bool request_pairing = (s_token[0] == '\0');
+    uint8_t frame[320];
     size_t length = 0U;
     random_bytes(s_client_nonce, sizeof(s_client_nonce));
-    if (!cbdp_build_hello(frame, sizeof(frame), &length, s_request_id++, s_client_nonce)) {
+    if (!cbdp_build_hello(frame, sizeof(frame), &length, s_request_id++,
+                          s_client_nonce, request_pairing)) {
         return false;
     }
     return socket_send_all(fd, frame, length);
@@ -319,7 +336,16 @@ static void process_client_frame(const uint8_t *frame, size_t length)
             client_replace(-1);
             return;
         }
-        if (!transmit_auth(s_client_fd)) client_replace(-1);
+        if (s_token[0] != '\0') {
+            // Provisioned device: unchanged pre-pairing flow.
+            if (!transmit_auth(s_client_fd)) client_replace(-1);
+        } else {
+            // 11.8: no token yet. Stay connected and wait for the Bridge's
+            // PAIRING offer; AUTH here would fail (no HMAC key) and the old
+            // code dropped the link, so pairing could never complete.
+            // The 10s handshake guard still bounds how long we wait.
+            ESP_LOGI(TAG, "WELCOME received; awaiting PAIRING offer");
+        }
         return;
     }
     if (header.message_type == CBDP_MT_AUTH_OK) {
@@ -350,6 +376,56 @@ static void process_client_frame(const uint8_t *frame, size_t length)
         if (s_client_fd >= 0) transmit_pong(s_client_fd, echo);
         return;
     }
+    // 11.8: PAIRING arrives before AUTH by design, so it must be handled ahead
+    // of the authenticated gate below or the offer would be dropped forever.
+    if (header.message_type == CBDP_MT_PAIRING) {
+        char new_token[CBDP_PAIRING_TOKEN_MAX_BYTES + 1];
+        new_token[0] = '\0';
+        const size_t tlv_length =
+            (size_t)header.header_len - CBDP_FIXED_HEADER_BYTES;
+        if (!cbdp_parse_pairing_offer(header_tlv, tlv_length, new_token,
+                                      sizeof(new_token))) {
+            ESP_LOGW(TAG, "PAIRING offer rejected");
+            client_replace(-1);
+            return;
+        }
+        const esp_err_t saved = save_token(new_token);
+        if (saved != ESP_OK) {
+            ESP_LOGE(TAG, "pairing save failed: %s", esp_err_to_name(saved));
+            client_replace(-1);
+            return;
+        }
+        strlcpy(s_token, new_token, sizeof(s_token));
+        // Report the request_id echoed by the Bridge so host-side logs line up.
+        // Never log the token itself, only its size (handoff section 9).
+        uint32_t offer_request_id = 0U;
+        (void)cbdp_tlv_read_u32(
+            cbdp_tlv_find(header_tlv, tlv_length, CBDP_TLV_REQUEST_ID),
+            &offer_request_id);
+        ESP_LOGI(TAG, "pairing offer: request_id=%lu token_bytes=%u",
+                 (unsigned long)offer_request_id, (unsigned)strlen(s_token));
+        ESP_LOGI(TAG, "pairing saved: nvs=ok");
+        if (!transmit_auth(s_client_fd)) client_replace(-1);
+        return;
+    }
+
+    // Token invalidation is handled here rather than in the application layer
+    // because it must also work pre-auth: a revoked device can learn its token
+    // is dead on the very next handshake, and the session is re-established by
+    // this transport, not by coding_bridge.c. Only the stored token changes;
+    // the frame still falls through so the app can surface the failure.
+    if (header.message_type == CBDP_MT_ERROR &&
+        (header.code == CBDP_ERR_UNAUTHORIZED ||
+         header.code == CBDP_ERR_TOKEN_ROTATED)) {
+        // 11.8: these two mean the stored token itself is unusable (revoked or
+        // rotated). Drop it so the next HELLO requests pairing again instead of
+        // reconnect-looping forever with a dead token. AUTH_EXPIRED is not
+        // included: it asks for a fresh AUTH with the same token.
+        ESP_LOGW(TAG, "bridge rejected token (code=0x%04X); clearing local token",
+                 (unsigned)header.code);
+        clear_token();
+    }
+
     bool authenticated = false;
     if (s_client_lock != NULL &&
         xSemaphoreTake(s_client_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
@@ -506,6 +582,20 @@ static void network_task(void *argument)
             announce_presence(udp_fd);
         }
 
+        // Pairing just completed while the home layer was showing. The socket
+        // was only kept alive to receive the offer; leaving it up would put a
+        // CBDP session next to the radio stream and reintroduce the DMA
+        // starvation that home-only mode exists to prevent. Hand it back and
+        // let the normal UDP-presence path report this device as online.
+        if (client >= 0 && s_session_ready && s_home_only_mode &&
+            s_token[0] != 0) {
+            ESP_LOGI(TAG, "pairing done on home layer; releasing CBDP socket");
+            client_replace(-1);
+            input_length = 0U;
+            client = -1;
+            client_fd = -1;
+        }
+
         // Section 12 liveness. Handshake stages are bounded by 10s, and a
         // READY session tolerates 3 x heartbeat_seconds without any inbound
         // frame before it is considered dead. PING keeps an idle link warm.
@@ -514,7 +604,15 @@ static void network_task(void *argument)
             if (!s_session_ready) {
                 if (s_client_connected_us != 0 &&
                     now_us - s_client_connected_us > HANDSHAKE_TIMEOUT_US) {
-                    ESP_LOGW(TAG, "CBDP handshake timed out");
+                    // With no token a missing offer means "not approved yet",
+                    // not a transport failure; say so instead of logging a
+                    // generic timeout the user cannot act on.
+                    if (s_token[0] == '\0') {
+                        ESP_LOGW(TAG, "CBDP pairing offer timed out; still "
+                                      "waiting for host approval");
+                    } else {
+                        ESP_LOGW(TAG, "CBDP handshake timed out");
+                    }
                     client_replace(-1);
                     input_length = 0U;
                     client = -1;
@@ -546,12 +644,28 @@ static void network_task(void *argument)
 
         if (FD_ISSET(tcp_fd, &read_set)) {
             int accepted = accept(tcp_fd, NULL, NULL);
-            if (accepted >= 0 && s_home_only_mode) {
+            // 11.8: an UNPAIRED device must stay reachable on the home layer.
+            //
+            // Home-only mode exists to keep the CBDP socket out of the WiFi RX
+            // path while the radio streams. But it also drops every inbound
+            // connection, and the documented first-run flow is exactly
+            // "admin approves -> Bridge dials the device on 8765" while the
+            // user is looking at the home screen. Refusing that dial means the
+            // pairing offer can never be delivered and a factory-fresh device
+            // can never be provisioned.
+            //
+            // Holding one socket until pairing completes is the correct trade:
+            // there is no radio stream worth protecting yet, because an
+            // unpaired device cannot have come from a working setup. Once a
+            // token is stored the normal home-only economy applies again.
+            if (accepted >= 0 && s_home_only_mode && s_token[0] != 0) {
                 // Drop immediately: the host will retry after its redial
                 // cooldown, and the home layer needs no control channel.
                 close(accepted);
                 accepted = -1;
                 ESP_LOGW(TAG, "home-only: refused CBDP TCP while minimized");
+            } else if (accepted >= 0 && s_home_only_mode) {
+                ESP_LOGI(TAG, "home-only: accepting CBDP so pairing can complete");
             }
             if (accepted >= 0) {
                 struct timeval send_timeout = {.tv_sec = 2, .tv_usec = 0};

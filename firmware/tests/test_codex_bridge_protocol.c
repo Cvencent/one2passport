@@ -356,6 +356,107 @@ static void test_welcome_max_audio_bytes(void)
     assert(fallback.max_audio_bytes == CBDP_MAX_REASSEMBLY_BYTES);
 }
 
+static void test_hello_pairing_request(void)
+{
+    // 11.8: a device with no stored token asks for pairing in HELLO; a device
+    // that already holds one must keep the pre-pairing HELLO byte-for-byte so
+    // old bridges never see a new TLV.
+    static const uint8_t nonce[16] = {0x21U, 0x22U, 0x23U, 0x24U};
+    uint8_t with_request[320];
+    size_t with_length = 0U;
+    assert(cbdp_build_hello(with_request, sizeof(with_request), &with_length,
+                            7U, nonce, true));
+    const cbdp_tlv_t *state = cbdp_tlv_find(
+        with_request + CBDP_FIXED_HEADER_BYTES,
+        with_length - CBDP_FIXED_HEADER_BYTES, CBDP_TLV_PAIRING_STATE);
+    uint8_t state_value = 0xFFU;
+    assert(cbdp_tlv_read_u8(state, &state_value));
+    assert(state_value == CBDP_PAIRING_STATE_REQUEST);
+
+    uint8_t without_request[320];
+    size_t without_length = 0U;
+    assert(cbdp_build_hello(without_request, sizeof(without_request),
+                            &without_length, 7U, nonce, false));
+    assert(cbdp_tlv_find(without_request + CBDP_FIXED_HEADER_BYTES,
+                         without_length - CBDP_FIXED_HEADER_BYTES,
+                         CBDP_TLV_PAIRING_STATE) == NULL);
+    // Omitting the TLV must also shrink the frame by exactly that TLV (4 byte
+    // tag+length plus the 1 byte value), not by some incidental amount.
+    assert(without_length == with_length - 5U);
+}
+
+static void assert_pairing_offer(const char *token, bool want_ok)
+{
+    uint8_t tlv[160];
+    size_t length = 0U;
+    assert(cbdp_tlv_write_u8(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_STATE,
+                             CBDP_PAIRING_STATE_OFFER));
+    assert(cbdp_tlv_write_bytes(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_TOKEN,
+                                token, strlen(token)));
+    char out[CBDP_PAIRING_TOKEN_MAX_BYTES + 1];
+    memset(out, 0x5AU, sizeof(out));
+    const bool ok = cbdp_parse_pairing_offer(tlv, length, out, sizeof(out));
+    assert(ok == want_ok);
+    if (want_ok) {
+        assert(strcmp(out, token) == 0);
+    } else {
+        // A rejected offer must not leave a half-written token behind for the
+        // caller to accidentally persist.
+        assert(out[0] == 0x5AU);
+    }
+}
+
+static void test_pairing_offer_parse(void)
+{
+    // Boundary lengths straight from 11.8: 16 and 64 bytes are accepted.
+    assert_pairing_offer("0123456789abcdef", true);
+    assert_pairing_offer(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true);
+    // 15 and 65 bytes are outside the contract and must be refused.
+    assert_pairing_offer("0123456789abcde", false);
+    assert_pairing_offer(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+        false);
+
+    // Wrong state, missing token, and an embedded NUL all have to fail: the
+    // device stores the token as a C string and HMACs it with strlen(), so a
+    // truncated token would silently break AUTH on every reconnect.
+    uint8_t tlv[160];
+    size_t length = 0U;
+    char out[CBDP_PAIRING_TOKEN_MAX_BYTES + 1];
+
+    assert(cbdp_tlv_write_u8(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_STATE,
+                             CBDP_PAIRING_STATE_REQUEST));
+    assert(cbdp_tlv_write_bytes(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_TOKEN,
+                                "0123456789abcdef", 16U));
+    assert(!cbdp_parse_pairing_offer(tlv, length, out, sizeof(out)));
+
+    length = 0U;
+    assert(cbdp_tlv_write_u8(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_STATE,
+                             CBDP_PAIRING_STATE_OFFER));
+    assert(!cbdp_parse_pairing_offer(tlv, length, out, sizeof(out)));
+
+    static const uint8_t embedded_nul[16] = {0x30U, 0x31U, 0x00U, 0x33U,
+                                             0x34U, 0x35U, 0x36U, 0x37U,
+                                             0x38U, 0x39U, 0x61U, 0x62U,
+                                             0x63U, 0x64U, 0x65U, 0x66U};
+    length = 0U;
+    assert(cbdp_tlv_write_u8(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_STATE,
+                             CBDP_PAIRING_STATE_OFFER));
+    assert(cbdp_tlv_write_bytes(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_TOKEN,
+                                embedded_nul, sizeof(embedded_nul)));
+    assert(!cbdp_parse_pairing_offer(tlv, length, out, sizeof(out)));
+
+    // A too-small destination must be refused rather than overrun.
+    length = 0U;
+    assert(cbdp_tlv_write_u8(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_STATE,
+                             CBDP_PAIRING_STATE_OFFER));
+    assert(cbdp_tlv_write_bytes(tlv, sizeof(tlv), &length, CBDP_TLV_PAIRING_TOKEN,
+                                "0123456789abcdef", 16U));
+    char tight[16];
+    assert(!cbdp_parse_pairing_offer(tlv, length, tight, sizeof(tight)));
+}
+
 static void test_subscribe_cursor_is_optional(void)
 {
     uint8_t frame[CBDP_MAX_FRAME_BYTES];
@@ -406,6 +507,8 @@ int main(void)
     test_fragment_reassembly();
     test_known_method_and_object_ids();
     test_welcome_max_audio_bytes();
+    test_hello_pairing_request();
+    test_pairing_offer_parse();
     test_subscribe_cursor_is_optional();
     puts("codex_bridge_protocol: all tests passed");
     return 0;

@@ -536,39 +536,111 @@ static void menu_build(void) {
     lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
 }
 
-static void menu_icon_symbol(lv_obj_t *parent, app_id_t id, bool big) {
-    // 图标: 收音机=圆环, Codex=>_, 小智=+, 设置=*
+static uint32_t menu_icon_surface(lv_obj_t *parent) {
+    return parent == s_menu_icon ? C_SURFACE : C_SOFT;
+}
+
+// 菜单图标统一由 LVGL 图元绘制, 不依赖字体里的 ASCII/Unicode 字形。
+static lv_obj_t *icon_outline(lv_obj_t *parent, int x, int y, int w, int h,
+                              int radius, int border, uint32_t color) {
+    lv_obj_t *o = box(parent, x, y, w, h, color);
+    lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(o, lv_color_hex(color), 0);
+    lv_obj_set_style_border_width(o, border, 0);
+    lv_obj_set_style_radius(o, radius, 0);
+    return o;
+}
+
+static lv_obj_t *icon_line(lv_obj_t *parent, const lv_point_precise_t *points,
+                           uint32_t count, int width, uint32_t color) {
+    lv_obj_t *line = lv_line_create(parent);
+    lv_obj_set_pos(line, 18, 18);
+    lv_obj_set_size(line, 64, 64);
+    lv_obj_set_style_pad_all(line, 0, 0);
+    lv_obj_set_style_bg_opa(line, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_line_width(line, width, 0);
+    lv_obj_set_style_line_color(line, lv_color_hex(color), 0);
+    lv_obj_set_style_line_rounded(line, true, 0);
+    lv_line_set_points(line, points, count);
+    return line;
+}
+
+static lv_obj_t *icon_fill(lv_obj_t *parent, int x, int y, int w, int h,
+                           uint32_t color, int radius) {
+    lv_obj_t *o = box(parent, x, y, w, h, color);
+    lv_obj_set_style_radius(o, radius, 0);
+    return o;
+}
+
+static void menu_radio_icon(lv_obj_t *parent) {
+    // 收音机: 机身 + 天线 + 扬声器 + 调谐旋钮。
+    static const lv_point_precise_t antenna[] = {{48, 20}, {58, 10}};
+    icon_line(parent, antenna, 2, 3, C_FG);
+    icon_fill(parent, 73, 24, 6, 6, C_ACCENT, LV_RADIUS_CIRCLE);
+    icon_outline(parent, 24, 38, 52, 36, 8, 4, C_FG);
+    icon_outline(parent, 31, 45, 19, 19, LV_RADIUS_CIRCLE, 3, C_FG);
+    icon_fill(parent, 35, 50, 11, 2, C_FG, 1);
+    icon_fill(parent, 35, 54, 11, 2, C_FG, 1);
+    icon_fill(parent, 35, 58, 11, 2, C_FG, 1);
+    icon_fill(parent, 61, 49, 8, 8, C_ACCENT, LV_RADIUS_CIRCLE);
+    icon_fill(parent, 64, 42, 3, 3, C_MUTED, LV_RADIUS_CIRCLE);
+}
+
+static void menu_codex_icon(lv_obj_t *parent) {
+    // Codex: 终端窗口 + 提示符箭头 + 光标。
+    static const lv_point_precise_t prompt[] = {{16, 32}, {24, 39}, {16, 46}};
+    icon_outline(parent, 22, 28, 56, 44, 8, 4, C_FG);
+    icon_fill(parent, 25, 39, 50, 2, C_FG, 1);
+    icon_fill(parent, 29, 33, 3, 3, C_MUTED, LV_RADIUS_CIRCLE);
+    icon_fill(parent, 35, 33, 3, 3, C_MUTED, LV_RADIUS_CIRCLE);
+    icon_fill(parent, 41, 33, 3, 3, C_MUTED, LV_RADIUS_CIRCLE);
+    icon_line(parent, prompt, 3, 4, C_ACCENT);
+    icon_fill(parent, 44, 56, 14, 4, C_ACCENT, 2);
+}
+
+static void menu_xiaozhi_icon(lv_obj_t *parent) {
+    // 小智 AI: 对话气泡 + 声波。
+    static const lv_point_precise_t tail[] = {{20, 46}, {16, 64}, {28, 59}};
+    icon_outline(parent, 22, 28, 56, 38, 13, 4, C_FG);
+    icon_line(parent, tail, 3, 4, C_FG);
+    icon_fill(parent, 43, 44, 3, 7, C_ACCENT, 2);
+    icon_fill(parent, 49, 39, 3, 17, C_ACCENT, 2);
+    icon_fill(parent, 55, 35, 3, 25, C_ACCENT, 2);
+    icon_fill(parent, 61, 39, 3, 17, C_ACCENT, 2);
+    icon_fill(parent, 67, 44, 3, 7, C_ACCENT, 2);
+}
+
+static void menu_settings_icon(lv_obj_t *parent) {
+    // 设置: 三条滑杆 + 旋钮, 比星号更直观, 也与其它线性图标同宽。
+    const uint32_t surface = menu_icon_surface(parent);
+    icon_fill(parent, 28, 37, 44, 3, C_FG, 2);
+    icon_fill(parent, 28, 51, 44, 3, C_FG, 2);
+    icon_fill(parent, 28, 65, 44, 3, C_FG, 2);
+    lv_obj_t *top = icon_outline(parent, 36, 32, 11, 11, LV_RADIUS_CIRCLE, 3, C_FG);
+    lv_obj_set_style_bg_color(top, lv_color_hex(surface), 0);
+    lv_obj_set_style_bg_opa(top, LV_OPA_COVER, 0);
+    lv_obj_t *middle = icon_outline(parent, 54, 46, 11, 11, LV_RADIUS_CIRCLE, 3, C_ACCENT);
+    lv_obj_set_style_bg_color(middle, lv_color_hex(surface), 0);
+    lv_obj_set_style_bg_opa(middle, LV_OPA_COVER, 0);
+    lv_obj_t *bottom = icon_outline(parent, 46, 60, 11, 11, LV_RADIUS_CIRCLE, 3, C_FG);
+    lv_obj_set_style_bg_color(bottom, lv_color_hex(surface), 0);
+    lv_obj_set_style_bg_opa(bottom, LV_OPA_COVER, 0);
+}
+
+static void menu_icon_symbol(lv_obj_t *parent, app_id_t id) {
     lv_obj_clean(parent);
-    const char *sym = "";
     switch (id) {
-        case APP_ID_RADIO: {
-            // 圆环用两圆叠: 外亮环+内底色
-            lv_obj_t *ring = box(parent, big ? 22 : 8, big ? 22 : 6, big ? 56 : 28, big ? 56 : 28, parent == s_menu_icon ? C_SURFACE : C_SOFT);
-            lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
-            lv_obj_set_style_border_color(ring, lv_color_hex(C_FG), 0);
-            lv_obj_set_style_border_width(ring, big ? 6 : 3, 0);
-            return;
-        }
-        case APP_ID_CODEX: sym = ">_"; break;
-        case APP_ID_XIAOZHI: sym = "+"; break;
-        case APP_ID_SETTINGS: sym = "*"; break;
+        case APP_ID_RADIO:    menu_radio_icon(parent); break;
+        case APP_ID_CODEX:    menu_codex_icon(parent); break;
+        case APP_ID_XIAOZHI:  menu_xiaozhi_icon(parent); break;
+        case APP_ID_SETTINGS: menu_settings_icon(parent); break;
         default: break;
     }
-    lv_obj_t *l = lv_label_create(parent);
-    lv_label_set_text(l, sym);
-    // 图标用**纯 ASCII**(+ * >_ 圆环), 已被 radio_font/lv_font_cn_16 全覆盖。
-    // ⚠ 教训: 早期用 ✦(U+2726)/⚙(U+2699) 等符号, 注释声称 lv_font_cn_16 覆盖
-    // 0x00B0..0x3002 含这些码点 —— 实测**并不包含**(grep 该文件 0 命中), 导致
-    // 图标显示为空白/方框。NotoSansSC 也不含这些符号。故统一改 ASCII, 不再依赖
-    // 特殊符号字形。新增任何非 ASCII 字符前, 必须确认目标字体真的含该码点。
-    lv_obj_set_style_text_font(l, ui_cn_font(), 0);
-    lv_obj_set_style_text_color(l, lv_color_hex(id == APP_ID_XIAOZHI ? C_ACCENT : C_FG), 0);
-    lv_obj_center(l);
 }
 
 static void menu_refresh(void) {
     const app_entry_t &app = APPS[s_menu_sel];
-    menu_icon_symbol(s_menu_icon, (app_id_t)s_menu_sel, true);
+    menu_icon_symbol(s_menu_icon, (app_id_t)s_menu_sel);
     lv_label_set_text(s_menu_name, app.name);
     // 顶栏信号格/电量: 菜单没有自己的 tick, 借 menu_refresh 刷新
     // (进入菜单时调一次; 菜单内上下选也会调, 顺带更新)

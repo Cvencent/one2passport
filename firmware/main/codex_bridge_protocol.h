@@ -84,6 +84,9 @@ typedef enum {
      * discovery port (see docs/CodexBridge-UDP-home-counters-2026-10-21.md).
      * The three counters travel in the frame header TLVs. */
     CBDP_MT_HOME_COUNTERS = 0x1E,
+    /* Bridge -> device: wireless pairing token offer, sent right after WELCOME
+     * when the device asked for pairing in HELLO (11.8 / 19.16). */
+    CBDP_MT_PAIRING = 0x1F,
 } cbdp_message_type_t;
 
 enum {
@@ -116,6 +119,18 @@ enum {
     CBDP_TRANSPORT_PLAIN_LAN = 0,
     CBDP_TRANSPORT_TLS = 1,
 };
+
+/* 11.8: pairing_state values. NONE is the implicit default when the TLV is
+ * absent, so an already-provisioned device keeps its HELLO byte-for-byte. */
+enum {
+    CBDP_PAIRING_STATE_NONE = 0,
+    CBDP_PAIRING_STATE_REQUEST = 1,
+    CBDP_PAIRING_STATE_OFFER = 2,
+};
+
+/* 11.8: pairing_token is UTF-8 and MUST be 16..64 bytes on the wire. */
+#define CBDP_PAIRING_TOKEN_MIN_BYTES 16U
+#define CBDP_PAIRING_TOKEN_MAX_BYTES 64U
 
 enum {
     CBDP_SCOPE_SUMMARY = 0,
@@ -206,6 +221,10 @@ enum {
     CBDP_TLV_RUNNING_COUNT = 0x00BC,
     CBDP_TLV_COMPLETED_UNREAD = 0x00BD,
     CBDP_TLV_FAILED_UNREAD = 0x00BE,
+    /* Wireless pairing. pairing_state is valid in HELLO (device request) and in
+     * PAIRING (bridge offer); pairing_token is PAIRING-only. */
+    CBDP_TLV_PAIRING_STATE = 0x00C0,
+    CBDP_TLV_PAIRING_TOKEN = 0x00C1,
     CBDP_TLV_SNAPSHOT_REVISION = 0x003C,
     CBDP_TLV_PAGE_INDEX = 0x003D,
     CBDP_TLV_PAGE_COUNT = 0x003E,
@@ -532,7 +551,8 @@ bool cbdp_auth_proof_hmac_sha256(const char *pairing_token,
                                   const char *device_id,
                                   uint8_t proof[32]);
 bool cbdp_build_hello(uint8_t *buffer, size_t capacity, size_t *length,
-                      uint32_t request_id, const uint8_t client_nonce[16]);
+                      uint32_t request_id, const uint8_t client_nonce[16],
+                      bool request_pairing);
 bool cbdp_build_auth(uint8_t *buffer, size_t capacity, size_t *length,
                      const cbdp_session_t *session, const char *pairing_token,
                      const uint8_t client_nonce[16], uint32_t request_id);
@@ -585,6 +605,8 @@ bool cbdp_build_discovery_reply(uint8_t *buffer, size_t capacity, size_t *length
                                 const uint8_t nonce[16]);
 
 bool cbdp_parse_welcome(const uint8_t *tlv, size_t length, cbdp_session_t *session);
+bool cbdp_parse_pairing_offer(const uint8_t *tlv, size_t length,
+                              char *token_out, size_t token_capacity);
 bool cbdp_parse_auth_ok(const uint8_t *tlv, size_t length, cbdp_session_t *session);
 bool cbdp_parse_capability_update(const uint8_t *tlv, size_t length, cbdp_session_t *session);
 bool cbdp_parse_event_header(const uint8_t *tlv, size_t length, cbdp_event_header_t *event);

@@ -426,7 +426,8 @@ bool cbdp_auth_proof_hmac_sha256(const char *pairing_token,
 }
 
 bool cbdp_build_hello(uint8_t *buffer, size_t capacity, size_t *length,
-                      uint32_t request_id, const uint8_t client_nonce[16])
+                      uint32_t request_id, const uint8_t client_nonce[16],
+                      bool request_pairing)
 {
     if (!begin_frame(buffer, capacity, length, CBDP_MT_HELLO, CBDP_FLAG_REQUEST,
                      CBDP_QOS_CRITICAL, 0U, 0U)) return false;
@@ -451,6 +452,11 @@ bool cbdp_build_hello(uint8_t *buffer, size_t capacity, size_t *length,
     if (client_nonce != NULL &&
         !cbdp_tlv_write_bytes(buffer, capacity, length, CBDP_TLV_CLIENT_NONCE,
                               client_nonce, 16U)) return false;
+    // 11.8: only a device with no usable token advertises the request. Writing
+    // nothing when false keeps the old HELLO byte-for-byte identical.
+    if (request_pairing &&
+        !cbdp_tlv_write_u8(buffer, capacity, length, CBDP_TLV_PAIRING_STATE,
+                           CBDP_PAIRING_STATE_REQUEST)) return false;
     return finish_frame(buffer, capacity, length, 0U);
 }
 
@@ -827,6 +833,43 @@ bool cbdp_parse_welcome(const uint8_t *tlv, size_t length, cbdp_session_t *sessi
     uint64_t server_time_ms = 0U;
     if (!cbdp_tlv_read_u64(item, &server_time_ms)) return false;
     session->supported_caps = supported_capabilities();
+    return true;
+}
+
+bool cbdp_parse_pairing_offer(const uint8_t *tlv, size_t length,
+                              char *token_out, size_t token_capacity)
+{
+    if (token_out == NULL || token_capacity == 0U ||
+        !cbdp_tlv_validate_block(tlv, length, NULL)) {
+        return false;
+    }
+    // cbdp_tlv_find() hands back a pointer into a single shared static slot, so
+    // every lookup is copied out before the next one runs.
+    const cbdp_tlv_t *state_found = cbdp_tlv_find(tlv, length, CBDP_TLV_PAIRING_STATE);
+    if (state_found == NULL) return false;
+    const cbdp_tlv_t state = *state_found;
+    uint8_t state_value = 0U;
+    if (!cbdp_tlv_read_u8(&state, &state_value) ||
+        state_value != CBDP_PAIRING_STATE_OFFER) {
+        return false;
+    }
+    const cbdp_tlv_t *token_found = cbdp_tlv_find(tlv, length, CBDP_TLV_PAIRING_TOKEN);
+    if (token_found == NULL) return false;
+    const cbdp_tlv_t token = *token_found;
+    const uint8_t *bytes = NULL;
+    size_t byte_length = 0U;
+    if (!cbdp_tlv_read_bytes(&token, &bytes, &byte_length) || bytes == NULL ||
+        byte_length < CBDP_PAIRING_TOKEN_MIN_BYTES ||
+        byte_length > CBDP_PAIRING_TOKEN_MAX_BYTES ||
+        token_capacity <= byte_length) {
+        return false;
+    }
+    // The device keeps this token as a NUL-terminated C string and feeds
+    // strlen() into the HMAC, so an embedded NUL would be silently truncated
+    // and break AUTH forever. Reject it instead of storing a corrupt token.
+    if (memchr(bytes, '\0', byte_length) != NULL) return false;
+    memcpy(token_out, bytes, byte_length);
+    token_out[byte_length] = '\0';
     return true;
 }
 

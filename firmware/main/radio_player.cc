@@ -83,10 +83,20 @@ static_assert(kSharedNetworkBlocks >= 1,
               "network blocks must share the output pool (see comment above)");
 static_assert(kPcmCapacity + kSharedNetworkBlocks * kInputSize <= kOutputSize,
               "shared network blocks must fit inside the output pool");
-// MP3 解码器初始化所需的**连续**内部堆(实测约 19~20KB)。
-// 用于在解码失败时判断"重试是否有意义": largest 低于此值时重试必然失败,
-// 必须直接交外层退避, 否则会以 ~5 次/秒刷 "Fail to init" 并烧 CPU(实测发热)。
-constexpr std::size_t kDecoderMinBlock = 20 * 1024;
+// MP3 解码器首帧初始化真正要的那块**连续**内部堆。2026-10-25 反汇编
+// esp32c3 版 libesp_audio_codec.a 实测: esp_mp3_dec_decode 首次进入时会调用
+//   pvmp3_decoderMemRequirements() -> media_lib_module_calloc(..., 0x5978)
+// 即一次 22904B(0x5978) 的连续分配。旧值按 20480B 估计偏小, 于是
+// largest=22528 时仍会放行一次注定失败的解码, 反复刷
+// "insufficient contiguous heap for decoder first frame"。
+constexpr std::size_t kDecoderInitBytes = 0x5978;
+// 判"重试是否有意义"的阈值: largest 低于此值时重试必然失败, 必须直接交外层
+// 退避, 否则会以 ~5 次/秒刷 "Fail to init" 并烧 CPU(实测发热)。向上取整到
+// 23KiB, 保证不低于解码器真实需求。
+constexpr std::size_t kDecoderMinBlock = 23 * 1024;
+static_assert(kDecoderMinBlock >= kDecoderInitBytes,
+              "kDecoderMinBlock must cover the measured MP3 decoder init "
+              "requirement (0x5978) or stream_station will attempt doomed decodes");
 constexpr std::size_t kLevelCount = 18;
 // 电台列表容量。兜底表 10 项(7 中文 + 3 国际)已占大半, 再给目录搜索结果
 // 留几个位置。RadioStation ≈ 418B, 14 项 ≈ 5.9KB 静态。
@@ -471,6 +481,56 @@ static const uint8_t kSilentMp3Frame[417] = {
 //   - 预热在开机(heap largest=114688)时完成, 之后**不 reset、不释放池**,
 //     内部缓冲常驻 -> 播放时无需再要 20KB 连续块。
 // 因此 stream_station 在 warmed 时可跳过大块内存检查(见那里的说明)。
+static bool warm_decoder_with_scratch(const char *who) {
+    if (!s_decoder_pool) return false;
+    const std::size_t need = kInputSize + kPcmCapacity;
+    uint8_t *scratch = nullptr;
+    bool scratch_from_heap = false;
+    std::size_t idle_size = 0;
+    uint8_t *idle = xiaozhi_idle_buffer(&idle_size);
+    if (idle != nullptr && idle_size >= need) {
+        scratch = idle;
+    } else {
+        scratch = static_cast<uint8_t *>(malloc(need));
+        scratch_from_heap = true;
+    }
+    if (scratch == nullptr) {
+        ESP_LOGW(kTag, "radio %s: no scratch for decoder warmup (largest=%u)",
+                 who, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return false;
+    }
+    // Signal path uses two separate buffers; keep them non-overlapping here too.
+    uint8_t *scratch_in = scratch;
+    uint8_t *scratch_out = scratch + kInputSize;
+    std::memset(scratch_in, 0, kInputSize);
+    std::memcpy(scratch_in, kSilentMp3Frame, sizeof(kSilentMp3Frame));
+    esp_audio_simple_dec_raw_t raw = {
+        .buffer = scratch_in,
+        .len = static_cast<uint32_t>(sizeof(kSilentMp3Frame)),
+        .eos = false,
+        .consumed = 0,
+        .frame_recover = ESP_AUDIO_SIMPLE_DEC_RECOVERY_NONE,
+    };
+    esp_audio_simple_dec_out_t frame = {
+        .buffer = scratch_out,
+        .len = static_cast<uint32_t>(kPcmCapacity),
+        .needed_size = 0,
+        .decoded_size = 0,
+    };
+    const esp_audio_err_t warm =
+        esp_audio_simple_dec_process(s_decoder_pool, &raw, &frame);
+    const bool warmed = frame.decoded_size > 0;
+    s_pool_warmed.store(warmed, std::memory_order_release);
+    ESP_LOGW(kTag,
+             "radio %s: scratch warmup result=%d (decoded=%u, warmed=%d, "
+             "largest=%u, scratch=%s)",
+             who, (int)warm, (unsigned)frame.decoded_size, (int)warmed,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             scratch_from_heap ? "heap" : "xiaozhi-idle");
+    if (scratch_from_heap) free(scratch);
+    return warmed;
+}
+
 static void warm_pool_decoder(const char *who) {
     if (!s_decoder_pool || !s_input_pool || !s_output_pool) return;
     std::memset(s_input_pool, 0, kInputSize);
@@ -509,15 +569,15 @@ bool radio_player_prewarm(void) {
     if (esp_audio_dec_register_default() != ESP_AUDIO_ERR_OK) return false;
     if (esp_audio_simple_dec_register_default() != ESP_AUDIO_ERR_OK) return false;
     s_decoder_pool = open_mp3_decoder();
+    // ⚠⚠ 关键(2026-10-10 发热事故的根本修复, 2026-10-25 补顺序修复):
+    // 解码器句柄打开 ≠ 首帧内存已就绪。真正的 22904B(0x5978) 连续块是在
+    // **首次 process() 内部**懒分配的。2026-10-25 复现确认: 如果先 malloc
+    // s_output_pool/s_input_pool 再预热, 这两次分配会把唯一的大块切碎,
+    // 预热以 ESP_MP3_DEC ret 10 失败, 之后进收音机就报"内存不足 稍后重试"。
+    // 所以必须**先**用暂存区把首帧喂给解码器拿到内部大块, 再分配池缓冲。
+    warm_decoder_with_scratch("prewarm");
     s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
     s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
-
-    // ⚠⚠ 关键(2026-10-10 发热事故的根本修复):
-    // 解码器句柄打开 ≠ 首帧内存已就绪。真正的 ~20KB 连续块是在**首次
-    // process() 内部**懒分配的。如果不在这里(堆最充足时)先分配出来,
-    // 一旦池被释放后重建, 堆已碎, 就**永远拿不到 20KB** -> 收音机永久播不了,
-    // 而播放循环会不停重试(实测每 14 秒一轮, 持续发热)。
-    warm_pool_decoder("prewarm");
 
     const bool ok = s_decoder_pool && s_output_pool && s_input_pool;
     ESP_LOGW(kTag, "radio prewarm: decoder=%d in=%p out=%p (heap largest=%u)",
@@ -598,6 +658,8 @@ void radio_player_ensure_pool(void) {
         }
     }
     s_decoder_pool = open_mp3_decoder();
+    // 顺序同上(2026-10-25): 先让解码器拿到 0x5978 连续块, 再分配池内缓冲。
+    warm_decoder_with_scratch("re-acquire");
     s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
     s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
     // ⚠ 重建失败必须**彻底清干净**(2026-10-12): 否则会留下一个半死的
@@ -612,9 +674,11 @@ void radio_player_ensure_pool(void) {
         free(s_input_pool);   s_input_pool = nullptr;
         xSemaphoreGiveRecursive(s_pool_mutex);
         return;
-    }    // ⚠ 重建的池**必须再预热一次**(2026-10-10): 否则新句柄的首帧内存又变成
-    // "待懒分配"状态, 而此刻堆往往已碎 -> 收音机永久播不了 -> 播放循环空转发热。
-    warm_pool_decoder("re-acquire");
+    }
+    // 若暂存预热没有成功(极端碎片), 用池内缓冲再补一次; 此时至少句柄已就绪。
+    if (!s_pool_warmed.load(std::memory_order_acquire)) {
+        warm_pool_decoder("re-acquire-retry");
+    }
     ESP_LOGW(kTag, "radio pool re-acquired: decoder=%d warmed=%d (largest=%u)",
              s_decoder_pool != nullptr,
              (int)s_pool_warmed.load(std::memory_order_acquire),

@@ -1902,6 +1902,22 @@ static void wireless_handle_delta(const cbdp_frame_header_t *header,
 
     if (event.event_type == CBDP_EVENT_MESSAGE_APPENDED ||
         event.event_type == CBDP_EVENT_MESSAGE_UPDATED) {
+        // A message event is NOT a turn result. The Bridge sends the initial
+        // task/commentary row (kind=2, status=1) as soon as a turn starts; the
+        // old code showed every such row as "任务完成" before the model had
+        // done any work. Terminal completion is delivered by TURN_COMPLETED /
+        // TURN_FAILED above, so here we only refresh the running status.
+        uint8_t kind = 0U;
+        uint16_t status = 0U;
+        (void)cbdp_tlv_read_u8(cbdp_tlv_find(event.event_payload,
+                                             event.event_payload_length,
+                                             CBDP_TLV_KIND), &kind);
+        (void)cbdp_tlv_read_u16(cbdp_tlv_find(event.event_payload,
+                                              event.event_payload_length,
+                                              CBDP_TLV_STATUS), &status);
+        if (kind != 2U || status != 1U) {
+            return;
+        }
         char body[CODING_STATUS_MAX] = {0};
         char thread_id[64] = {0};
         char message_id[CODEX_BRIDGE_ID_MAX] = {0};
@@ -1930,7 +1946,7 @@ static void wireless_handle_delta(const cbdp_frame_header_t *header,
         }
         if (body[0] != '\0' && ui_budget_available() &&
             coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {
-            app_coding_remote_result(thread_id, "completed", body, message_id);
+            app_coding_remote_task(thread_id, body, message_id);
             bsp_lvgl_unlock();
         }
     }

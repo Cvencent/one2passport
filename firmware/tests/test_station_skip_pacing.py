@@ -64,8 +64,8 @@ class StationSkipPacingTest(unittest.TestCase):
         window = self.body[played:played + 1600]
         self.assertIn("s_last_prebuffer_starved.exchange", window,
                       "the played branch must consult the starvation marker")
-        self.assertIn("starved_sessions >= 2", window,
-                      "two consecutive starved sessions = broken source")
+        self.assertIn("starved_sessions >= 1", window,
+                      "one starved session = broken source")
         self.assertIn("radio_player_select_relative(1)", window,
                       "a starved station must be skipped like a dead one")
         self.assertIn("starved_sessions = 0;", window,

@@ -1208,9 +1208,23 @@ bool stream_station(std::size_t station, uint32_t generation) {
                         ? borrowed_network + i * kInputSize
                         : borrowed_tts + (i - borrowed_mic_blocks) * kInputSize;
             }
+            // 2026-10-25: 64k 台的缓冲余量为零 —— 13KB 环只够 1.6s, 而 CDN
+            // 的抖动实测 gap 2.2~2.3s(用户: 一阵一阵的卡)。 borrowed 块铺完
+            // 后用堆把环补足到 kNetworkBlocks(20 块 ≈ 2.5s@64kbps); 尾部
+            // 竞技场占用 6.5K 后首页播放堆仍有 ~15KB, 补 7 块后余量足够。
+            // 流结束由 heap_network_start 清理循环统一 free。
+            while (block_count < kNetworkBlocks) {
+                uint8_t *heap_block =
+                    static_cast<uint8_t *>(malloc(kInputSize));
+                if (heap_block == nullptr) break;
+                network_blocks[block_count++] = heap_block;
+            }
+            prebuffer_bytes = std::min(
+                (block_count - kSharedNetworkBlocks) * kInputSize,
+                kPrebufferTarget);
             heap_network_start = block_count;
             ESP_LOGI(kTag,
-                     "network buffer: blocks=%u capacity=%u prebuffer=%u source=idle-xiaozhi-stack",
+                     "network buffer: blocks=%u capacity=%u prebuffer=%u source=idle-xiaozhi-stack+heap",
                      (unsigned)block_count,
                      (unsigned)(block_count * kInputSize),
                      (unsigned)prebuffer_bytes);
@@ -1406,6 +1420,17 @@ bool stream_station(std::size_t station, uint32_t generation) {
                 ++rebuffers;
                 ESP_LOGW(kTag, "rebuffer #%u: next resume waits %u bytes",
                          (unsigned)rebuffers, (unsigned)wait_bytes);
+                if (rebuffers >= 2) {
+                    // 源反复断流(2026-10-25 实测涓流台每 10s 窗口恰好 2 次
+                    // rebuffer, 统计窗口清零导致计数永远到不了 3): 与其让
+                    // 用户听 30-60s 的卡顿+静音再等两轮饥饿会话, 不如放弃
+                    // 本会话, 外层按饥饿计数立即跳台(冷却会让该台稍后轮回,
+                    // CDN 恢复后还能听)。
+                    ESP_LOGW(kTag, "session starved (%u rebuffers); abandoning",
+                             (unsigned)rebuffers);
+                    s_last_prebuffer_starved.store(true, std::memory_order_release);
+                    break;
+                }
                 radio_ui_set_playback(RadioPlaybackState::Buffering, "正在缓冲");
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
@@ -1795,9 +1820,13 @@ void player_task(void *) {
             const std::size_t live_count = radio_player_station_count();
             if (starved) {
                 ++starved_sessions;
-                if (starved_sessions >= 2 && live_count > 1) {
-                    ESP_LOGW(kTag, "station %u starved twice; skipping "
-                                   "(source feeds too slow)",
+                // 2026-10-25 实测收口: 涓流会话每轮 20~30s 的卡顿+静音,
+                // 用户已经在受苦 —— 1 轮饥饿就直接跳(冷却会让该台稍后
+                // 轮回来, 若 CDN 恢复还能听)。阈值 2 的版本让用户每台
+                // 白等 40~60s, 不如快跳。
+                if (starved_sessions >= 1 && live_count > 1) {
+                    ESP_LOGW(kTag, "station %u starved (source feeds too "
+                                   "slow); skipping",
                              static_cast<unsigned>(station));
                     radio_ui_set_playback(RadioPlaybackState::Error,
                                           "信号太弱 已换台");

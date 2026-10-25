@@ -28,6 +28,7 @@
 
 extern "C" void xz_heap_report(const char *tag);  // xiaozhi_client.c 临时heap诊断
 #include "esp_netif_sntp.h"
+#include "esp_wifi.h"
 #include "lwip/inet.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -1335,6 +1336,10 @@ extern "C" void app_main(void) {
         // Existing owners keep all networks already stored in NVS. Give those
         // networks 30 seconds to appear before opening the setup portal.
         manager.StartStation();
+        // 2026-10-25: 真机 ping 丢包率 43-50%(空闲也一样), TCP 吞吐坍缩成
+        // 涓流是首页/收音机播放卡顿的链路层根因。发射功率拉满(84/4=21dBm,
+        // C3 上限), 配合 lwIP 窗口/WiFi 缓冲加大(sdkconfig)对冲丢包。
+        esp_wifi_set_max_tx_power(84);
     }
 
     // WiFi station setup allocates event nodes and netif state. Start the

@@ -86,6 +86,19 @@ class VoiceSinglePathTest(unittest.TestCase):
         self.assertIn("XZ_MIC_TAIL_ARENA_CAP", calloc_body,
                       "the bump allocator must be bounded by the cap")
 
+    def test_rebuffer_storm_abandons_the_session(self):
+        # 2026-10-25 device log: a trickle source produced 2-3 rebuffers per
+        # 10s window; the session dragged 30-60s before the starvation skip.
+        # Three rebuffers in one session = broken source: abandon immediately
+        # and let the starve-skip advance the dial.
+        decode = function_body(RADIO, "bool stream_station(std::size_t station, uint32_t generation)")
+        self.assertIn("session starved", decode,
+                      "2 rebuffers in one 10s stats window must abandon the session")
+        self.assertIn("rebuffers >= 2", decode,
+                      "the trickle signature is exactly 2 rebuffers per 10s "
+                      "window (stats reset bounds the counter)")
+        self.assertIn("s_last_prebuffer_starved.store(true", decode)
+
     def test_audio_end_reuses_the_begin_tx_id(self):
         begin_body = function_body(BRIDGE, "static bool send_audio_begin")
         end_body = function_body(BRIDGE, "static bool send_audio_end")

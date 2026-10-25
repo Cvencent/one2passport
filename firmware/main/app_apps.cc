@@ -86,6 +86,7 @@ static void xz_font_safe_copy(const char *src, char *dst, std::size_t dst_size) 
 // ---- main.cc 提供的桥(C 链接) ----
 extern "C" void app_radio_request_catalog(void);
 extern "C" void app_radio_request_city(const char *city, const char *display);
+extern "C" bool app_radio_catalog_busy(void);
 extern "C" void app_radio_enter_wifi_setup(void);
 extern "C" void app_radio_show_saved_wifi(void);
 extern "C" void app_wifi_xiaozhi_mode(bool active);
@@ -833,6 +834,19 @@ void start_sleep_timer() {
     radio_sleep_timer_set_minutes(static_cast<uint16_t>(kSleepMinutes[s_sleep_minutes_idx]));
 }
 
+// 城市电台加载态: 选中城市(含自动定位)后, 定位+搜台在后台任务里跑,
+// 完成前设置页不响应任何按键(用户需求: 快速进收音机时本地台必须已就绪)。
+bool s_city_busy = false;
+lv_timer_t *s_city_busy_timer = nullptr;
+
+void city_busy_tick(lv_timer_t *timer) {
+    if (app_radio_catalog_busy()) return;
+    s_city_busy = false;
+    lv_timer_del(timer);
+    s_city_busy_timer = nullptr;
+    show(RadioSettingsPage::Menu, 1);
+}
+
 }  // namespace
 
 static void settings_open_menu(void) {
@@ -842,6 +856,7 @@ static void settings_open_menu(void) {
 
 bool settings_app_back(void) {
     if (!s_settings_open) return false;
+    if (s_city_busy) return true;  // 定位/搜台进行中: 完成前禁止返回
     switch (s_page) {
         case RadioSettingsPage::SavedWifi: show(RadioSettingsPage::WifiMenu, 1); break;
         case RadioSettingsPage::WifiAction: show(RadioSettingsPage::SavedWifi, s_saved_network_index); break;
@@ -861,6 +876,7 @@ bool settings_app_back(void) {
 }
 
 void settings_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
+    if (s_city_busy) return;  // 定位/搜台进行中: 忽略所有按键
     const std::size_t rows = page_rows(s_page);
     if (ev == BSP_BTN_LONG &&
         (btn == BSP_BTN_UP || (btn == BSP_BTN_OK &&
@@ -922,13 +938,27 @@ void settings_app_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
             // 选城市: 第 0 项=自动定位, 其他按名字搜台。s_sel 是绝对索引,
             // 分页只显示其中 9 项。
             const char *city = city_query_for(s_sel);
-            if (city == nullptr || city[0] == '\0') {
+            const bool auto_locate = (city == nullptr || city[0] == '\0');
+            if (auto_locate) {
                 app_radio_request_city("", "");
             } else {
                 app_radio_request_city(city, city);
             }
-            // 选择完成回菜单
-            show(RadioSettingsPage::Menu, 1);
+            // 2026-10-25: 定位/搜台是异步任务, 以前选完立即回菜单, 用户快速
+            // 进收音机时本地台还没拿到。现在进入加载页, 按键全部忽略,
+            // 目录任务完成后由 city_busy_tick 自动返回菜单。
+            if (app_radio_catalog_busy()) {
+                s_city_busy = true;
+                radio_ui_show_city_loading(auto_locate ? nullptr : city);
+                if (s_city_busy_timer == nullptr) {
+                    s_city_busy_timer = lv_timer_create(city_busy_tick, 500,
+                                                        nullptr);
+                }
+            } else {
+                // 任务没建起来(内存不足等): start_catalog_search 已就地
+                // 恢复网络/解码池, 按旧流程回菜单即可。
+                show(RadioSettingsPage::Menu, 1);
+            }
             break;
         }
         case RadioSettingsPage::SleepTimer:

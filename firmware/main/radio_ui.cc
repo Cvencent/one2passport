@@ -1476,6 +1476,30 @@ void radio_ui_show_saved_wifi(const char *const *ssids, std::size_t count,
     bsp_lvgl_unlock();
 }
 
+void radio_ui_show_city_loading(const char *city) {
+    if (!s_screen || !bsp_lvgl_lock(500)) return;
+    reset_transient_objects(Page::Settings);
+    s_settings_page = RadioSettingsPage::City;
+    s_settings_selected = 0;
+    s_settings_row_count = 0;
+    lv_obj_t *title = make_label(s_screen, "城市电台", 12, 16, 216, kText,
+                                 ui_cn_font());
+    set_centered(title);
+    char status[96];
+    if (city && city[0]) {
+        std::snprintf(status, sizeof(status), "正在搜索《%s》电台…", city);
+    } else {
+        std::snprintf(status, sizeof(status), "正在定位城市并搜索本地电台…");
+    }
+    lv_obj_t *loading = make_label(s_screen, status, 12, 120, 216, kAmber,
+                                   ui_cn_font());
+    set_centered(loading);
+    lv_obj_t *hint = make_label(s_screen, "请稍候，完成后自动返回",
+                                12, 276, 216, kMuted);
+    set_centered(hint);
+    bsp_lvgl_unlock();
+}
+
 void radio_ui_show_wifi_action(const char *ssid, std::size_t selected) {
     if (!s_screen || !bsp_lvgl_lock(500)) return;
     build_wifi_action(ssid, selected);

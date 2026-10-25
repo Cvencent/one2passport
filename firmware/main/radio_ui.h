@@ -65,6 +65,9 @@ void radio_ui_show_settings(RadioSettingsPage page, std::size_t selected,
 void radio_ui_show_saved_wifi(const char *const *ssids, std::size_t count,
                               std::size_t selected);
 void radio_ui_show_wifi_action(const char *ssid, std::size_t selected);
+// 城市选择后的加载页: 定位/搜台进行中, 按键全部忽略, 完成后由 app_apps
+// 的轮询定时器自动返回设置菜单。city 为 NULL/空 = 自动定位。
+void radio_ui_show_city_loading(const char *city);
 void radio_ui_show_wifi_delete_confirm(const char *ssid, std::size_t selected);
 void radio_ui_show_easter_egg(const char *message);
 bool radio_ui_show_easter_egg_frame(const uint8_t *jpeg, std::size_t size,

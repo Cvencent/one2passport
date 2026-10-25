@@ -1153,6 +1153,11 @@ void app_radio_request_catalog(void) {
     }
     if (s_connected.load() && needs_catalog) start_remembered_catalog_search();
 }
+bool app_radio_catalog_busy(void) {
+    // 城市目录任务(定位+搜台)是否仍在运行。设置页的加载态据此轮询。
+    return s_catalog_task != nullptr;
+}
+
 void app_radio_request_city(const char *city, const char *display) {
     const std::size_t count = city_choice_count();
     for (std::size_t i = 0; i < count; ++i) {

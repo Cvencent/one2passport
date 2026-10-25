@@ -1210,10 +1210,14 @@ bool stream_station(std::size_t station, uint32_t generation) {
             }
             // 2026-10-25: 64k 台的缓冲余量为零 —— 13KB 环只够 1.6s, 而 CDN
             // 的抖动实测 gap 2.2~2.3s(用户: 一阵一阵的卡)。 borrowed 块铺完
-            // 后用堆把环补足到 kNetworkBlocks(20 块 ≈ 2.5s@64kbps); 尾部
-            // 竞技场占用 6.5K 后首页播放堆仍有 ~15KB, 补 7 块后余量足够。
-            // 流结束由 heap_network_start 清理循环统一 free。
-            while (block_count < kNetworkBlocks) {
+            // 后用堆把环尽量补大 —— 但**必须带内存安全线**: 实测无脑补满 20
+            // 块会把首页播放的堆吃到 free=5.4KB / dma=828B, WiFi 收包(1.6KB)
+            // 分配不出来 -> 流饿死 -> 切台风暴 -> 进收音机建 UI 直接冻结。
+            // 安全线: 内部堆空闲 >20KB 且最大连续块 >4KB(WiFi 收包 1.6KB 的
+            // 2.5 倍)才继续补; 达线即停, 环有多少用多少。
+            while (block_count < kNetworkBlocks &&
+                   heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 20000 &&
+                   heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > 4096) {
                 uint8_t *heap_block =
                     static_cast<uint8_t *>(malloc(kInputSize));
                 if (heap_block == nullptr) break;

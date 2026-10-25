@@ -33,18 +33,37 @@ class RadioPoolOrderTest(unittest.TestCase):
     """
 
     def test_decoder_warmup_precedes_pool_buffer_allocation(self):
+        """Heap-sourced decoder blocks must still be claimed before pools.
+
+        2026-10-25 update: with the mic-tail arena the decoder's big
+        sub-blocks no longer come from the heap, so the arena path may
+        allocate the pool buffers first. The legacy order must survive in
+        the fallback branch (arena unavailable -> block from the heap).
+        """
         body = function_body(SOURCE, "void radio_player_ensure_pool(void)")
-        warm = body.find("warm_decoder_with_scratch")
-        if warm < 0:
-            self.fail("ensure_pool must warm the decoder through "
-                      "warm_decoder_with_scratch while the heap is contiguous")
-        first_pool = body.find("s_output_pool = static_cast")
+        self.assertIn(
+            "xiaozhi_radio_tail_available()", body,
+            "ensure_pool must branch on tail-arena availability")
+        arena_idx = body.find("xiaozhi_radio_tail_available()")
+        first_pool = body.find("s_output_pool = static_cast", arena_idx)
         self.assertGreater(first_pool, -1, "output pool allocation missing")
+        open_after_pool = body.find("open_mp3_decoder()", first_pool)
+        self.assertGreater(
+            open_after_pool, first_pool,
+            "arena path may allocate pools first only because the decoder "
+            "sub-blocks go to the static tail")
+        warm_idx = body.find('warm_decoder_with_scratch("re-acquire")')
+        self.assertGreater(warm_idx, -1,
+                           "fallback branch must keep warm_decoder_with_scratch")
+        pool_after_warm = body.find("s_output_pool = static_cast", warm_idx)
+        self.assertGreater(
+            pool_after_warm, -1,
+            "fallback branch must still allocate pool buffers")
         self.assertLess(
-            warm, first_pool,
-            "decoder warmup must run before s_output_pool/s_input_pool are "
-            "malloc'd, otherwise the decoder's ~22.9KB internal block is "
-            "fragmented and warmup fails with ESP_MP3_DEC ret 10")
+            warm_idx, pool_after_warm,
+            "when the tail is unavailable the decoder blocks come from the "
+            "heap, so warmup must run before the pool mallocs (ESP_MP3_DEC "
+            "ret 10 regression guard)")
 
     def test_decoder_min_block_matches_measured_requirement(self):
         match = re.search(r"kDecoderMinBlock\s*=\s*([0-9]+)\s*\*\s*1024", SOURCE)

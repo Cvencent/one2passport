@@ -102,6 +102,7 @@ static lv_timer_t *s_home_tick;
 static lv_timer_t *s_home_eq_tick;
 static uint32_t s_eq_frame;              // 动画帧计数(驱动波形平移)
 static int s_eq_last_h[20];              // 每根柱子上次高度(仅变化时才重绘)
+static lv_obj_t *s_eq_bars[20];          // 频谱柱对象(v1.2.15 从绘制回调改来)
 
 // ---- 菜单 ----
 static lv_obj_t *s_menu_scr;
@@ -183,16 +184,19 @@ static lv_obj_t *pet_build(lv_obj_t *parent, int x, int y) {
     box(ant, -3, -7, 10, 10, C_ACCENT);
     // 身体
     lv_obj_t *body = box(pet, 0, 0, 72, 64, C_FG);
-    lv_obj_set_style_radius(body, 31, 0);
+    // 2026-10-26: radius 31(半圆) -> 12。半圆=LVGL circle mask 主用户, 而
+    // codex_state 每 ~2s 刷一次 body 颜色 -> 强制重绘 -> circle mask 缓存
+    // 反复进出, 该缓存在压力下反复崩溃(get_next_line/lv_draw_add_task,
+    // 5 次 MEPC 全部命中)。12px 圆角观感接近, 但走简单矩形路径。
+    lv_obj_set_style_radius(body, 12, 0);
     s_home_body = body;
-    // 底部收口(弧形观感: 两条圆角块)
     lv_obj_t *skirt = box(pet, 5, 54, 62, 10, C_FG);
-    lv_obj_set_style_radius(skirt, 6, 0);
+    lv_obj_set_style_radius(skirt, 4, 0);
     // 眼睛
     pet_eye_l = box(pet, 17, 23, 14, 18, C_BG);
-    lv_obj_set_style_radius(pet_eye_l, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(pet_eye_l, 4, 0);  // circle-mask 规避 2026-10-26
     pet_eye_r = box(pet, 41, 23, 14, 18, C_BG);
-    lv_obj_set_style_radius(pet_eye_r, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(pet_eye_r, 4, 0);  // circle-mask 规避 2026-10-26
     box(pet_eye_l, 4, 4, 5, 5, 0xFFFFFF);
     box(pet_eye_r, 4, 4, 5, 5, 0xFFFFFF);
     // 腮红
@@ -238,7 +242,7 @@ static void codex_badge_build(lv_obj_t *parent, int index, int y, uint32_t color
     s_home_badge[index] = box(parent, 166, y, 64, 20, C_BG);
     lv_obj_set_style_bg_opa(s_home_badge[index], LV_OPA_TRANSP, 0);
     s_home_badge_dot[index] = box(s_home_badge[index], 0, 7, 6, 6, color);
-    lv_obj_set_style_radius(s_home_badge_dot[index], LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(s_home_badge_dot[index], 2, 0);  // circle-mask 规避 2026-10-26
     s_home_badge_num[index] = label(s_home_badge[index], "0", 16, color);
     lv_obj_set_pos(s_home_badge_num[index], 12, 0);
     lv_obj_add_flag(s_home_badge[index], LV_OBJ_FLAG_HIDDEN);
@@ -306,33 +310,12 @@ static const uint8_t kEqPattern[20] = {
 };
 
 static void home_eq_draw(lv_event_t *event) {
-    lv_obj_t *card = static_cast<lv_obj_t *>(lv_event_get_target(event));
-    lv_area_t origin;
-    lv_obj_get_coords(card, &origin);
-    lv_draw_rect_dsc_t descriptor;
-    lv_draw_rect_dsc_init(&descriptor);
-    descriptor.bg_color = lv_color_hex(C_MUTED);
-    // 2026-10-26 崩溃修复: 频谱柱必须裁剪到卡片内再交给 lv_draw_rect。
-    // 高度最高 32px, 卡片内高 78px 本应放得下; 但卡片自带 radius=6 圆角,
-    // 柱子 x=13/63/... 的一根恰好压在圆角边缘时, lv_draw_sw_border 的
-    // 复杂边框路径会在柱与圆角的交叠区越界写(lv_memset 崩溃, 反汇编
-    // draw_border_complex -> lv_mask_radius 实测)。给柱子范围裁剪到
-    // 卡片坐标 1..77(避开圆角与边框), 与圆角无交叠后路径保持简单矩形。
-    lv_area_t clip = origin;
-    clip.x1 += 2; clip.x2 -= 2;
-    clip.y1 += 2; clip.y2 -= 2;
-    for (int i = 0; i < 20; ++i) {
-        const int height = s_eq_last_h[i] > 0 ? s_eq_last_h[i] : 6;
-        const int x = origin.x1 + 13 + i * 10;
-        lv_area_t bar = {x, origin.y1 + 77 - height, x + 6, origin.y1 + 77};
-        // 裁剪到卡片安全区; 完全在外的柱子跳过。
-        if (bar.x1 < clip.x1) bar.x1 = clip.x1;
-        if (bar.x2 > clip.x2) bar.x2 = clip.x2;
-        if (bar.y1 < clip.y1) bar.y1 = clip.y1;
-        if (bar.y2 > clip.y2) bar.y2 = clip.y2;
-        if (bar.x2 <= bar.x1 || bar.y2 <= bar.y1) continue;
-        lv_draw_rect(lv_event_get_layer(event), &descriptor, &bar);
-    }
+    // 2026-10-26 二次修复: 任何 LV_EVENT_DRAW_MAIN 回调里调用 lv_draw_rect
+    // 都会与卡片自身 border/radius 的绘制任务交叠, 实测两次 Store access
+    // fault(lv_draw_add_task / draw_border_complex)。此回调已不再被挂接,
+    // 保留空实现仅为 ABI 兼容; 动画由 home_eq_tick 直接改 20 根柱对象的
+    // 坐标(见 home_build)。
+    (void)event;
 }
 
 static void home_eq_tick(lv_timer_t *timer) {
@@ -340,25 +323,33 @@ static void home_eq_tick(lv_timer_t *timer) {
     if (!s_home_scr || !s_home_np_card) return;
     const bool playing = radio_player_is_playing();
     if (!playing) {
-        // 停止: 只需压平一次(靠 s_eq_last_h 比对, 不会反复重绘)
         bool changed = false;
         for (int i = 0; i < 20; ++i) {
             if (s_eq_last_h[i] == 6) continue;
             s_eq_last_h[i] = 6;
             changed = true;
         }
-        if (changed) lv_obj_invalidate(s_home_np_card);
+        if (changed && s_eq_bars[0]) {
+            for (int i = 0; i < 20; ++i) {
+                if (!s_eq_bars[i]) continue;
+                lv_obj_set_pos(s_eq_bars[i], 4 + i * 10, 70);
+                lv_obj_set_size(s_eq_bars[i], 6, 6);
+            }
+        }
         return;
     }
+    if (!s_eq_bars[0]) return;  // tree being destroyed: skip tick
     ++s_eq_frame;
     for (int i = 0; i < 20; ++i) {
         // 帧偏移让波形向左流动(每帧错开 1 格)
         const int h = 6 + kEqPattern[(i + s_eq_frame) % 20];
         if (h == s_eq_last_h[i]) continue;   // ⚠ 只在变化时才动 LVGL 对象
         s_eq_last_h[i] = h;
-        // ⚠ 底边固定 y=78, 高度变化时顶部上移(同时改 pos+size, 否则会向下长)
+        if (s_eq_bars[i]) {
+            lv_obj_set_pos(s_eq_bars[i], 4 + i * 10, 76 - h);
+            lv_obj_set_size(s_eq_bars[i], 6, h);
+        }
     }
-    lv_obj_invalidate(s_home_np_card);
 }
 
 // 把聚合计数写进宠物右侧的三个徽标。数字为 0 时隐藏该徽标, 避免首页出现
@@ -487,7 +478,10 @@ static void home_build(void) {
     s_home_np_card = box(s_home_scr, 12, 196, 216, 80, C_SURFACE);
     lv_obj_set_style_border_color(s_home_np_card, lv_color_hex(C_BORDER), 0);
     lv_obj_set_style_border_width(s_home_np_card, 1, 0);
-    lv_obj_set_style_radius(s_home_np_card, 6, 0);
+    // 2026-10-26: radius 6 -> 0。圆角边框走 draw_border_complex + circle mask
+    // 缓存路径, 真机两次 Load/Store fault(get_next_line / lv_draw_add_task)
+    // 都在该缓存被踩时发生。直角边框走 draw_border_simple, 与 mask 无关。
+    lv_obj_set_style_radius(s_home_np_card, 0, 0);
     // 单行文案: "正在播放 音乐" —— 原来是"正在播放"(标题) + 电台名(第二行)两行,
     // 用户要求合成一行。用前缀 + 动态电台名拼成一条。
     s_home_np_name = label(s_home_np_card, "正在播放", 16, C_FG);
@@ -495,9 +489,17 @@ static void home_build(void) {
     lv_obj_set_pos(s_home_np_name, 10, 10);
     lv_obj_set_width(s_home_np_name, 196);              // 卡片宽 216 - 左右各 10
     lv_label_set_long_mode(s_home_np_name, LV_LABEL_LONG_DOT);  // 过长自动省略号
-    // 频谱条: 底边紧贴卡片底部内侧。卡片高 80, 内高 78 -> 底边基准 y=78。
-    // 原来底边在卡片内 y=62, 距底还有 18px 空隙(用户反馈"没贴到底部")。
-    lv_obj_add_event_cb(s_home_np_card, home_eq_draw, LV_EVENT_DRAW_MAIN, nullptr);
+    // 频谱条: 20 根真实 lv_obj 矩形(v1.2.15: 从 DRAW_MAIN 绘制回调改为
+    // 对象, 崩溃根因见 home_eq_draw 注释)。底边基准卡片内 y=76。
+    for (int i = 0; i < 20; ++i) {
+        s_eq_bars[i] = lv_obj_create(s_home_np_card);
+        lv_obj_remove_style_all(s_eq_bars[i]);
+        lv_obj_set_style_bg_color(s_eq_bars[i], lv_color_hex(C_MUTED), 0);
+        lv_obj_set_style_radius(s_eq_bars[i], 0, 0);
+        lv_obj_set_style_border_width(s_eq_bars[i], 0, 0);
+        lv_obj_set_pos(s_eq_bars[i], 4 + i * 10, 70);
+        lv_obj_set_size(s_eq_bars[i], 6, 6);
+    }
 
     // 底部提示: 说明首页按键(长按OK = 退出收音机/暂停播放)
     lv_obj_t *h = label(s_home_scr, "OK 暂停/继续   长按OK 菜单", 10, 0x3F8F68);
@@ -683,6 +685,7 @@ static void destroy_home(void) {
     if (s_home_tick) { lv_timer_delete(s_home_tick); s_home_tick = nullptr; }
     if (s_home_eq_tick) { lv_timer_delete(s_home_eq_tick); s_home_eq_tick = nullptr; }
     if (s_home_scr) { lv_obj_delete(s_home_scr); s_home_scr = nullptr; }
+    for (int i = 0; i < 20; ++i) s_eq_bars[i] = nullptr;
     s_home_pet = s_home_body = s_home_deco = s_home_clock = s_home_date = nullptr;
     s_home_np_card = s_home_np_name = s_home_batt = nullptr;
     for (int i = 0; i < 3; ++i) {

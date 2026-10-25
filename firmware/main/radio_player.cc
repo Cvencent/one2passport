@@ -1174,6 +1174,9 @@ void network_feed_task(void *argument) {
 
 bool stream_station(std::size_t station, uint32_t generation) {
     const RadioStation preset = station_snapshot(station);
+    // 2026-10-26: 每会话开始强制省电=NONE。切台/重试路径不经过 set_playing,
+    // BALANCED 被恢复后无人切回, 真机 ping 丢包 30-90% 周期性出现。
+    radio_wifi_set_streaming(true);
     if (!preset.url[0]) {
         ESP_LOGE(kTag, "Station %u has no stream URL", static_cast<unsigned>(station));
         return false;
@@ -1354,7 +1357,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
             prebuffer_bytes = std::min(
                 (block_count - kSharedNetworkBlocks) * kInputSize,
                 kPrebufferTarget);
-            ring_storage.emplace(network_blocks, block_count, kInputSize);
+            // 2026-10-26: 先填块再 emplace(与 heap 分支同规则)。
             for (std::size_t i = 0; i < kSharedNetworkBlocks; ++i) {
                 network_blocks[i] = output + kPcmCapacity + i * kInputSize;
             }
@@ -1383,7 +1386,14 @@ bool stream_station(std::size_t station, uint32_t generation) {
             prebuffer_bytes = std::min(
                 (block_count - kSharedNetworkBlocks) * kInputSize,
                 kPrebufferTarget);
-            heap_network_start = block_count;
+            // 2026-10-26 崩溃根因: heap_network_start 必须指向第一块堆块
+            // (kSharedNetworkBlocks + borrowed_blocks), 否则 free 循环变成
+            // no-op, 每个会话泄漏最多 7KB; 泄漏累积耗尽系统堆后 LVGL 的
+            // lv_malloc_zeroed 返回 NULL, lv_draw_add_task 无检查直接解引用
+            // -> Store access fault(get_next_line 崩溃同理: mask 缓存分配
+            // 失败后返回 NULL 被解引用)。同时把 prebuffer 目标恢复 12KB。
+            heap_network_start = kSharedNetworkBlocks + borrowed_blocks;
+            ring_storage.emplace(network_blocks, block_count, kInputSize);
             ESP_LOGI(kTag,
                      "network buffer: blocks=%u capacity=%u prebuffer=%u source=idle-xiaozhi-stack+heap",
                      (unsigned)block_count,
@@ -1474,18 +1484,25 @@ bool stream_station(std::size_t station, uint32_t generation) {
                      (unsigned)prebuffer_bytes,
                      (unsigned)free_bytes,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-            ring_storage.emplace(network_blocks, block_count, kInputSize);
-            for (std::size_t i = 0; i < block_count; ++i) {
-                network_blocks[i] = i < kSharedNetworkBlocks
-                    ? output + kPcmCapacity + i * kInputSize
-                    : static_cast<uint8_t *>(malloc(kInputSize));
-                if (!network_blocks[i]) { blocks_ready = false; break; }
+            // 2026-10-26 顺序修复(堆损坏元凶): 先填块再 emplace。旧顺序先
+            // emplace(容量=block_count)再逐块 malloc; 中途 malloc 失败时
+            // ring_storage 已持满槽而尾部 network_blocks 还是上一轮会话的
+            // 野指针 -> 喂流/解码立即解引用旧块 = 堆损坏(随机踩 LVGL
+            // circle-mask 缓存, 表现为 get_next_line / lv_draw_add_task
+            // Store/Load fault 循环重启)。
+            std::size_t filled = kSharedNetworkBlocks;
+            for (std::size_t i = kSharedNetworkBlocks; i < block_count; ++i) {
+                network_blocks[i] = static_cast<uint8_t *>(malloc(kInputSize));
+                if (!network_blocks[i]) break;
+                ++filled;
             }
-            if (!blocks_ready) {
+            if (filled <= kSharedNetworkBlocks) {
                 s_last_fail_lowmem.store(true, std::memory_order_release);
                 ESP_LOGW(kTag, "network buffer unavailable");
                 break;
             }
+            block_count = filled;
+            ring_storage.emplace(network_blocks, block_count, kInputSize);
         }
         // 缓冲已就位: 借用静态栈路径与 heap 兜底路径共用同一份环形缓冲访问。
         RadioStreamBuffer &ring = *ring_storage;

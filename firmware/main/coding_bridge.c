@@ -786,6 +786,8 @@ static bool send_text_bytes(const char *text)
     uint8_t frame[CBDP_MAX_FRAME_BYTES];
     size_t length = 0U;
     if (text == NULL || !s_connected || !wireless_bridge_session_ready()) {
+        ESP_LOGW(TAG, "text submit refused: connected=%d session_ready=%d",
+                 (int)s_connected, (int)wireless_bridge_session_ready());
         return false;
     }
     const size_t total_bytes = strlen(text);
@@ -820,7 +822,11 @@ static bool send_text_bytes(const char *text)
         return false;
     }
     s_text_offset = total_bytes;
-    return wireless_bridge_send_frame(frame, length);
+    const bool ok = wireless_bridge_send_frame(frame, length);
+    ESP_LOGI(TAG, "text submit: thread='%s' ref=%u bytes=%u tx=%u ok=%d",
+             s_active_thread_id, (unsigned)s_active_thread_ref,
+             (unsigned)total_bytes, (unsigned)s_wireless_tx_id, (int)ok);
+    return ok;
 }
 
 static void capture_task(void *argument)

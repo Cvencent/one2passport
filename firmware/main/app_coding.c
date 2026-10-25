@@ -150,6 +150,9 @@ static int s_catalog_return_selected;
 static bool s_selecting_thread;
 static bool s_discard_selection_updates;
 static uint32_t s_send_started_ms;
+// 语音刚通过 AUDIO_* 提交: 吞掉紧跟的第一次确定键(旧习惯是"确认后发送",
+// 但提交在 AUDIO_END 就已完成, 此时确定键的 open_projects 会把用户弹回列表)。
+static bool s_voice_submit_guard;
 static char s_current_task[CATALOG_TITLE_MAX];
 static char s_current_project[CATALOG_DETAIL_MAX];
 // 选中会话的"最后一段文本"(电脑端随 codex_selected 下发)。
@@ -898,6 +901,17 @@ static void coding_render(void)
         uint32_t now = lv_tick_get();
         s_selected = 0;
         s_page = 0U;
+        // 语音刚提交(TRANSCRIBING -> QUEUED): 吞掉紧跟的第一次确定键。
+        // 旧习惯是"确认后发送", 但 AUDIO_* 路径在 AUDIO_END 时就已提交,
+        // 这时的确定键若触发 open_projects 会把用户弹回列表(2026-10-25
+        // 用户实测), 破坏"接着对话"的循环。
+        if (s_flow.stage == CODING_STAGE_QUEUED &&
+            s_rendered_stage == CODING_STAGE_TRANSCRIBING) {
+            s_voice_submit_guard = true;
+        } else if (s_flow.stage != CODING_STAGE_QUEUED &&
+                   s_flow.stage != CODING_STAGE_RUNNING) {
+            s_voice_submit_guard = false;
+        }
         if (s_flow.stage == CODING_STAGE_RECORDING) s_record_started_ms = now;
         if (s_flow.stage == CODING_STAGE_TRANSCRIBING) s_transcribing_started_ms = now;
         if (s_flow.stage == CODING_STAGE_QUEUED &&
@@ -1785,6 +1799,10 @@ void app_coding_key(bsp_btn_t button, bsp_btn_ev_t event)
                 if (s_selected == 1) action = coding_flow_cancel_task(&s_flow);
                 s_cancel_confirm = false;
                 s_selected = 0;
+            } else if (s_voice_submit_guard) {
+                // 提交后的第一次确定: 用户惯性按键。回合已在电脑端运行,
+                // 这里不跳列表, 留在任务视图看响应(下一次确定恢复正常导航)。
+                s_voice_submit_guard = false;
             } else if (s_page_count > 1U && s_selected == 0) {
                 s_page = (s_page + 1U) % s_page_count;
             } else if ((s_page_count > 1U && s_selected == 1) ||

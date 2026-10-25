@@ -749,6 +749,13 @@ constexpr std::size_t kPrebufferTarget = 12 * 1024;
 // stream_station 还会把它夹到环容量的 3/4 以内, 保证任何时候都留 1/4 环
 // 吸收突发(小环/堆兜底路径下也不会去等一个永远填不满的量而卡死)。
 constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
+// 预缓冲等待上限(2026-10-25 真机根因): 有些电台 CDN 会以极低速率持续滴流,
+// 既不彻底静默(20s idle 看门狗不触发), 又永远攒不到 12KB —— 表现为界面
+// 无限停在"正在缓冲"。到期后必须做决定: 手上的数据够就先播, 不够就放弃
+// 本次尝试, 让外层按失败处理去换台。
+constexpr std::uint32_t kPrebufferDeadlineMs = 20000;
+// 到期时至少要有这么多音频才值得先播(约 0.75s @64kbps), 否则直接放弃。
+constexpr std::size_t kPrebufferMinStartBytes = 6144;
 
 // network_feed_task 的栈**静态分配**: 动态申请要求在播放时凑出一块连续堆,
 // 而那时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 必然失败
@@ -1161,6 +1168,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
         bool format_ready = false;
         uint8_t source_channels = 1;
         bool buffering = true;
+        int64_t buffering_since_us = esp_timer_get_time();
         // 恢复阈值上限 = 环容量的 3/4, 且不超过 kMaxResumePrebuffer(12KB)。
         // 先算上限、再夹起播阈值 —— 否则堆兜底路径下环可能只有 1~2KB,
         // 却去等 12KB, 永远等不满(表现为一直停在"正在缓冲")。
@@ -1200,15 +1208,37 @@ bool stream_station(std::size_t station, uint32_t generation) {
         }
         while (request_still_current(generation, station)) {
             const std::size_t available = ring.available();
-            if (buffering && available < wait_bytes && !feed.finished.load()) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
+            if (buffering) {
+                const std::uint32_t waited_ms = static_cast<std::uint32_t>(
+                    (esp_timer_get_time() - buffering_since_us) / 1000);
+                const bool feed_done = feed.finished.load(std::memory_order_acquire);
+                if (!feed_done && available < wait_bytes &&
+                    waited_ms < kPrebufferDeadlineMs) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
+                if (available < wait_bytes) {
+                    // 到期或源已结束: 不够最低可播量就放弃本次尝试(外层换台),
+                    // 够就先播, 绝不允许无限停在"正在缓冲"。
+                    if (feed_done || available < kPrebufferMinStartBytes) {
+                        ESP_LOGW(kTag,
+                                 "prebuffer stalled: %u/%u bytes after %ums; abandon attempt",
+                                 (unsigned)available, (unsigned)wait_bytes,
+                                 (unsigned)waited_ms);
+                        break;
+                    }
+                    ESP_LOGW(kTag,
+                             "prebuffer deadline: start with %u/%u bytes after %ums",
+                             (unsigned)available, (unsigned)wait_bytes,
+                             (unsigned)waited_ms);
+                }
             }
             buffering = false;
             const int received = ring.read(input, kInputSize);
             if (!received) {
                 if (feed.finished.load(std::memory_order_acquire)) break;
                 buffering = true;
+                buffering_since_us = esp_timer_get_time();
                 join_warmup_frames = 2;   // 重新接入同样先丢两帧防爆音
                 // 源端刚才停顿到把缓冲吃空: 下次多攒一点再出声, 避免"刚恢复
                 // 又断"的连环卡顿。上限 kMaxResumePrebuffer。

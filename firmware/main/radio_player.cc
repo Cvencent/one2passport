@@ -753,9 +753,9 @@ constexpr std::size_t kMaxResumePrebuffer = 12 * 1024;
 // 既不彻底静默(20s idle 看门狗不触发), 又永远攒不到 12KB —— 表现为界面
 // 无限停在"正在缓冲"。到期后必须做决定: 手上的数据够就先播, 不够就放弃
 // 本次尝试, 让外层按失败处理去换台。
-constexpr std::uint32_t kPrebufferDeadlineMs = 20000;
-// 到期时至少要有这么多音频才值得先播(约 0.75s @64kbps), 否则直接放弃。
-constexpr std::size_t kPrebufferMinStartBytes = 6144;
+constexpr std::uint32_t kPrebufferDeadlineMs = 12000;
+// 到期时至少要有这么多音频才值得先播(约 0.5s @64kbps), 否则直接放弃。
+constexpr std::size_t kPrebufferMinStartBytes = 4096;
 
 // network_feed_task 的栈**静态分配**: 动态申请要求在播放时凑出一块连续堆,
 // 而那时堆已被 LVGL/WiFi/音频分割到 largest<4KB, 必然失败

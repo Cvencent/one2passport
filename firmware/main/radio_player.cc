@@ -187,6 +187,10 @@ std::atomic<bool> s_audio_needs_reformat{false};
 // 最近一次 stream_station 失败的原因是否为"内存不足"(而非电台本身坏)。
 // 播放循环据此决定: 真坏台 -> 换台; 内存不足 -> 换台也没用, 用长退避等堆恢复。
 std::atomic<bool> s_last_fail_lowmem{false};
+// 本次 stream_station 是否处于"源在涓流喂食"状态(prebuffer 到期仍不足目标量)。
+// 涓流台能解码出几十毫秒音频, 旧的 played_audio 判据把它当"活台"永远重连,
+// 用户就卡在一个无声台里(2026-10-25 真机: 重庆都市广播整晚 12s 只给 ~9.6K)。
+std::atomic<bool> s_last_prebuffer_starved{false};
 // 池里的解码器是否已完成"首帧预热"。
 std::atomic<bool> s_pool_warmed{false};
 std::atomic<TaskHandle_t> s_player_task{nullptr};
@@ -997,6 +1001,8 @@ bool stream_station(std::size_t station, uint32_t generation) {
     esp_http_client_set_header(client, "Accept", "audio/mpeg,*/*");
 
     bool played_audio = false;
+    // 台连上了就先假设不饿; prebuffer 到期不足目标量时上面会置 true。
+    s_last_prebuffer_starved.store(false, std::memory_order_release);
     esp_audio_simple_dec_handle_t decoder = nullptr;
     uint8_t *input = nullptr;
     uint8_t *output = nullptr;
@@ -1265,12 +1271,15 @@ bool stream_station(std::size_t station, uint32_t generation) {
                                  "prebuffer stalled: %u/%u bytes after %ums; abandon attempt",
                                  (unsigned)available, (unsigned)wait_bytes,
                                  (unsigned)waited_ms);
+                        s_last_prebuffer_starved.store(true, std::memory_order_release);
                         break;
                     }
                     ESP_LOGW(kTag,
                              "prebuffer deadline: start with %u/%u bytes after %ums",
                              (unsigned)available, (unsigned)wait_bytes,
                              (unsigned)waited_ms);
+                    // 部分量开播 = 源在涓流喂食, 记 starvation 给外层跳台判据。
+                    s_last_prebuffer_starved.store(true, std::memory_order_release);
                 }
             }
             buffering = false;
@@ -1614,6 +1623,13 @@ void player_task(void *) {
     // 冷却等于每 10s 烧一轮 CPU+解码风暴(实测发热)。按连续失败次数指数退避,
     // 上限 120s, 使坏流状态下 CPU 占用可忽略。
     uint32_t fail_backoff_ms = 500;    // 首次短退避: 让堆有时间合并出解码器所需连续块
+    // 跳台冷却: 连播失败大多是 CDN 限流/服务端 RST(2026-10-25 实测: 毫秒级
+    // 连拨 10 个台全部被 307 拒掉, 间隔仅 20~40ms), 冷却太短等于继续打脸
+    // CDN。每次跳台升级 1.5s -> 3s -> 4.5s(封顶), 播出成功即复位。
+    uint32_t skip_cooldown_ms = 1500;
+    // 连续"涓流会话"计数: 解码出过音频但 prebuffer 到期仍不足目标量(源饿)。
+    // 旧判据 played_audio 只要有几十毫秒音频就当活台, 用户被钉死在无声台上。
+    uint8_t starved_sessions = 0;
     while (true) {
         if (!s_wanted_playing.load(std::memory_order_acquire)) {
             radio_ui_set_playback(RadioPlaybackState::Stopped, "已暂停");
@@ -1659,7 +1675,31 @@ void player_task(void *) {
             // The stream worked at least briefly, so this station is alive and
             // simply dropped. Keep it and reconnect.
             failed_attempts = 0;
+            skip_cooldown_ms = 1500;
             fail_backoff_ms = 1500;
+            // 2026-10-25: "播过 26ms"不等于"台健康"。涓流台(源饿, prebuffer
+            // 每轮到期都不足量)会在这里无限重连, 用户被钉死在无声台上。
+            // 连续 2 次涓流会话 -> 按"台源有问题"跳台(带冷却)。健康会话复位。
+            const bool starved =
+                s_last_prebuffer_starved.exchange(false, std::memory_order_acq_rel);
+            const std::size_t live_count = radio_player_station_count();
+            if (starved) {
+                ++starved_sessions;
+                if (starved_sessions >= 2 && live_count > 1) {
+                    ESP_LOGW(kTag, "station %u starved twice; skipping "
+                                   "(source feeds too slow)",
+                             static_cast<unsigned>(station));
+                    radio_ui_set_playback(RadioPlaybackState::Error,
+                                          "信号太弱 已换台");
+                    starved_sessions = 0;
+                    radio_player_select_relative(1);
+                    interruptible_delay_ms(skip_cooldown_ms, generation, station);
+                    if (skip_cooldown_ms < 4500) skip_cooldown_ms += 1500;
+                    continue;
+                }
+            } else {
+                starved_sessions = 0;
+            }
             radio_ui_set_playback(RadioPlaybackState::Reconnecting,
                                   "信号中断，正在重连");
             interruptible_delay_ms(1200, generation, station);
@@ -1692,12 +1732,19 @@ void player_task(void *) {
         ++failed_attempts;
         const std::size_t count = radio_player_station_count();
         if (failed_attempts >= kMaxFailedAttempts && count > 1) {
-            ESP_LOGW(kTag, "Station %u unreachable, skipping to the next one",
-                     static_cast<unsigned>(station));
+            ESP_LOGW(kTag, "Station %u unreachable, skipping to the next one "
+                           "(cooldown %ums)",
+                     static_cast<unsigned>(station),
+                     (unsigned)skip_cooldown_ms);
             radio_ui_set_playback(RadioPlaybackState::Error,
                                   "电台无法播放 已换台");
             failed_attempts = 0;
             radio_player_select_relative(1);
+            // ⚠ 跳台必须冷却(2026-10-25): 失败后立即连拨会被 CDN 判定为
+            // 攻击 -> 整表 307(实测), 反而把活台也拒了。冷却期间用户按键
+            // (generation 变化)会立即打断, 不影响手动切台手感。
+            interruptible_delay_ms(skip_cooldown_ms, generation, station);
+            if (skip_cooldown_ms < 4500) skip_cooldown_ms += 1500;
             continue;
         }
 

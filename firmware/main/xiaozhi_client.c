@@ -1587,9 +1587,20 @@ done:
     return success;
 }
 
+// 尾部竞技场占用标志(定义见下方"收音机解码器尾部竞技场"); 录音任务栈
+// 会覆盖整片 mic 数组, 录音前必须确认竞技场已归还。
+static bool s_radio_tail_held;
+
 void xiaozhi_client_start_listening(void)
 {
     if (!s_ws_open || s_listening) return;
+    if (s_radio_tail_held) {
+        // 竞技场还没归还(microedge: 进小智时流没退干净) -> mic 栈会与解码块
+        // 重叠, 宁可拒绝录音也不能内存越界。
+        xz_ui_event_t ev = XZ_EV_ERROR;
+        xQueueSend(s_event_queue, &ev, 0);
+        return;
+    }
     if (!xz_opus_encoder_init()) {
         xz_ui_event_t ev = XZ_EV_ERROR;
         xQueueSend(s_event_queue, &ev, 0);
@@ -1676,10 +1687,51 @@ uint8_t *xiaozhi_idle_buffer(size_t *size)
 {
     if (size) *size = 0;
     if (!xz_mic_stack_is_idle()) return NULL;
+    if (s_radio_tail_held) return NULL;  // 解码器竞技场借走了整段尾巴
     const size_t used = XZ_BRIDGE_STACK_BYTES + XZ_RADIO_STACK_BYTES;
     if (sizeof(s_mic_stack_storage) <= used) return NULL;
     if (size) *size = sizeof(s_mic_stack_storage) - used;
     return s_mic_stack_storage + used;
+}
+
+// ---- 收音机解码器尾部竞技场 ----
+// 只借"尾巴"(桥接栈+网络栈之后的一段, 9.2KB), 与桥接任务栈(前 12KB)不重叠,
+// 所以**桥接可以常驻首页** —— 这是首页小 Codex(UDP 计数/提醒) + 小收音机
+// 并存的成立前提。进入小智时 release_pool 归还, mic 任务照常用整片数组。
+bool xiaozhi_radio_tail_available(void)
+{
+    if (s_radio_tail_held) return false;
+    return xz_mic_stack_is_idle();
+}
+
+uint8_t *xiaozhi_radio_tail_claim(size_t *size)
+{
+    if (size) *size = 0;
+    if (s_radio_tail_held) return NULL;
+    if (!xz_mic_stack_is_idle()) {
+        ESP_LOGW(TAG, "radio tail claim refused: xiaozhi not idle");
+        return NULL;
+    }
+    const size_t used = XZ_BRIDGE_STACK_BYTES + XZ_RADIO_STACK_BYTES;
+    if (sizeof(s_mic_stack_storage) <= used) return NULL;
+    s_radio_tail_held = true;
+    ESP_LOGI(TAG, "radio tail arena claimed (%uB) - bridge stays resident",
+             (unsigned)(sizeof(s_mic_stack_storage) - used));
+    if (size) *size = sizeof(s_mic_stack_storage) - used;
+    return s_mic_stack_storage + used;
+}
+
+void xiaozhi_radio_tail_release(void)
+{
+    if (s_radio_tail_held) {
+        s_radio_tail_held = false;
+        ESP_LOGI(TAG, "radio tail arena released");
+    }
+}
+
+bool xiaozhi_radio_tail_active(void)
+{
+    return s_radio_tail_held;
 }
 
 // Static 4KB stack for the always-on radio network feeder task. Lives in the

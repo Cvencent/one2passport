@@ -33,6 +33,9 @@
 #include <strings.h>
 
 extern "C" uint8_t *xiaozhi_idle_buffer(std::size_t *size);
+extern "C" bool xiaozhi_radio_tail_available(void);
+extern "C" uint8_t *xiaozhi_radio_tail_claim(std::size_t *size);
+extern "C" void xiaozhi_radio_tail_release(void);
 
 namespace {
 
@@ -215,6 +218,7 @@ static StackType_t s_player_task_stack[4608];
 esp_audio_simple_dec_handle_t s_decoder_pool = nullptr;
 uint8_t *s_input_pool = nullptr;
 uint8_t *s_output_pool = nullptr;
+static std::size_t s_tail_arena_size = 0;
 
 RadioStation station_snapshot(std::size_t index) {
     RadioStation station = {};
@@ -487,6 +491,60 @@ esp_audio_simple_dec_handle_t open_mp3_decoder() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// media_lib 分配器接管(尾部竞技场, 2026-10-25)。
+// 反汇编实测: esp_audio_codec 预编译库(audio_codec_mem.c.obj)里的
+// media_lib_module_calloc/malloc/realloc/free 全是 weak 符号, 默认实现就是
+// calloc/malloc/realloc/free 直通。这里给出强符号(文件作用域, 保证符号外部
+// 可见以覆盖 weak 默认), 把 MP3 解码器首帧初始化的一串 >=2KB 子块(实测
+// 4224+2304+2312+8192..., 合计 ~26KB)中能装下的部分重定向到小智闲置 mic
+// 静态区的"尾巴"(9.2KB, 平时借给收音机抖动环, 见 xiaozhi_client.c)。
+// 尾部与桥接任务栈(前 12KB)不重叠 -> **桥接可以常驻首页**, 计数/提醒照常;
+// 堆里因此多出 ~8.8KB, 首页播放时 WiFi 收包(需 ~1600B 连续 DMA)不再被挤死。
+constexpr std::size_t kArenaMinBlock = 2048;
+static uint8_t *s_tail_arena_base = nullptr;   // 竞技场基址(nullptr = 未接管)
+static uint8_t *s_tail_arena_end = nullptr;
+static uint8_t *s_tail_arena_bump = nullptr;   // nullptr = 未接管
+
+extern "C" void *media_lib_module_calloc(uint32_t module, size_t n, size_t size) {
+    (void)module;
+    const size_t total = n * size;
+    if (total >= kArenaMinBlock && s_tail_arena_bump != nullptr) {
+        const size_t block = (total + 15u) & ~(size_t)15u;  // 16B 对齐
+        uint8_t *slot = s_tail_arena_bump;
+        if (slot + block <= s_tail_arena_end) {
+            *(volatile uint32_t *)slot = (uint32_t)total;  // 块头: 原尺寸
+            uint8_t *out = slot + 16;
+            s_tail_arena_bump = slot + block + 16;         // 头随块 16B 对齐
+            std::memset(out, 0, total);
+            return out;
+        }
+        // 竞技场满了: 余下的子块回堆(不失败, 只少省一点)。
+    }
+    return calloc(n, size);
+}
+
+extern "C" void *media_lib_module_realloc(uint32_t module, void *ptr, size_t size) {
+    (void)module;
+    if (ptr >= s_tail_arena_base && ptr < s_tail_arena_end) {
+        // pvmp3 不 realloc 解码块; 防御性兜底: 搬到堆, 避免对静态区指针
+        // 直接 realloc 崩溃。
+        const size_t old = (size_t)(*(volatile uint32_t *)((uint8_t *)ptr - 16));
+        void *heap_ptr = malloc(size);
+        if (heap_ptr != nullptr && old != 0) {
+            std::memcpy(heap_ptr, ptr, size < old ? size : old);
+        }
+        return heap_ptr;
+    }
+    return realloc(ptr, size);
+}
+
+extern "C" void media_lib_free(void *ptr) {
+    if (ptr == nullptr) return;
+    if (ptr >= s_tail_arena_base && ptr < s_tail_arena_end) return;  // 整片随池释放
+    free(ptr);
+}
+
 // 一段最小的**合法 MP3 帧**(静音), 用于逼解码器把首帧内存分配出来。
 // 取一个标准 MPEG-1 Layer III 帧头(0xFF 0xFB 0x90 0x00 = 128kbps/44.1kHz/单声道)
 // 加上足够的零填充 —— 解码器解析到帧头后会分配内部解析上下文与帧缓冲(约 20KB)。
@@ -593,16 +651,34 @@ bool radio_player_prewarm(void) {
     // 解码器注册必须先于 open。radio_player_init 里也会注册(幂等)。
     if (esp_audio_dec_register_default() != ESP_AUDIO_ERR_OK) return false;
     if (esp_audio_simple_dec_register_default() != ESP_AUDIO_ERR_OK) return false;
-    s_decoder_pool = open_mp3_decoder();
-    // ⚠⚠ 关键(2026-10-10 发热事故的根本修复, 2026-10-25 补顺序修复):
-    // 解码器句柄打开 ≠ 首帧内存已就绪。真正的 22904B(0x5978) 连续块是在
-    // **首次 process() 内部**懒分配的。2026-10-25 复现确认: 如果先 malloc
-    // s_output_pool/s_input_pool 再预热, 这两次分配会把唯一的大块切碎,
-    // 预热以 ESP_MP3_DEC ret 10 失败, 之后进收音机就报"内存不足 稍后重试"。
-    // 所以必须**先**用暂存区把首帧喂给解码器拿到内部大块, 再分配池缓冲。
-    warm_decoder_with_scratch("prewarm");
-    s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
-    s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
+    if (xiaozhi_radio_tail_available()) {
+        // 尾部竞技场可用: 池缓冲先分配, 预热用池内缓冲做 I/O(绝不能走
+        // scratch 路径 —— 那会先借走尾部, 随后竞技场 bump 落在同一片区,
+        // 实测预热 decoded=0, 2026-10-25)。
+        uint8_t *tail = xiaozhi_radio_tail_claim(&s_tail_arena_size);
+        if (tail != nullptr) {
+            s_tail_arena_base = tail;
+            s_tail_arena_end = tail + s_tail_arena_size;
+            s_tail_arena_bump = tail;
+        }
+        s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
+        s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
+        s_decoder_pool = open_mp3_decoder();
+        if (s_decoder_pool) warm_pool_decoder("prewarm-tail");
+        if (s_decoder_pool && !s_pool_warmed.load(std::memory_order_acquire)) {
+            warm_decoder_with_scratch("prewarm-tail-fallback");
+        }
+    } else {
+        s_decoder_pool = open_mp3_decoder();
+        // ⚠⚠ 关键(2026-10-10 发热事故的根本修复, 2026-10-25 补顺序修复):
+        // 解码器句柄打开 ≠ 首帧内存已就绪。真正的 22904B(0x5978) 连续块是在
+        // **首次 process() 内部**懒分配的。竞技场不可用(小智占用 mic 区)时
+        // 它来自堆: 如果先 malloc 池缓冲再预热, 会把唯一的大块切碎, 预热以
+        // ret 10 失败。所以必须先用暂存区喂首帧拿到内部大块, 再分配池缓冲。
+        warm_decoder_with_scratch("prewarm");
+        s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
+        s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
+    }
 
     const bool ok = s_decoder_pool && s_output_pool && s_input_pool;
     ESP_LOGW(kTag, "radio prewarm: decoder=%d in=%p out=%p (heap largest=%u)",
@@ -645,6 +721,10 @@ void radio_player_release_pool(void) {
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
+
+    s_tail_arena_base = s_tail_arena_end = s_tail_arena_bump = nullptr;
+    // 尾部竞技场随解码池一起归还: mic 静态区整片让给小智的 mic 任务栈。
+    xiaozhi_radio_tail_release();
     s_pool_warmed.store(false, std::memory_order_release);
     ESP_LOGW(kTag, "radio pool released by caller (heap largest=%u)",
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -682,11 +762,31 @@ void radio_player_ensure_pool(void) {
             return;
         }
     }
-    s_decoder_pool = open_mp3_decoder();
-    // 顺序同上(2026-10-25): 先让解码器拿到 0x5978 连续块, 再分配池内缓冲。
-    warm_decoder_with_scratch("re-acquire");
-    s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
-    s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
+    if (xiaozhi_radio_tail_available()) {
+        // 尾部竞技场可用(小智关闭): 解码子块 >=2KB 的部分将落进 mic 静态区
+        // 尾巴, 堆里少 ~8.8KB —— 桥接常驻的首页播放因此不再饿死 WiFi 收包。
+        // 池缓冲先分配(堆顺序无所谓), 预热直接用池内缓冲做 I/O。
+        uint8_t *tail = xiaozhi_radio_tail_claim(&s_tail_arena_size);
+        if (tail != nullptr) {
+            s_tail_arena_base = tail;
+            s_tail_arena_end = tail + s_tail_arena_size;
+            s_tail_arena_bump = tail;
+        }
+        s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
+        s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
+        s_decoder_pool = open_mp3_decoder();
+        if (s_decoder_pool) warm_pool_decoder("re-acquire-tail");
+        if (s_decoder_pool && !s_pool_warmed.load(std::memory_order_acquire)) {
+            warm_decoder_with_scratch("re-acquire-tail-fallback");
+        }
+    } else {
+        s_decoder_pool = open_mp3_decoder();
+        // 顺序同上(2026-10-25): 竞技场不可用时解码块仍来自堆, 必须先让解码器
+        // 拿到 0x5978 连续块, 再分配池内缓冲。
+        warm_decoder_with_scratch("re-acquire");
+        s_output_pool = static_cast<uint8_t *>(malloc(kOutputSize));
+        s_input_pool = static_cast<uint8_t *>(malloc(kInputSize));
+    }
     // ⚠ 重建失败必须**彻底清干净**(2026-10-12): 否则会留下一个半死的
     //   s_decoder_pool 句柄 —— 后续 stream_station 看到它非空就直接复用, 于是
     //   永远用着一个没成功预热过的解码器, 表现为收音机一直卡在"正在缓冲"/

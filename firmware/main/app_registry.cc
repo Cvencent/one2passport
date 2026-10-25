@@ -918,17 +918,12 @@ void app_framework_minimize_services(bool restore_radio) {
         return;
     }
 
-    // 2026-10-25 (方案 A): 最小化收音机播放期间桥接任务必须完全停止。
-    // 真机实测(COM4): 首页播放 + 桥接常驻时 dma 空闲只剩 652~936B, 而 WiFi
-    // 每个动态收包缓冲需要 ~1600B **连续** DMA —— 收包分配失败 -> 服务器
-    // 重传退避 -> ~15s 后 RST, 表现为首页播放一卡一卡。停桥实测能还回
-    // 2.4KB, 加上解码池释放的余量, dma 稳定在 2.5KB 稳定线之上。
-    // 代价: 播放期间电脑端看到设备离线; 停止播放回首页后由下方分支重新
-    // 拉起桥接(主机重发现实测 ~11s)。
+    // 2026-10-25 (尾部竞技场): 桥接任务栈占 mic 静态区**前 12KB**, 解码竞技场
+    // 只借**尾巴 9.2KB**(见 xiaozhi_client.c)—— 两者不重叠, 所以桥接**常驻**:
+    // 首页的 Codex 计数/完成提醒在收音机播放期间照常更新(首页小 Codex + 小
+    // 收音机并存)。解码子块进尾巴后堆多 ~8.8KB, WiFi 收包(需 ~1600B 连续
+    // DMA)不再被挤死 —— 旧方案 A(停桥)的离线代价取消。
     if (restore_radio && s_minimized_radio_should_play) {
-        if (coding_bridge_wireless_started()) {
-            coding_bridge_stop_wireless();
-        }
         // This path runs after the caller has released the LVGL lock. Use the
         // synchronous ordered helper so the decoder owns its contiguous block
         // before any bridge resource could be allocated.
@@ -961,21 +956,10 @@ void app_framework_restore_minimized_services_ordered(void) {
     // stuck flag would block every later home/menu restore.
     s_defer_minimized_services = false;
     if (s_level != APP_LEVEL_HOME && s_level != APP_LEVEL_MENU) return;
-    // Rebuild the MP3 decoder first: the minimized Codex bridge allocates its
-    // own task/socket state and can reduce the largest contiguous block below
-    // the decoder's ~20KB first-frame requirement. While the minimized radio
-    // plays, the bridge task (12KB static stack) must stay stopped: see
-    // app_framework_minimize_services() for the measured dma numbers.
+    // Rebuild the MP3 decoder first: the decoder's big sub-blocks go to the
+    // static mic tail (bridge task stack in the FRONT 12KB does not overlap),
+    // so the resident bridge keeps counters/alerts alive on home.
     if (s_minimized_radio_should_play) {
-        if (coding_bridge_wireless_started()) {
-            coding_bridge_stop_wireless();
-        }
-        if (coding_bridge_wireless_started()) {
-            coding_bridge_stop_wireless();
-        }
-        // This path runs after the caller has released the LVGL lock. Use the
-        // synchronous ordered helper so the decoder owns its contiguous block
-        // before any bridge resource could be allocated.
         radio_player_rewake_after_pool_ready();
         radio_player_set_playing(true);
         coding_bridge_set_foreground_ui(false);

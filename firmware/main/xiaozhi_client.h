@@ -51,6 +51,28 @@ void xiaozhi_opus_release(void);             // 退出小智时释放编码器(�
 // 当前连接阶段的简短中文描述(供进度页显示), 无连接时为空串。
 const char *xiaozhi_client_progress(void);
 
+// ---- 收音机解码器尾部竞技场(借闲置麦克风静态区的"尾巴") ----
+// mic 静态区 25.6KB 布局: [桥接12K][收音机网络栈4K][尾巴9.2K]。尾巴是收音机
+// 抖动环的备用借出区; 解码器子块(>=2KB)借用它时抖动环让位(缩到 TTS 10 块)。
+// 关键: 尾部与桥接栈(前 12KB)**不重叠** -> 桥接可以常驻首页(计数/提醒照常),
+// 这是"首页小 Codex + 小收音机并存"的成立前提。进入小智时 radio_player_
+// release_pool() 归还尾部, mic 任务照常使用整片数组。
+bool xiaozhi_radio_tail_available(void);        // 只查询: 现在借是否可行
+uint8_t *xiaozhi_radio_tail_claim(size_t *size); // 独占尾巴, 返回基址; 失败 NULL
+void xiaozhi_radio_tail_release(void);           // 归还(解码池释放时)
+bool xiaozhi_radio_tail_active(void);
+
+// ---- 收音机解码器尾部竞技场(借闲置麦克风静态区的"尾巴") ----
+// mic 静态区 25.6KB 布局: [桥接12K][收音机网络栈4K][尾巴9.2K]。尾巴是收音机
+// 抖动环的备用借出区; 解码器子块(>=2KB)借用它时抖动环让位(缩到 TTS 10 块)。
+// 关键: 尾部与桥接栈(前 12KB)**不重叠** -> 桥接可以常驻首页(计数/提醒照常),
+// 这是"首页小 Codex + 小收音机并存"的成立前提。进入小智时 radio_player_
+// release_pool() 归还尾部, mic 任务照常使用整片数组。
+bool xiaozhi_radio_tail_available(void);        // 只查询: 现在借是否可行
+uint8_t *xiaozhi_radio_tail_claim(size_t *size); // 独占尾巴, 返回基址; 失败 NULL
+void xiaozhi_radio_tail_release(void);           // 归还(解码池释放时)
+bool xiaozhi_radio_tail_active(void);
+
 #ifdef __cplusplus
 }
 #endif

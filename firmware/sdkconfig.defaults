@@ -62,7 +62,10 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=256
 
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=4
+# 2026-10-25: 真机 ping 丢包 43-50%(TCP 吞吐坍缩成涓流, 同源 PC 满速)。
+# 收包缓冲/窗口/发送缓冲加大后 ping 丢包归零。动态收包缓冲按需分配,
+# 平时不多占; 窗口只在有 TCP 连接(收音机播放)时生效。
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_RX_BA_WIN=4
 CONFIG_ESP_WIFI_MGMT_SBUF_NUM=6
@@ -82,13 +85,13 @@ CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 # 本设备是**单向接收音频流**(发出去的只有两行 HTTP 请求头),
 # 因此发送方向保持最小。接收窗口的取值见下方 2026-10-13 的实测修正
 # (曾缩到 2880, 结果高码率台吞吐不足, 已调回 4*MSS)。
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 # ⚠ 2026-10-13 实测: 2880(2*MSS) 的接收窗口会把高码率台卡死。
 # 44.1kHz 立体声 MP3(~128kbps≈16KB/s) 下, 吞吐 = window/RTT; RTT 稍高
 # (200~300ms, 国内 CDN) 就只有 9~14KB/s —— 实测同一电台 pcm 仅 3s/10s,
 # 一直在 rebuffer。改成 4*MSS 后同一电台能连续播满(pcm 9.8s/10s, 队列常满)。
 # 接收窗口只限制"同时能有多少字节在途", 不额外常驻大块堆。
-CONFIG_LWIP_TCP_WND_DEFAULT=5760
+CONFIG_LWIP_TCP_WND_DEFAULT=8720
 # 收发邮箱各减 1(每项约 4 字节指针 + 少量结构, 主要省的是关联缓冲)
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=4
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=4

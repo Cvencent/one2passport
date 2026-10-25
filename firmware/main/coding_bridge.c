@@ -185,6 +185,10 @@ static int s_ota_progress;
 static bool s_ota_active;
 static uint32_t s_wireless_request_id = 1U;
 static uint32_t s_wireless_tx_id = 1U;
+// 本段录音已通过 AUDIO_END 提交的互斥标志(CBDP §19.4: Bridge STT 后自动提交
+// turn)。置位后任何 SEND_* 文本提交(重复回调/超时重试/UI 重复确认)都被丢弃,
+// 防止同文两投; 新的 AUDIO_BEGIN(下一段录音)时清除。
+static bool s_voice_turn_submitted;
 
 // Section 17.4 keys host-side idempotency on (device_id, request_id, method_id,
 // params) and remembers it for 24h. A counter that restarts at 1 on every boot
@@ -746,6 +750,7 @@ static bool send_audio_begin(void)
 {
     uint8_t frame[CBDP_MAX_FRAME_BYTES];
     size_t length = 0U;
+    s_voice_turn_submitted = false;  // 新录音周期: 允许本段 AUDIO_END 置位
     s_wireless_tx_id = next_tx_id();
     make_idem_for(s_audio_idem, s_wireless_tx_id, CBDP_MT_AUDIO_BEGIN,
                   (const uint8_t *)s_active_thread_id, strlen(s_active_thread_id));
@@ -761,6 +766,9 @@ static bool send_audio_begin(void)
 
 static bool send_audio_end(size_t total_bytes)
 {
+    // 重传纪律(CBDP §19.4/§4): 弱网重发必须复用同一个 s_wireless_tx_id 和
+    // s_audio_idem —— 换新事务号会被 Bridge 当成新输入。本函数不复用
+    // 发号器, socket_send_all 的重试也始终重发同一帧字节。
     uint8_t frame[CBDP_MAX_FRAME_BYTES];
     size_t length = 0U;
     if (total_bytes > UINT32_MAX ||
@@ -768,7 +776,9 @@ static bool send_audio_end(size_t total_bytes)
                               (uint32_t)total_bytes)) {
         return false;
     }
-    return wireless_bridge_send_frame(frame, length);
+    const bool ok = wireless_bridge_send_frame(frame, length);
+    if (ok) s_voice_turn_submitted = true;
+    return ok;
 }
 
 static bool send_text_bytes(const char *text)
@@ -966,6 +976,13 @@ void coding_bridge_cancel_record(void)
 
 bool coding_bridge_send_voice(const char *text)
 {
+    if (s_voice_turn_submitted) {
+        // 本段录音已经通过 AUDIO_* 提交(Bridge STT 自动提交 turn), 这里的
+        // 文本只是回显 —— 再发一遍就是重复输入(2026-10-25 Bridge 取证)。
+        ESP_LOGW(TAG, "voice turn already submitted via AUDIO_*; "
+                      "drop duplicate text submission");
+        return true;
+    }
     return send_text_bytes(text);
 }
 

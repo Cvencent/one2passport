@@ -101,20 +101,21 @@ bool coding_flow_set_transcript(coding_flow_t *flow, const char *transcript)
         return false;
     }
     copy_text(flow->transcript, sizeof(flow->transcript), transcript);
-    flow->stage = CODING_STAGE_VOICE_REVIEW;
-    copy_text(flow->task_status, sizeof(flow->task_status), "发送前请确认文字");
+    // CBDP v1 §19.4: AUDIO_END 之后 Bridge 已经完成 STT 并提交 turn —— 这里的
+    // transcript 只是回显, 只能用于显示/状态收敛。旧流程在此进入"确认文字"页,
+    // 用户按确认后走 SEND_* 再提交一遍, 造成同文两投(2026-10-25 Bridge 取证:
+    // cbdp-audio:350674 与 cbdp-tx:350675 同文两条)。
+    flow->stage = CODING_STAGE_QUEUED;
+    copy_text(flow->task_status, sizeof(flow->task_status), "已识别并提交电脑端");
     return true;
 }
 
 coding_action_t coding_flow_confirm_voice(coding_flow_t *flow)
 {
-    if (flow == NULL || flow->stage != CODING_STAGE_VOICE_REVIEW ||
-        flow->transcript[0] == '\0') {
-        return CODING_ACTION_NONE;
-    }
-    flow->stage = CODING_STAGE_QUEUED;
-    copy_text(flow->task_status, sizeof(flow->task_status), "正在发送到电脑端");
-    return CODING_ACTION_SEND_VOICE;
+    // 语音提交入口已收敛为 AUDIO_* 单路径(见 set_transcript 注释):
+    // confirm 不能再触发 SEND_VOICE, 否则同一句话会被提交两次。
+    (void)flow;
+    return CODING_ACTION_NONE;
 }
 
 void coding_flow_retry_voice(coding_flow_t *flow)

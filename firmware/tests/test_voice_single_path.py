@@ -6,6 +6,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 FLOW = (ROOT / "main" / "coding_flow.c").read_text(encoding="utf-8")
 BRIDGE = (ROOT / "main" / "coding_bridge.c").read_text(encoding="utf-8")
+XZ_H = (ROOT / "main" / "xiaozhi_client.h").read_text(encoding="utf-8")
+XZ = (ROOT / "main" / "xiaozhi_client.c").read_text(encoding="utf-8")
+RADIO = (ROOT / "main" / "radio_player.cc").read_text(encoding="utf-8")
 
 
 def function_body(source, signature):
@@ -59,6 +62,29 @@ class VoiceSinglePathTest(unittest.TestCase):
         begin_body = function_body(BRIDGE, "static bool send_audio_begin")
         self.assertIn("s_voice_turn_submitted = false", begin_body,
                       "a new recording period clears the mutex")
+
+    def test_tail_arena_leaves_room_for_the_jitter_ring(self):
+        # 2026-10-25 user report: with the arena taking the WHOLE 9.2KB tail
+        # the ring shrank to 11 blocks and sources starved into auto-skips
+        # ('莫名切台' + segmented playback). The arena is capped so the ring
+        # keeps a slice of the tail.
+        import re as _re
+        m = _re.search(r"XZ_MIC_TAIL_ARENA_CAP (\d+)UL", XZ_H)
+        self.assertIsNotNone(m, "the arena cap must be an explicit constant")
+        cap = int(m.group(1))
+        self.assertGreaterEqual(cap, 4500,
+                                "the arena must still host the 4224B decoder "
+                                "sub-block (the biggest heap consumer)")
+        self.assertLessEqual(cap, 7000,
+                             "the ring must keep >=2.2KB of the tail; a full-"
+                             "tail arena shrank the ring to 11 blocks and "
+                             "caused the starvation skips")
+        idle = function_body(XZ, "uint8_t *xiaozhi_idle_buffer")
+        self.assertIn("XZ_MIC_TAIL_ARENA_CAP", idle,
+                      "the ring borrow must start after the arena cap")
+        calloc_body = function_body(RADIO, "void *media_lib_module_calloc")
+        self.assertIn("XZ_MIC_TAIL_ARENA_CAP", calloc_body,
+                      "the bump allocator must be bounded by the cap")
 
     def test_audio_end_reuses_the_begin_tx_id(self):
         begin_body = function_body(BRIDGE, "static bool send_audio_begin")

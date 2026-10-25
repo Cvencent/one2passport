@@ -12,6 +12,7 @@
 #include "nvs.h"
 #include "radio_ui.h"
 #include "radio_stream_buffer.h"
+#include "xiaozhi_client.h"     // XZ_MIC_TAIL_ARENA_CAP(竞技场容量上限)
 #include "radio_mp3_header.h"
 #include "radio_retry.h"
 
@@ -512,7 +513,9 @@ extern "C" void *media_lib_module_calloc(uint32_t module, size_t n, size_t size)
     if (total >= kArenaMinBlock && s_tail_arena_bump != nullptr) {
         const size_t block = (total + 15u) & ~(size_t)15u;  // 16B 对齐
         uint8_t *slot = s_tail_arena_bump;
-        if (slot + block <= s_tail_arena_end) {
+        // 只用尾巴的前 XZ_MIC_TAIL_ARENA_CAP 字节: 剩余的留给抖动环,
+        // 环容量 11 -> 13 块(用户实测: 整段占用会让源抖动吸收能力不足)。
+        if (slot + block <= s_tail_arena_base + XZ_MIC_TAIL_ARENA_CAP) {
             *(volatile uint32_t *)slot = (uint32_t)total;  // 块头: 原尺寸
             uint8_t *out = slot + 16;
             s_tail_arena_bump = slot + block + 16;         // 头随块 16B 对齐

@@ -62,16 +62,11 @@ uint8_t *xiaozhi_radio_tail_claim(size_t *size); // 独占尾巴, 返回基址; 
 void xiaozhi_radio_tail_release(void);           // 归还(解码池释放时)
 bool xiaozhi_radio_tail_active(void);
 
-// ---- 收音机解码器尾部竞技场(借闲置麦克风静态区的"尾巴") ----
-// mic 静态区 25.6KB 布局: [桥接12K][收音机网络栈4K][尾巴9.2K]。尾巴是收音机
-// 抖动环的备用借出区; 解码器子块(>=2KB)借用它时抖动环让位(缩到 TTS 10 块)。
-// 关键: 尾部与桥接栈(前 12KB)**不重叠** -> 桥接可以常驻首页(计数/提醒照常),
-// 这是"首页小 Codex + 小收音机并存"的成立前提。进入小智时 radio_player_
-// release_pool() 归还尾部, mic 任务照常使用整片数组。
-bool xiaozhi_radio_tail_available(void);        // 只查询: 现在借是否可行
-uint8_t *xiaozhi_radio_tail_claim(size_t *size); // 独占尾巴, 返回基址; 失败 NULL
-void xiaozhi_radio_tail_release(void);           // 归还(解码池释放时)
-bool xiaozhi_radio_tail_active(void);
+// 竞技场在尾巴里最多占用这么多: 装下解码器最大的两个子块(4224+2304+块头),
+// 剩余 ~2.5KB 还给收音机抖动环 —— 环 11 -> 13 块, 同时 dma 余量保持
+// ~7.4KB(WiFi 收包需求的 4.6 倍)。2026-10-25 用户实测: 整段尾巴给竞技场
+// 会让环缩到 11 块, 源稍慢就饿死跳台("莫名切台"+一段一段的卡顿)。
+#define XZ_MIC_TAIL_ARENA_CAP 6656UL
 
 #ifdef __cplusplus
 }

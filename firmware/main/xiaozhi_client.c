@@ -1687,9 +1687,16 @@ uint8_t *xiaozhi_idle_buffer(size_t *size)
 {
     if (size) *size = 0;
     if (!xz_mic_stack_is_idle()) return NULL;
-    if (s_radio_tail_held) return NULL;  // 解码器竞技场借走了整段尾巴
     const size_t used = XZ_BRIDGE_STACK_BYTES + XZ_RADIO_STACK_BYTES;
     if (sizeof(s_mic_stack_storage) <= used) return NULL;
+    if (s_radio_tail_held) {
+        // 解码器竞技场只占尾巴前段(XZ_MIC_TAIL_ARENA_CAP), 剩余的给抖动环
+        // —— 环 11 -> 13 块, 源抖动吸收能力部分恢复。
+        const size_t tail = sizeof(s_mic_stack_storage) - used;
+        if (tail <= XZ_MIC_TAIL_ARENA_CAP) return NULL;
+        if (size) *size = tail - XZ_MIC_TAIL_ARENA_CAP;
+        return s_mic_stack_storage + used + XZ_MIC_TAIL_ARENA_CAP;
+    }
     if (size) *size = sizeof(s_mic_stack_storage) - used;
     return s_mic_stack_storage + used;
 }

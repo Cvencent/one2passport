@@ -306,15 +306,31 @@ static const uint8_t kEqPattern[20] = {
 };
 
 static void home_eq_draw(lv_event_t *event) {
+    lv_obj_t *card = static_cast<lv_obj_t *>(lv_event_get_target(event));
     lv_area_t origin;
-    lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)), &origin);
+    lv_obj_get_coords(card, &origin);
     lv_draw_rect_dsc_t descriptor;
     lv_draw_rect_dsc_init(&descriptor);
     descriptor.bg_color = lv_color_hex(C_MUTED);
+    // 2026-10-26 崩溃修复: 频谱柱必须裁剪到卡片内再交给 lv_draw_rect。
+    // 高度最高 32px, 卡片内高 78px 本应放得下; 但卡片自带 radius=6 圆角,
+    // 柱子 x=13/63/... 的一根恰好压在圆角边缘时, lv_draw_sw_border 的
+    // 复杂边框路径会在柱与圆角的交叠区越界写(lv_memset 崩溃, 反汇编
+    // draw_border_complex -> lv_mask_radius 实测)。给柱子范围裁剪到
+    // 卡片坐标 1..77(避开圆角与边框), 与圆角无交叠后路径保持简单矩形。
+    lv_area_t clip = origin;
+    clip.x1 += 2; clip.x2 -= 2;
+    clip.y1 += 2; clip.y2 -= 2;
     for (int i = 0; i < 20; ++i) {
         const int height = s_eq_last_h[i] > 0 ? s_eq_last_h[i] : 6;
         const int x = origin.x1 + 13 + i * 10;
-        lv_area_t bar = {x, origin.y1 + 79 - height, x + 6, origin.y1 + 78};
+        lv_area_t bar = {x, origin.y1 + 77 - height, x + 6, origin.y1 + 77};
+        // 裁剪到卡片安全区; 完全在外的柱子跳过。
+        if (bar.x1 < clip.x1) bar.x1 = clip.x1;
+        if (bar.x2 > clip.x2) bar.x2 = clip.x2;
+        if (bar.y1 < clip.y1) bar.y1 = clip.y1;
+        if (bar.y2 > clip.y2) bar.y2 = clip.y2;
+        if (bar.x2 <= bar.x1 || bar.y2 <= bar.y1) continue;
         lv_draw_rect(lv_event_get_layer(event), &descriptor, &bar);
     }
 }

@@ -1491,7 +1491,12 @@ bool stream_station(std::size_t station, uint32_t generation) {
         RadioStreamBuffer &ring = *ring_storage;
         feed.ring = &ring;
         // Bound pause/cancel latency after the connection is established.
-        esp_http_client_set_timeout_ms(client, 1000);
+        // 2026-10-26: 1000ms -> 200ms。每轮 read 最多阻塞 1s 意味着环形缓冲
+        // 快见底时, 一次 EAGAIN 就烧掉 1s —— 而 64k 台的抖动间隔实测 2~3s,
+        // 两次 EAGAIN 直接把环抽干(13KB 环 = 1.6s)。200ms 的情况下同样的
+        // 抖动只烧 0.2-0.4s, 环能扛过去。换台/暂停延迟不受影响: stop 与
+        // generation 检查在每轮循环最前, 单轮阻塞最多 200ms。
+        esp_http_client_set_timeout_ms(client, 200);
         xTaskNotifyGive(network_task);
         // 缓冲已在上面就位(池化复用或现场分配), 此处不再 malloc。
 
@@ -1587,6 +1592,10 @@ bool stream_station(std::size_t station, uint32_t generation) {
                     // 用户听 30-60s 的卡顿+静音再等两轮饥饿会话, 不如放弃
                     // 本会话, 外层按饥饿计数立即跳台(冷却会让该台稍后轮回,
                     // CDN 恢复后还能听)。
+                    //
+                    // ⚠ 前提: rebuffer 只会在"欠载"时发生。起播阈值 12KB
+                    // (=1.5s@64kbps)本身不欠载; 若连起播都进不来大量数据
+                    // (12s 只到 4-10KB), 那是源极慢, 跳台同样正确。
                     ESP_LOGW(kTag, "session starved (%u rebuffers); abandoning",
                              (unsigned)rebuffers);
                     s_last_prebuffer_starved.store(true, std::memory_order_release);

@@ -99,7 +99,14 @@ constexpr std::size_t kDecoderMinBlock = 23 * 1024;
 // 2026-10-25 真机复现: 首页/菜单层合法地只剩 ~1.2KB free 时进收音机,
 // getaddrinfo() 返回 202(EAI_MEMORY) -> 旧代码按"电台不可达"处理, 毫秒级把
 // 整表电台刷一遍, 日志雪崩 + CPU 打满, 最终 RTC_SW_CPU_RST 复位。
-constexpr std::size_t kConnectionMinBlock = 6 * 1024;
+//
+// 2026-10-25 (方案 A) 从 6KB 放宽到 2.5KB: 方案 A 让首页播放时停掉桥接,
+// 解码池(22.9KB, 仍在堆里)吃掉最大块后首页合法地只剩 ~3.1KB —— 这不是
+// "内存不足", 而是**正常可播状态**: 项目实测(2026-10-12, radio_player.cc
+// 头部注释) dma 空闲 >=2.5KB 就足以稳定供出 1600B 的 WiFi 收包缓冲,
+// getaddrinfo 在 1.2KB 才开始返回 EAI_MEMORY。2.5KB 卡在两者中间:
+// 低于它 = 真的连不动(原地退避), 高于它 = 放手去连。
+constexpr std::size_t kConnectionMinBlock = 2500;
 
 // True when a connection failure is explained by a starved heap rather than a
 // dead station. Callers must retry the same station instead of advancing.

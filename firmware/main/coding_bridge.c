@@ -2297,6 +2297,11 @@ esp_err_t coding_bridge_init_usb_only(void)
     return ESP_OK;
 }
 
+bool coding_bridge_wireless_started(void)
+{
+    return s_wireless_started;
+}
+
 esp_err_t coding_bridge_start_wireless(void)
 {
     if (s_wireless_started) {

@@ -63,6 +63,8 @@ bool radio_player_has_cached_catalog();
 void radio_player_invalidate_catalog_cache();
 RadioStation radio_player_station(std::size_t index);
 bool radio_player_replace_stations(const RadioStation *stations, std::size_t count);
+// 选城市时从实测白名单预设表加载(城市名->省/市组); 无匹配返回 false。
+bool radio_player_load_city_preset(const char *city);
 // Installs a catalog and keeps listening to the station the user last chose
 // when the new catalog still offers it, so a restart resumes where it left off.
 bool radio_player_replace_stations_resuming(const RadioStation *stations,

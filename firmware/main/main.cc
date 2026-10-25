@@ -1170,6 +1170,17 @@ void app_radio_request_city(const char *city, const char *display) {
             break;
         }
     }
+    // 2026-10-26: 优先走实测白名单预设表(零网络延迟、全部可持续)。
+    // 自动定位/预设未覆盖的城市仍走在线目录搜索。
+    if (city && city[0] && radio_player_load_city_preset(city)) {
+        radio_ui_set_location(display && display[0] ? display : city);
+        radio_ui_set_station(0, radio_player_station_count(),
+                             radio_player_station(0));
+        radio_ui_set_playback(RadioPlaybackState::Stopped,
+                              "已加载实测电台列表");
+        radio_player_set_network(true);
+        return;
+    }
     start_city_catalog_search(city, display);
 }
 void app_radio_wifi_performance(void) {
@@ -1336,10 +1347,6 @@ extern "C" void app_main(void) {
         // Existing owners keep all networks already stored in NVS. Give those
         // networks 30 seconds to appear before opening the setup portal.
         manager.StartStation();
-        // 2026-10-25: 真机 ping 丢包率 43-50%(空闲也一样), TCP 吞吐坍缩成
-        // 涓流是首页/收音机播放卡顿的链路层根因。发射功率拉满(84/4=21dBm,
-        // C3 上限), 配合 lwIP 窗口/WiFi 缓冲加大(sdkconfig)对冲丢包。
-        esp_wifi_set_max_tx_power(84);
     }
 
     // WiFi station setup allocates event nodes and netif state. Start the

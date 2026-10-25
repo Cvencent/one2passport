@@ -123,9 +123,17 @@ static_assert(kDecoderMinBlock >= kDecoderInitBytes,
               "kDecoderMinBlock must cover the measured MP3 decoder init "
               "requirement (0x5978) or stream_station will attempt doomed decodes");
 constexpr std::size_t kLevelCount = 18;
-// 电台列表容量。兜底表 10 项(7 中文 + 3 国际)已占大半, 再给目录搜索结果
-// 留几个位置。RadioStation ≈ 418B, 14 项 ≈ 5.9KB 静态。
-constexpr std::size_t kMaxStations = 14;
+// 电台列表容量。兜底表 = 47 个实测可持续的全国台(2026-10-26 普查);
+// 地方台按城市动态加载(见 kCityPresetStations)。
+// 2026-10-26: 14 -> 47。兜底表 = 全部 47 个实测可持续的全国/网络台
+// (2026-10-26 普查 192 台, 逐台测投递速率 vs 内容码率, 余量比<=0.75 且
+// 12s 采样无停顿)。RadioStation ≈ 418B, 47 项 ≈ 19.6KB 静态:
+// post_wifi_init dma≈59KB, 开机 RF 校准安全线 dma>5748B, 余量充足。
+// 地方台不占兜底表 —— 按城市从 kCityPresetStations 动态加载(见下)。
+// 2026-10-26 (v1.2.14): 47 -> 20。兜底表 = 用户点选的 15 个全国台(显示名
+// 按用户指定), 剩余 5 个槽位给城市预设/目录搜索动态加载。
+// RadioStation ≈ 418B, 20 项 ≈ 8.4KB 静态(开机 RF 校准安全线内)。
+constexpr std::size_t kMaxStations = 20;
 // Consecutive silent failures tolerated before moving to the next station.
 // Public directories are full of dead entries; retrying the same address just
 // makes every "next station" press feel frozen. Move on after the first
@@ -143,35 +151,184 @@ constexpr uint8_t kMaxFailedAttempts = 1;
 //    secretagent 曾被标成"Fred 电影电台""亚洲音乐台", 属于错标)。
 // ③ FM891 的 96k.aac 与 qingting 的 kuwo "音乐之声" 变体都不是稳定直播流
 //    (后者实测 238 kB/s 的整块下载, 是单曲而非电台), 同样删除。
-// ④ 兜底表整体换成中文台: 国家级 4 条 + 中文综艺/音乐 6 条。原先收着的
-//    RFI中文、SomaFM 环境/爵士/复古(英文氛围乐)和怀旧金曲(设备端实测 Open
-//    failed)按用户要求删掉, 换成 2026-10-18 逐条测速通过的中文台。
+// 2026-10-26 兜底表: 用户从 29 个实测全国台中点选 15 个, 显示名按用户指定。
+// 全部 OK 级(投递余量 >= 1.1x 内容码率, 12s 采样无停顿), 高码率组优先。
 const RadioStation kFallbackStations[] = {
-    // ---- 国家级中文台(全国可达, 实测可播) ----
-    {"中国之声", "中央人民广播电台 · 新闻",
-     "http://lhttp.qtfm.cn/live/15318317/64k.mp3", 0},
-    {"经济之声", "中央人民广播电台 · 财经",
-     "http://lhttp.qtfm.cn/live/15318316/64k.mp3", 0},
-    {"劲曲调频", "CRI Hit FM · 中文流行",
-     "http://lhttp.qingting.fm/live/15318703/64k.mp3", 0},
-    {"轻松调频", "CRI Easy FM · 中英双语",
-     "http://lhttp.qingting.fm/live/15318704/64k.mp3", 0},
-    // ---- 中文综艺/音乐台(2026-10-18 逐条测速后保留) ----
-    {"清晨音乐台", "华语轻音乐 · 全天不间断",
-     "http://lhttp.qingting.fm/live/4915/64k.mp3", 0},
-    {"500首华语经典", "老歌精选 · 中文",
-     "https://lhttp.qtfm.cn/live/5022308/64k.mp3", 0},
-    {"动听音乐台", "流行音乐 · 中文",
-     "https://lhttp-hw.qtfm.cn/live/5022107/64k.mp3", 0},
-    {"听云音乐台", "320kbps 高码率 · 中文",
-     "https://m.tyradio.uk/radio.mp3", 0},
-    {"听云评书台", "评书 · 中文",
-     "https://m.tyradio.uk/typs.mp3", 0},
-    {"听云相声台", "相声 · 中文",
-     "https://m.tyradio.uk/tyxs.mp3", 0},
+    {"音乐之声", "全国",
+     "http://antiserver.kuwo.cn/anti.s?rid=MUSIC_190038250&response=res&format=mp3|aac&type=convert_url&br=128kmp3&agent=iPhone&callback=getlink&jpcallback=getlink.mp3", 0},   // 128kbps 1330.0KB/s 余量0.01 (原名: CNR-3 音乐之声)
+    {"亚洲音乐台", "全国",
+     "https://antares.dribbcast.com/proxy/apop?mp=/s", 0},   // 128kbps 102.2KB/s 余量0.16 (原名: Big B Radio亚洲音乐台)
+    {"5分钟新闻", "全国",
+     "https://replaynewszh.ice.infomaniak.ch/replaynewszh-128.mp3", 0},   // 128kbps  27.3KB/s 余量0.59 (原名: REPLAY NEWS - 中文 每5分钟播报一次新)
+    {"听云戏曲台", "全国",
+     "https://m.tyradio.uk/tyxq.mp3", 0},   //  96kbps  16.7KB/s 余量0.72 (原名: 听云戏曲台)
+    {"听云相声台", "全国",
+     "https://m.tyradio.uk/tyxs.mp3", 0},   //  96kbps  16.5KB/s 余量0.73 (原名: 听云相声台)
+    {"听云评书台", "全国",
+     "https://m.tyradio.uk/typs.mp3", 0},   //  96kbps  16.2KB/s 余量0.74 (原名: 听云评书台)
+    {"新闻联播", "全国",
+     "https://rfienchinois64k.ice.infomaniak.ch//rfienchinois-64.mp3", 0},   //  64kbps  18.3KB/s 余量0.44 (原名: 新闻联播)
+    {"中国之声", "全国",
+     "https://lhttp.qtfm.cn/live/15318317/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.62 (原名: CNR-1 中国之声)
+    {"国际新闻", "全国",
+     "https://lhttp.qtfm.cn/live/20500172/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.63 (原名: 国际新闻)
+    {"故事广播", "全国",
+     "https://lhttp.qtfm.cn/live/20500182/64k.mp3", 0},   //  64kbps  12.7KB/s 余量0.63 (原名: 故事广播-阿基米德故事会)
+    {"动听音乐台", "全国",
+     "https://lhttp-hw.qtfm.cn/live/5022107/64k.mp3", 0},   //  64kbps  12.6KB/s 余量0.64 (原名: 动听音乐台)
+    {"星空电台", "全国",
+     "https://lhttp-hw.qtfm.cn/live/5022379/64k.mp3", 0},   //  64kbps  12.4KB/s 余量0.65 (原名: 星空电台 STAR RADIO)
+    {"健康电台", "全国",
+     "https://lhttp-hw.qtfm.cn/live/20500232/64k.mp3", 0},   //  64kbps  12.9KB/s 余量0.62 (原名: 阿基米德-健康电台)
+    {"听梦想FM", "全国",
+     "https://lhttp-hw.qtfm.cn/live/4917/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.62 (原名: .听梦想FM（原态度电台）24小时音乐不打烊)
+    {"城市音乐台", "全国",
+     "https://lhttp.qtfm.cn/live/20500153/64k.mp3", 0},   //  64kbps  12.7KB/s 余量0.63 (原名: CityFM城市音乐台)
 };
 
 
+// 城市预设表: 选城市时按组键动态拷入电台列表(不占兜底静态表)。
+// 组键 = 省级(如 广东/江苏), 每组按实测余量比升序(最稳的在前)。
+// 城市预设表: 选省份/城市时按组键动态拷入电台列表(不占兜底静态表)。
+// 每组 <= 12 台(实测可持续), 重庆 5 台为 v1.2.14 专项补测。
+const RadioStation kCityPresetStations[] = {
+    {"Alxa Chinese Radio", "内蒙古",
+     "http://lhttp.qingting.fm/live/5022521/64k.mp3", 0},   //  64kbps  12.8 余量0.63
+    {"赤峰蒙语广播", "内蒙古",
+     "https://lhttp-hw.qtfm.cn/live/1897/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"北京新闻广播", "北京",
+     "https://lhttp.qtfm.cn/live/339/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"南阳综合广播", "南阳",
+     "https://lhttp.qingting.fm/live/1213/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"MY FM全国音乐频道——FM106.3  长春少儿", "吉林",
+     "http://lhttp.qingting.fm/live/4984/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"长春交通之声", "吉林",
+     "http://lhttp.qingting.fm/live/4967/64k.mp3", 0},   //  64kbps  12.8 余量0.63
+    {"四川新闻广播", "四川",
+     "https://lhttp.qtfm.cn/live/4906/64k.mp3", 0},   //  64kbps  12.8 余量0.63
+    {"四川音乐广播", "四川",
+     "https://lhttp.qtfm.cn/live/1110/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"安徽交通广播", "安徽",
+     "https://lhttp.qtfm.cn/live/1949/64k.mp3", 0},   //  64kbps  20.5 余量0.39
+    {"济南都市广播", "山东",
+     "https://lhttp.qtfm.cn/live/5022333/64k.mp3", 0},   //  64kbps  12.8 余量0.63
+    {"聊城经济广播", "山东",
+     "https://lhttp.qtfm.cn/live/5022262/64k.mp3", 0},   //  64kbps  12.6 余量0.64
+    {"青岛新闻广播", "山东",
+     "http://lhttp.qingting.fm/live/1673/64k.mp3", 0},   //  64kbps  12.3 余量0.65
+    {"广州新闻资讯广播台", "广东",
+     "http://lhttp.qingting.fm/live/4848/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"深圳新闻广播", "广东",
+     "http://lhttp.qingting.fm/live/1270/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"深圳音乐广播", "广东",
+     "https://lhttp.qtfm.cn/live/1271/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"羊城交通电台", "广东",
+     "https://lhttp.qtfm.cn/live/1262/64k.mp3", 0},   //  64kbps  12.8 余量0.62
+    {"顺德音乐之声", "广东",
+     "https://lhttp.qtfm.cn/live/20500150/64k.mp3", 0},   //  64kbps  13.0 余量0.62
+    {"中山综合广播·新锐967", "广东",
+     "https://lhttp.qingting.fm/live/1277/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"广东城市之声", "广东",
+     "https://lhttp.qtfm.cn/live/469/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"广东新闻广播", "广东",
+     "https://lhttp.qtfm.cn/live/1254/64k.mp3", 0},   //  64kbps  12.8 余量0.63
+    {"广东珠江经济台", "广东",
+     "https://lhttp.qtfm.cn/live/1259/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"广东音乐之声", "广东",
+     "https://lhttp.qtfm.cn/live/1260/64k.mp3", 0},   //  64kbps  12.6 余量0.63
+    {"广州汽车音乐电台金曲音乐广播", "广东",
+     "http://lhttp.qingting.fm/live/20192/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"广州经济交通广播电台", "广东",
+     "http://lhttp.qingting.fm/live/4955/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"广西教育广播 私家车930", "广西",
+     "https://lhttp-hw.qtfm.cn/live/1756/64k.mp3", 0},   //  64kbps  13.2 余量0.61
+    {"怀集音乐之声", "广西",
+     "https://lhttp.qingting.fm/live/4804/64k.mp3", 0},   //  64kbps  12.6 余量0.64
+    {"Changchi News Radio", "新疆",
+     "http://lhttp.qingting.fm/live/5021874/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"轮台之声", "新疆",
+     "https://lhttp-hw.qtfm.cn/live/20500099/64k.mp3", 0},   //  64kbps  12.5 余量0.64
+    {"无锡新闻综合广播FM93.7", "江苏",
+     "https://lhttp.qtfm.cn/live/2777/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"苏州都市音乐广播", "江苏",
+     "http://lhttp.qingting.fm/live/2803/64k.mp3", 0},   //  64kbps  12.8 余量0.62
+    {"三门峡交通文艺广播", "河南",
+     "https://lhttp-hw.qtfm.cn/live/15318227/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"杭州华语之声网络广播", "浙江",
+     "https://lhttp.qtfm.cn/live/20505/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"海口综合广播", "海口",
+     "https://lhttp.qtfm.cn/live/5022015/64k.mp3", 0},   //  64kbps  12.9 余量0.62
+    {"FM104.7 澧县人民广播电台", "湖北",
+     "https://lhttp-hw.qtfm.cn/live/15318178/64k.mp3", 0},   //  64kbps  13.2 余量0.60
+    {"鼎城人民广播电台", "湖南",
+     "https://lhttp.qingting.fm/live/5021860/64k.mp3", 0},   //  64kbps  12.5 余量0.64
+    {"福建海峡之声", "福建",
+     "https://lhttp-hw.qtfm.cn/live/1744/64k.mp3", 0},   //  64kbps  13.0 余量0.62
+    {"厦门音乐广播", "福建",
+     "https://lhttp.qtfm.cn/live/1739/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"西宁交通文艺广播", "西宁",
+     "http://lhttp.qingting.fm/live/5022283/64k.mp3", 0},   //  64kbps  12.8 余量0.62
+    {"大连音乐广播", "辽宁",
+     "http://lhttp.qingting.fm/live/1084/64k.mp3", 0},   //  64kbps  13.0 余量0.62
+    {"沈阳新闻广播", "辽宁",
+     "http://lhttp.qingting.fm/live/20024/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"北碚综合广播·嘉陵之声FM88.7", "重庆",
+     "https://lhttp-hw.qtfm.cn/live/20211692/64k.mp3", 0},   //  64kbps  12.8 余量0.62
+    {"大足综合广播", "重庆",
+     "https://lhttp-hw.qtfm.cn/live/20211676/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"綦江综合广播", "重庆",
+     "http://lhttp.qtfm.cn/live/20500201/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"永川之声100.7", "重庆",
+     "http://lhttp.qtfm.cn/live/20210236/64k.mp3", 0},   //  64kbps  12.4 余量0.64
+    {"重庆都市广播", "重庆",
+     "http://lhttp.qtfm.cn/live/1502/64k.mp3", 0},   //  64kbps  12.5 余量0.64
+    {"长沙交通广播", "长沙",
+     "http://lhttp.qingting.fm/live/3967/64k.mp3", 0},   //  64kbps  13.0 余量0.62
+    {"长沙音乐广播", "长沙",
+     "https://lhttp.qtfm.cn/live/20847/64k.mp3", 0},   //  64kbps  13.0 余量0.62
+    {"陕西交通广播", "陕西",
+     "https://lhttp.qtfm.cn/live/1601/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"陕西音乐广播", "陕西",
+     "https://lhttp.qtfm.cn/live/4873/64k.mp3", 0},   //  64kbps  12.7 余量0.63
+    {"青海交通音乐广播 FM97.2", "青海",
+     "http://lhttp.qtfm.cn/live/5009/64k.mp3", 0},   //  64kbps  13.0 余量0.62
+    {"青海经济生活广播 FM90.3", "青海",
+     "http://lhttp.qtfm.cn/live/5008/64k.mp3", 0},   //  64kbps  12.8 余量0.63
+};
+
+// 组键 -> [起始, 数量] 索引(线性查找, 组数少)
+struct CityPresetGroup {
+    const char *group;
+    uint16_t offset;
+    uint16_t count;
+};
+const CityPresetGroup kCityPresetGroups[] = {
+    {"内蒙古", 0, 2},
+    {"北京", 2, 1},
+    {"南阳", 3, 1},
+    {"吉林", 4, 2},
+    {"四川", 6, 2},
+    {"安徽", 8, 1},
+    {"山东", 9, 3},
+    {"广东", 12, 12},
+    {"广西", 24, 2},
+    {"新疆", 26, 2},
+    {"江苏", 28, 2},
+    {"河南", 30, 1},
+    {"浙江", 31, 1},
+    {"海口", 32, 1},
+    {"湖北", 33, 1},
+    {"湖南", 34, 1},
+    {"福建", 35, 2},
+    {"西宁", 37, 1},
+    {"辽宁", 38, 2},
+    {"重庆", 40, 5},
+    {"长沙", 45, 2},
+    {"陕西", 47, 2},
+    {"青海", 49, 2},
+};
+
+// 选城市时把预设组拷入 s_stations(见 radio_player_load_city_preset)。
 std::atomic<bool> s_network_connected{false};
 std::atomic<bool> s_wanted_playing{false};
 std::atomic<std::size_t> s_station_index{0};
@@ -2187,6 +2344,35 @@ std::size_t radio_player_station_count() {
 
 RadioStation radio_player_station(std::size_t index) {
     return station_snapshot(index);
+}
+
+// 选城市时从预设表加载该城市的实测可持续台(2026-10-26 普查)。
+// 组键匹配: 城市名 -> 省/市组(kCityPresetGroups), 无匹配返回 false(调用方
+// 回退到在线目录搜索)。拷贝受 kMaxStations 上限保护。
+bool radio_player_load_city_preset(const char *city) {
+    if (city == nullptr || city[0] == 0) return false;
+    const std::size_t group_count =
+        sizeof(kCityPresetGroups) / sizeof(kCityPresetGroups[0]);
+    for (std::size_t g = 0; g < group_count; ++g) {
+        if (std::strcmp(kCityPresetGroups[g].group, city) != 0) continue;
+        const std::size_t offset = kCityPresetGroups[g].offset;
+        const std::size_t count = kCityPresetGroups[g].count;
+        if (offset + count >
+            sizeof(kCityPresetStations) / sizeof(kCityPresetStations[0]))
+            return false;
+        if (xSemaphoreTake(s_station_mutex, pdMS_TO_TICKS(500)) != pdTRUE)
+            return false;
+        std::memcpy(s_stations, &kCityPresetStations[offset],
+                    count * sizeof(RadioStation));
+        s_station_count.store(count, std::memory_order_release);
+        s_station_index.store(0, std::memory_order_release);
+        s_catalog_cached = true;
+        xSemaphoreGive(s_station_mutex);
+        ESP_LOGI(kTag, "city preset loaded: %s -> %u stations",
+                 city, (unsigned)count);
+        return true;
+    }
+    return false;
 }
 
 bool radio_player_replace_stations(const RadioStation *stations, std::size_t count) {

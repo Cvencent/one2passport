@@ -1296,9 +1296,7 @@ void app_coding_bridge_done_with_elapsed(const char *text, uint32_t elapsed_ms)
     if (s_has_remote_task_elapsed) s_last_task_elapsed_ms = elapsed_ms;
     coding_flow_set_done(&s_flow, text);
     coding_render_deferred();
-    app_voice_mode_t mode = app_settings_voice_mode();
-    if (mode == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
-    else if (mode == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
+    codex_alert_play(false);
 }
 
 void app_coding_bridge_error(const char *text)
@@ -1325,7 +1323,7 @@ void app_coding_bridge_error_with_elapsed(const char *text, uint32_t elapsed_ms)
     if (s_has_remote_task_elapsed) s_last_task_elapsed_ms = elapsed_ms;
     coding_flow_set_error(&s_flow, text);
     coding_render_deferred();
-    ui_sfx_play(UI_SFX_FAIL);
+    codex_alert_play(true);
 }
 
 void app_coding_bridge_state(uint32_t running, uint32_t done, uint32_t failed)
@@ -1374,15 +1372,13 @@ void app_coding_remote_result(const char *thread_id, const char *status,
     snprintf(s_active_message_id, sizeof(s_active_message_id), "%s",
              message_id != NULL ? message_id : "");
     s_read_count = 0U;
-    if (status != NULL && strcmp(status, "failed") == 0) {
+    const bool failed = status != NULL && strcmp(status, "failed") == 0;
+    if (failed) {
         coding_flow_set_error(&s_flow, text);
-        ui_sfx_play(UI_SFX_FAIL);
     } else {
         coding_flow_set_done(&s_flow, text);
-        app_voice_mode_t mode = app_settings_voice_mode();
-        if (mode == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
-        else if (mode == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
     }
+    codex_alert_play(failed);
     coding_render_deferred();
 }
 

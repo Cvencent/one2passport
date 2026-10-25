@@ -55,6 +55,10 @@ void app_coding_bridge_transcript(const char *text);
 void app_coding_bridge_task_queued(const char *text);
 void app_coding_bridge_task_status(const char *text);
 void app_coding_bridge_approval(const char *question, const char *detail);
+// Single dedup gate for Codex completion/failure alerts. Both the CBDP
+// bridge and the foreground UI call this so one completion rings once.
+void codex_alert_play(bool failed);
+
 void app_coding_bridge_done(const char *text);
 void app_coding_bridge_error(const char *text);
 void app_coding_bridge_done_with_elapsed(const char *text, uint32_t elapsed_ms);

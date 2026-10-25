@@ -12,6 +12,7 @@
 #include "cJSON.h"
 #include "codex_bridge_protocol.h"
 #include "codex_background_state.h"
+#include "codex_alert.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "fap_screenshot.h"
@@ -118,6 +119,13 @@ static uint32_t s_codex_alert_armed_done;
 static uint32_t s_codex_alert_armed_failed;
 static bool s_codex_alert_armed_is_failure;
 #define CODEX_ALERT_SETTLE_US (4LL * 1000 * 1000)
+// One completion is reported through several independent channels: the
+// terminal turn event, the aggregate done/failed counters (which only ring
+// after CODEX_ALERT_SETTLE_US), and the foreground UI update. Each used to
+// ring on its own, so a single finished task produced two or three tones.
+// Claim the right to ring once; anything that follows within the window is
+// the same completion.
+static codex_alert_gate_t s_alert_gate;
 #define MAX_SUBSCRIPTIONS 6
 static uint32_t s_sub_topic[MAX_SUBSCRIPTIONS];
 static uint8_t s_sub_scope[MAX_SUBSCRIPTIONS];
@@ -1618,6 +1626,22 @@ static void wireless_handle_result(const cbdp_frame_header_t *header,
     s_last_message_us = esp_timer_get_time();
 }
 
+// The single alert entry point for every Codex completion/failure source.
+// It owns the dedup window and the user's speech/tone/silent preference,
+// so the bridge and the UI layer cannot drift or double-ring.
+void codex_alert_play(bool failed)
+{
+    if (!codex_alert_claim(&s_alert_gate, esp_timer_get_time())) return;
+    const app_voice_mode_t voice = app_settings_voice_mode();
+    if (failed) {
+        ui_sfx_play(UI_SFX_FAIL);
+    } else if (voice == APP_VOICE_SPEECH) {
+        ui_sfx_play(UI_SFX_DONE_SPEECH);
+    } else if (voice == APP_VOICE_TONE) {
+        ui_sfx_play(UI_SFX_CONFIRM);
+    }
+}
+
 // Shared by both counter channels: the CBDP TCP event 0x0704 and the UDP
 // home-counters frame 0x1E the Bridge pushes on the discovery port. Keeping one
 // implementation means the two paths cannot drift or double-count.
@@ -1667,13 +1691,7 @@ static void apply_codex_counts(uint32_t running, uint32_t done, uint32_t failed)
             if (now_us - s_codex_alert_armed_us >= CODEX_ALERT_SETTLE_US) {
                 const bool alert_failed = s_codex_alert_armed_is_failure;
                 s_codex_alert_armed_us = 0;
-                if (alert_failed) {
-                    ui_sfx_play(UI_SFX_FAIL);
-                } else {
-                    const app_voice_mode_t voice = app_settings_voice_mode();
-                    if (voice == APP_VOICE_SPEECH) ui_sfx_play(UI_SFX_DONE_SPEECH);
-                    else if (voice == APP_VOICE_TONE) ui_sfx_play(UI_SFX_CONFIRM);
-                }
+                codex_alert_play(alert_failed);
             }
         } else if (s_codex_alert_armed_us != 0) {
             // Count fell back: it was another client reading, not new work.
@@ -1878,14 +1896,7 @@ static void wireless_handle_delta(const cbdp_frame_header_t *header,
             // Alert only for a newly delivered result, not for a replay, and
             // honour the user's notification mode exactly like the in-page
             // path does (speech / tone / silent).
-            const app_voice_mode_t voice = app_settings_voice_mode();
-            if (failed) {
-                ui_sfx_play(UI_SFX_FAIL);
-            } else if (voice == APP_VOICE_SPEECH) {
-                ui_sfx_play(UI_SFX_DONE_SPEECH);
-            } else if (voice == APP_VOICE_TONE) {
-                ui_sfx_play(UI_SFX_CONFIRM);
-            }
+            codex_alert_play(failed);
         }
         if (body[0] != '\0' && ui_budget_available() &&
             coding_bridge_foreground_ui_active() && bsp_lvgl_lock(500)) {

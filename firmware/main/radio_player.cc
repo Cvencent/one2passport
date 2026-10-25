@@ -651,6 +651,13 @@ bool radio_player_prewarm(void) {
     // 解码器注册必须先于 open。radio_player_init 里也会注册(幂等)。
     if (esp_audio_dec_register_default() != ESP_AUDIO_ERR_OK) return false;
     if (esp_audio_simple_dec_register_default() != ESP_AUDIO_ERR_OK) return false;
+    if (!xiaozhi_radio_tail_available()) {
+        // 小智退出收尾窗口: 有界等尾部归还, 否则池建在堆上且整场播放不纠正。
+        for (int waited = 0; waited < 30 && !xiaozhi_radio_tail_available();
+             ++waited) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
     if (xiaozhi_radio_tail_available()) {
         // 尾部竞技场可用: 池缓冲先分配, 预热用池内缓冲做 I/O(绝不能走
         // scratch 路径 —— 那会先借走尾部, 随后竞技场 bump 落在同一片区,

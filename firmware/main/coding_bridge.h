@@ -16,6 +16,8 @@ esp_err_t coding_bridge_init(void);
 esp_err_t coding_bridge_init_usb_only(void);
 // 桥接无线任务是否在运行(app_registry 的最小化服务在收音机播放期间据此停桥)。
 bool coding_bridge_wireless_started(void);
+// 桥接无线任务是否在运行(小智/完整 Codex 退出后, 首页恢复播放时要补启)。
+bool coding_bridge_wireless_started(void);
 esp_err_t coding_bridge_start_wireless(void);
 void coding_bridge_stop_wireless(void);
 void coding_bridge_set_foreground_ui(bool active);

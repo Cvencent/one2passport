@@ -924,6 +924,13 @@ void app_framework_minimize_services(bool restore_radio) {
     // 收音机并存)。解码子块进尾巴后堆多 ~8.8KB, WiFi 收包(需 ~1600B 连续
     // DMA)不再被挤死 —— 旧方案 A(停桥)的离线代价取消。
     if (restore_radio && s_minimized_radio_should_play) {
+        // 2026-10-25: 小智/完整 Codex 退出时停过桥 —— 首页恢复播放前必须
+        // 补启, 否则计数/提醒死掉、电脑端看到设备离线(实测漏了这步)。
+        if (!coding_bridge_wireless_started()) {
+            if (coding_bridge_start_wireless() != ESP_OK) {
+                ESP_LOGW(kTag, "minimized Codex bridge could not start");
+            }
+        }
         // This path runs after the caller has released the LVGL lock. Use the
         // synchronous ordered helper so the decoder owns its contiguous block
         // before any bridge resource could be allocated.
@@ -960,6 +967,11 @@ void app_framework_restore_minimized_services_ordered(void) {
     // static mic tail (bridge task stack in the FRONT 12KB does not overlap),
     // so the resident bridge keeps counters/alerts alive on home.
     if (s_minimized_radio_should_play) {
+        if (!coding_bridge_wireless_started()) {
+            if (coding_bridge_start_wireless() != ESP_OK) {
+                ESP_LOGW(kTag, "minimized Codex bridge could not start");
+            }
+        }
         radio_player_rewake_after_pool_ready();
         radio_player_set_playing(true);
         coding_bridge_set_foreground_ui(false);

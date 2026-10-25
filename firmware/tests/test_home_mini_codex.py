@@ -35,7 +35,10 @@ class HomeMiniCodexTest(unittest.TestCase):
     the heap (~8.8KB), keeping the WiFi RX supply above the stable line.
     """
 
-    def test_bridge_stays_resident_during_minimized_playback(self):
+    def test_bridge_restarted_when_resuming_playback(self):
+        # 2026-10-25 regression: entering xiaozhi stops the bridge; the resume
+        # path forgot to start it again, so home counters/alerts died until
+        # the next full app cycle. The playing branch must restart it.
         body = function_body(REG, "void app_framework_minimize_services")
         playing = body.find("s_minimized_radio_should_play")
         ret = body.find("return;", playing)
@@ -44,17 +47,18 @@ class HomeMiniCodexTest(unittest.TestCase):
         self.assertNotIn("coding_bridge_stop_wireless()", window,
                          "the bridge must stay resident on home: counters and "
                          "alerts must keep working while the radio plays")
-        start = body.find("coding_bridge_start_wireless()", playing)
-        self.assertGreater(start, ret,
-                           "the idle branch (radio not playing) still starts "
-                           "the bridge")
+        self.assertIn("coding_bridge_wireless_started()", window)
+        self.assertIn("coding_bridge_start_wireless()", window,
+                      "the resume branch must restart the bridge stopped by "
+                      "the xiaozhi/codex enter paths")
 
-    def test_restore_ordered_keeps_bridge_resident(self):
+    def test_restore_ordered_restarts_bridge_too(self):
         body = function_body(REG, "void app_framework_restore_minimized_services_ordered")
         playing = body.find("s_minimized_radio_should_play")
         ret = body.find("return;", playing)
         window = body[playing:ret]
         self.assertNotIn("coding_bridge_stop_wireless()", window)
+        self.assertIn("coding_bridge_start_wireless()", window)
 
     def test_tail_arena_only_borrows_the_idle_tail(self):
         claim = function_body(XZ, "uint8_t *xiaozhi_radio_tail_claim")

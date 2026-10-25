@@ -94,6 +94,20 @@ constexpr std::size_t kDecoderInitBytes = 0x5978;
 // 退避, 否则会以 ~5 次/秒刷 "Fail to init" 并烧 CPU(实测发热)。向上取整到
 // 23KiB, 保证不低于解码器真实需求。
 constexpr std::size_t kDecoderMinBlock = 23 * 1024;
+// 建立连接(DNS/TCP/TLS + HTTP client)所需的连续内部堆下限。低于它时的 connect
+// 失败属于**内存不足**, 不是电台失效 —— 必须原地等待, 绝不能换台。
+// 2026-10-25 真机复现: 首页/菜单层合法地只剩 ~1.2KB free 时进收音机,
+// getaddrinfo() 返回 202(EAI_MEMORY) -> 旧代码按"电台不可达"处理, 毫秒级把
+// 整表电台刷一遍, 日志雪崩 + CPU 打满, 最终 RTC_SW_CPU_RST 复位。
+constexpr std::size_t kConnectionMinBlock = 6 * 1024;
+
+// True when a connection failure is explained by a starved heap rather than a
+// dead station. Callers must retry the same station instead of advancing.
+static bool connect_out_of_memory() {
+    return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) <
+           kConnectionMinBlock;
+}
+
 static_assert(kDecoderMinBlock >= kDecoderInitBytes,
               "kDecoderMinBlock must cover the measured MP3 decoder init "
               "requirement (0x5978) or stream_station will attempt doomed decodes");
@@ -925,6 +939,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         ESP_LOGE(kTag, "HTTP client allocation failed");
+        s_last_fail_lowmem.store(true, std::memory_order_release);
         return false;
     }
     const auto close_client = [client]() {
@@ -1099,7 +1114,16 @@ bool stream_station(std::size_t station, uint32_t generation) {
             break;
         }
         if (esp_http_client_open(client, 0) != ESP_OK) {
-            ESP_LOGW(kTag, "Open failed: %s", preset.url);
+            // Distinguish "no memory to build the connection" from "this
+            // station is dead": only the latter should advance the dial.
+            if (esp_http_client_get_errno(client) == ENOMEM || connect_out_of_memory()) {
+                ESP_LOGW(kTag, "Open failed (low memory, largest=%u): %s",
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                         preset.url);
+                s_last_fail_lowmem.store(true, std::memory_order_release);
+            } else {
+                ESP_LOGW(kTag, "Open failed: %s", preset.url);
+            }
             break;
         }
         // 内存探针(诊断): open 之后(socket/TCP 建立)的连续块大小。
@@ -1108,7 +1132,15 @@ bool stream_station(std::size_t station, uint32_t generation) {
         esp_http_client_fetch_headers(client);
         const int status = esp_http_client_get_status_code(client);
         if (status < 200 || status >= 300) {
-            ESP_LOGW(kTag, "HTTP status %d", status);
+            // status -1 means fetch_headers failed outright; when that is
+            // caused by an allocation failure it must not burn the dial.
+            if (status < 0 && connect_out_of_memory()) {
+                ESP_LOGW(kTag, "HTTP status %d (low memory, largest=%u)", status,
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                s_last_fail_lowmem.store(true, std::memory_order_release);
+            } else {
+                ESP_LOGW(kTag, "HTTP status %d", status);
+            }
             break;
         }
 

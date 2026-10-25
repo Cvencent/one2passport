@@ -901,14 +901,15 @@ bool stream_station(std::size_t station, uint32_t generation) {
     // long that a dead directory entry feels like a frozen dial. Live reads are
     // re-armed to 1000ms after the headers arrive (see below).
     config.timeout_ms = 3500;
-    // 2026-10-25: 1024 -> 2048. 真机实测收音机页里 Codex 桥接已停、DMA 仍有
-    // 8.8~14KB 空闲, 2048 的连续块可以稳定拿到; 而 CDN 慢启动期只有 ~1KB/s,
-    // 更大的接收缓冲能让一次 read 收下更多突发数据、少一次 syscall 往返。
-    // (2026-10-13 曾因播放时 largest 只有 1792 而退回 1024 —— 那是内存修复
-    //  之前的堆状态; 现在预热顺序已修, 该约束不再成立。)
-    // 若某些极端碎片场景下 2048 分配失败, esp_http_client_open 会报错并走
-    // 换台/退避路径, 不会卡死。
-    config.buffer_size = 2048;
+    // ⚠ 2026-10-25 实测回退 2048 -> 1024:
+    //   把接收缓冲提到 2048 后, 长时间运行(堆只剩 free≈5.5KB / largest≈2.4KB)
+    //   时 2048 + socket 缓冲放不下, esp_http_client_open 直接失败:
+    //     transport_base: Failed to open a new connection: 32769
+    //     tcp close: fd=-1 ... errno=119
+    //   结果是"一直在正在连接电台 -> 连不上 -> 切下一个台"地循环换台。
+    //   1024 是能在这种紧堆状态下稳定建链的上限, 吞吐只能靠其它手段优化。
+    //   (2026-10-13 的原始结论依然成立, 不要仅因为播放页 DMA 充裕就调大。)
+    config.buffer_size = 1024;
     config.buffer_size_tx = 256;
     config.user_agent = "AI-Passport-Radio/1.1.1";
     config.keep_alive_enable = true;

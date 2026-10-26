@@ -155,32 +155,28 @@ constexpr uint8_t kMaxFailedAttempts = 1;
 // 全部 OK 级(投递余量 >= 1.1x 内容码率, 12s 采样无停顿), 高码率组优先。
 const RadioStation kFallbackStations[] = {
     {"中国之声", "全国",
-     "http://lhttp.qtfm.cn/live/15318317/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.62 (CNR-1, http 直连 v1.2.17)
+     "http://lhttp.qtfm.cn/live/15318317/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.62 (CNR-1)
     {"新闻联播", "全国",
-     "http://rfienchinois64k.ice.infomaniak.ch//rfienchinois-64.mp3", 0},   //  64kbps  18.3KB/s 余量0.44 (http 直连 v1.2.17)
+     "http://rfienchinois64k.ice.infomaniak.ch//rfienchinois-64.mp3", 0},   //  64kbps  18.3KB/s 余量0.44
     {"国际新闻", "全国",
-     "http://lhttp.qtfm.cn/live/20500172/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.63 (http 直连 v1.2.17)
+     "http://lhttp.qtfm.cn/live/20500172/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.63
     {"故事广播", "全国",
-     "http://lhttp.qtfm.cn/live/20500182/64k.mp3", 0},   //  64kbps  12.7KB/s 余量0.63 (原名: 故事广播-阿基米德故事会)
+     "http://lhttp.qtfm.cn/live/20500182/64k.mp3", 0},   //  64kbps  12.7KB/s 余量0.63
     {"动听音乐台", "全国",
      "http://lhttp-hw.qtfm.cn/live/5022107/64k.mp3", 0},   //  64kbps  12.6KB/s 余量0.64
     {"健康电台", "全国",
-     "http://lhttp-hw.qtfm.cn/live/20500232/64k.mp3", 0},   //  64kbps  12.9KB/s 余量0.62 (原名: 阿基米德-健康电台)
+     "http://lhttp-hw.qtfm.cn/live/20500232/64k.mp3", 0},   //  64kbps  12.9KB/s 余量0.62
     {"听梦想FM", "全国",
-     "http://lhttp.qtfm.cn/live/4917/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.62 (hw 线路 404, v1.2.17 换主线路)
+     "http://lhttp.qtfm.cn/live/4917/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.62
     {"城市音乐台", "全国",
-     "http://lhttp.qtfm.cn/live/20500153/64k.mp3", 0},   //  64kbps  12.7KB/s 余量0.63 (原名: CityFM城市音乐台)
-    {"听云戏曲台", "全国",
-     "http://m.tyradio.uk/tyxq.mp3", 0},   //  96kbps  16.7KB/s 余量0.72
-    {"听云相声台", "全国",
-     "http://m.tyradio.uk/tyxs.mp3", 0},   //  96kbps  16.5KB/s 余量0.73
-    {"听云评书台", "全国",
-     "http://m.tyradio.uk/typs.mp3", 0},   //  96kbps  16.2KB/s 余量0.74
-    {"亚洲音乐台", "全国",
-     "http://antares.dribbcast.com/proxy/apop?mp=/s", 0},   // 128kbps 102.2KB/s 余量0.16 (Big B Radio, http v1.2.17)
-    {"5分钟新闻", "全国",
-     "http://replaynewszh.ice.infomaniak.ch/replaynewszh-128.mp3", 0},   // 128kbps  27.3KB/s 余量0.59 (REPLAY NEWS, http v1.2.17)
+     "http://lhttp.qtfm.cn/live/20500153/64k.mp3", 0},   //  64kbps  12.7KB/s 余量0.63
 };
+// v1.2.17 台源沘水: 删 5 个设备端不稳台 ——
+//  亚洲音乐台 / 5分钟新闻: 128kbps 在 C3 上解码+收包接近满载,
+//    任何 WiFi 波动就饿死(用户:播一下立马切走); 且均为海外源 RTT 高。
+//  听云三台: 美国 VPS 源 RTT 200ms+, 设备 200ms 读超时下 eagain 风暴。
+//  保留 8 台 64kbps 稳定源(PC 实测 11.6-15.6KB/s 零停滞)。
+// (128k/96k 源 PC 实测吐流正常, 是设备端压力问题, 非源死。)
 
 // v1.2.17 变更说明:
 //  - 删 音乐之声(kuwo): anti.s 返回 302 -> Location 是 https, 1KB header
@@ -2234,7 +2230,7 @@ bool radio_player_init() {
         // catalog_v4: 2026-10-26 v1.2.17 all-http sources; v3 blobs may hold https entries, invalidate. History(2026-10-18): 又一次改名。目录请求从 esp_http_client 换成裸 socket 之后
         // 才真正搜得到本地台, 而此前存进 NVS 的是"只剩全国兜底台"的列表; 不清掉的话
         // app_radio_request_catalog 会因为"已有缓存"永远不再搜索, 用户看到的仍然是外地台。
-        if (nvs_get_blob(catalog_handle, "catalog_v4", s_stations, &bytes) == ESP_OK &&
+        if (nvs_get_blob(catalog_handle, "catalog_v5", s_stations, &bytes) == ESP_OK &&
             bytes > 0 && bytes % sizeof(RadioStation) == 0 && bytes <= sizeof(s_stations)) {
             const std::size_t cached_count = bytes / sizeof(RadioStation);
             bool valid = true;
@@ -2383,7 +2379,7 @@ void radio_player_invalidate_catalog_cache() {
     s_catalog_cached = false;
     nvs_handle_t handle;
     if (nvs_open("radio", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_key(handle, "catalog_v4");
+        nvs_erase_key(handle, "catalog_v5");
         nvs_commit(handle);
         nvs_close(handle);
     }
@@ -2493,11 +2489,11 @@ bool radio_player_replace_stations_resuming(const RadioStation *stations,
         // fail with ESP_ERR_NVS_NOT_ENOUGH_SPACE while the old entry still
         // occupies its slot, which then left the previous city's catalog in
         // place across a reboot. Releasing the old blob makes room.
-        const esp_err_t erased = nvs_erase_key(catalog_handle, "catalog_v4");
+        const esp_err_t erased = nvs_erase_key(catalog_handle, "catalog_v5");
         if (erased != ESP_OK && erased != ESP_ERR_NVS_NOT_FOUND) {
             ESP_LOGW(kTag, "catalog cache erase failed: %s", esp_err_to_name(erased));
         }
-        esp_err_t saved = nvs_set_blob(catalog_handle, "catalog_v4", merged,
+        esp_err_t saved = nvs_set_blob(catalog_handle, "catalog_v5", merged,
                                       merged_count * sizeof(RadioStation));
         if (saved == ESP_OK) saved = nvs_commit(catalog_handle);
         if (saved != ESP_OK) ESP_LOGW(kTag, "catalog cache save failed: %s", esp_err_to_name(saved));

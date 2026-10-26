@@ -28,3 +28,10 @@ std::size_t radio_catalog_discover_city(const char *city, RadioStation *stations
 // 这类表序错位的老问题。
 std::size_t radio_catalog_city_count();
 const char *radio_catalog_city_name(std::size_t index);
+
+// 轻量 IP 定位(不做目录搜索)。供自动定位先拿省份再命中省级预设。
+bool radio_catalog_locate(RadioLocation *location);
+
+// IP 定位结果的中文省份名(CN 且在翻译表内); 海外/未知返回 nullptr。
+// 供自动定位优先命中省级预设表使用, 避开在线目录搜索的堆碎片化。
+const char *radio_catalog_province_cn(const RadioLocation *location);

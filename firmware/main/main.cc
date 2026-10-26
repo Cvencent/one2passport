@@ -828,16 +828,45 @@ void catalog_task(void *) {
                  (int)pause.was_playing, (int)idle);
 
         RadioLocation location = {};
-        const std::size_t count = !idle ? 0 : city[0]
-                                      ? radio_catalog_discover_city(
-                                            city, stations, kDiscoveryCapacity, &location)
-                                      : radio_catalog_discover(
-                                            stations, kDiscoveryCapacity, &location);
+        std::size_t count = 0;
+        bool preset_hit = false;
+        char preset_name[24] = {};
+        // v1.2.17: 自动定位先做轻量 locate, 省份命中省级预设表就
+        // **完全跳过**在线目录搜索。搜索的 8KB 响应缓冲会把堆碎
+        // 片化, 恢复播放时 MP3 解码器 init 失败(ret 10 x3, 真机:
+        // 定位重庆后卡死崩溃)。命中预设则零额外分配, 直接播
+        // 实测白名单; 未命中才走原有目录搜索。
+        if (idle && city[0] == '\0') {
+            if (radio_catalog_locate(&location)) {
+                const char *prov = radio_catalog_province_cn(&location);
+                if (prov && prov[0] && radio_player_load_city_preset(prov)) {
+                    preset_hit = true;
+                    std::snprintf(preset_name, sizeof(preset_name), "%s", prov);
+                }
+            }
+        }
+        if (!preset_hit && !idle) {
+            count = 0;  // 流未停稳: 保持原有列表, 不搜索
+        } else if (!preset_hit) {
+            count = city[0]
+                        ? radio_catalog_discover_city(
+                              city, stations, kDiscoveryCapacity, &location)
+                        : radio_catalog_discover(
+                              stations, kDiscoveryCapacity, &location);
+        }
 
         std::lock_guard<std::mutex> lock(s_catalog_mutex);
         if (generation != s_catalog_generation) {
             radio_player_resume_after_catalog(pause);
             continue;
+        }
+        if (preset_hit) {
+            s_catalog_loaded = true;
+            save_catalog_city(preset_name);
+            for (std::size_t i = 1; i < city_choice_count(); ++i) {
+                const char *q = city_query_for(i);
+                if (q && std::strcmp(q, preset_name) == 0) { save_selected_city(i); break; }
+            }
         }
         if (s_connected.load(std::memory_order_acquire)) {
             // The national-fallback guard exists so an auto-located search does
@@ -847,7 +876,12 @@ void catalog_task(void *) {
             const bool keep_cached_on_fallback =
                 city[0] == '\0' && location.national_fallback &&
                 radio_player_has_cached_catalog();
-            if (count > 0 && !keep_cached_on_fallback &&
+            if (preset_hit) {
+                radio_ui_set_location(preset_name);
+                radio_ui_set_station(
+                    radio_player_station_index(), radio_player_station_count(),
+                    radio_player_station(radio_player_station_index()));
+            } else if (count > 0 && !keep_cached_on_fallback &&
                 radio_player_replace_stations_resuming(stations, count)) {
                 s_catalog_loaded = true;
                 save_catalog_city(city);
@@ -856,7 +890,8 @@ void catalog_task(void *) {
                                           : (location.city[0] ? location.city
                                                               : location.region));
             } else {
-                radio_ui_set_location(city[0] ? display : "NATIONAL");
+                radio_ui_set_location(preset_hit ? preset_name
+                                      : (city[0] ? display : "NATIONAL"));
                 radio_ui_set_station(
                     radio_player_station_index(), radio_player_station_count(),
                     radio_player_station(radio_player_station_index()));
@@ -865,7 +900,12 @@ void catalog_task(void *) {
         }
         // Give the decoder its contiguous block back *before* resuming, or the
         // playback worker starts without a pool and fails to open the stream.
-        radio_player_ensure_pool();
+        // v1.2.17: 预设命中时跳过这里的 ensure —— catalog 任务上下文里
+        // 重建解码器实测必败(ESP_MP3_DEC ret 10 x3, 与栈无关), 而播放
+        // 任务自己的 ensure_pool(播放循环 1318 行)稳定成功。
+        if (!preset_hit) {
+            radio_player_ensure_pool();
+        }
         radio_player_resume_after_catalog(pause);
         s_catalog_task = nullptr;
         break;

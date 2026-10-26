@@ -898,6 +898,15 @@ std::size_t query_national_top(const RadioLocation &location, RadioStation *stat
 
 }  // namespace
 
+bool radio_catalog_locate(RadioLocation *location) {
+    return locate(location);
+}
+
+const char *radio_catalog_province_cn(const RadioLocation *location) {
+    if (!location) return nullptr;
+    return translated_province(*location);
+}
+
 std::size_t radio_catalog_city_count() {
     return sizeof(kCityRegions) / sizeof(kCityRegions[0]);
 }

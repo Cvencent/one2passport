@@ -41,6 +41,9 @@ extern "C" void xiaozhi_radio_tail_release(void);
 namespace {
 
 constexpr char kTag[] = "radio_player";
+// 首页频谱条的真实音量级(0-1000, 本块 PCM 均值归一化)。
+// 播放循环每块(~26ms)发布一次, UI 侧 300ms 采样。
+static std::atomic<uint16_t> s_eq_level{0};
 // ⚠ 输入块大小必须保持 1024: 实测改成 4096 会让 esp_audio_simple_dec_process
 // 连续报 "ESP_MP3_DEC: Fail to init MP3 decoder ret 10" + "Decode error reach
 // limited 20"(即使内存充裕也不解), 说明该库对单次投喂的块大小敏感。
@@ -1844,6 +1847,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
                             if (gap > 30000) ++slow_gaps;
                         }
                         const auto *samples = reinterpret_cast<const int16_t *>(frame.buffer);
+                        uint16_t block_peak = 0;   // 本块峰值 -> 频谱条级别
                         for (std::size_t i = 0; i < mono_bytes / 2; ++i) {
                             const int32_t value = samples[i];
                             if (value >= 32760 || value <= -32760) ++pcm_clipped;
@@ -1853,8 +1857,17 @@ bool stream_station(std::size_t station, uint32_t generation) {
                             if (magnitude > pcm_peak) {
                                 pcm_peak = static_cast<uint16_t>(magnitude);
                             }
+                            if (magnitude > block_peak) {
+                                block_peak = static_cast<uint16_t>(magnitude);
+                            }
                         }
                         pcm_samples += mono_bytes / 2;
+                        // 本块峰值 -> 频谱条级别(0-1000, 20k 满刻)。
+                        if (mono_bytes) {
+                            s_eq_level.store(
+                                static_cast<uint16_t>(block_peak > 20000 ? 1000 : block_peak * 1000 / 20000),
+                                std::memory_order_release);
+                        }
                         if (s_audio_yield.load(std::memory_order_acquire)) {
                             // 提示音占用音频设备: 这段时间不写 I2S。
                             vTaskDelay(pdMS_TO_TICKS(5));
@@ -1980,6 +1993,11 @@ static bool demote_station_to_tail(std::size_t index) {
     }
     xSemaphoreGive(s_station_mutex);
     return moved;
+}
+
+
+static uint16_t eq_level_snapshot() {
+    return s_eq_level.load(std::memory_order_acquire);
 }
 
 void player_task(void *) {
@@ -2317,6 +2335,7 @@ void radio_player_toggle() {
 }
 
 void radio_player_set_playing(bool playing) {
+    if (!playing) s_eq_level.store(0, std::memory_order_release);
     if (!s_worker_mutex) return;
     xSemaphoreTake(s_worker_mutex, portMAX_DELAY);
     const bool started = set_playing_locked(playing);
@@ -2330,6 +2349,7 @@ void radio_player_set_playing(bool playing) {
 }
 
 bool radio_player_is_playing() {
+    // (频谱级别在上方播放循环内发布)
     return s_wanted_playing.load(std::memory_order_acquire);
 }
 
@@ -2579,4 +2599,8 @@ extern "C" void radio_pause_for_xiaozhi(void) {
 }
 extern "C" bool radio_is_playing_c(void) {
     return radio_player_is_playing();
+}
+
+uint16_t radio_player_eq_level() {
+    return eq_level_snapshot();
 }

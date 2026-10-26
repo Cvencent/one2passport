@@ -184,19 +184,19 @@ static lv_obj_t *pet_build(lv_obj_t *parent, int x, int y) {
     box(ant, -3, -7, 10, 10, C_ACCENT);
     // 身体
     lv_obj_t *body = box(pet, 0, 0, 72, 64, C_FG);
-    // 2026-10-26: radius 31(半圆) -> 12。半圆=LVGL circle mask 主用户, 而
-    // codex_state 每 ~2s 刷一次 body 颜色 -> 强制重绘 -> circle mask 缓存
-    // 反复进出, 该缓存在压力下反复崩溃(get_next_line/lv_draw_add_task,
-    // 5 次 MEPC 全部命中)。12px 圆角观感接近, 但走简单矩形路径。
-    lv_obj_set_style_radius(body, 12, 0);
+    // 2026-10-26 v1.2.17: 恢复原始圆形(radius 31)。v1.2.16 为规避
+    // circle mask 崩溃改方, 但崩溃真因是堆耗尽已修(https 源移除、
+    // 连接前堆安全线、lwIP/WiFi 缓冲收紧), 播放期 dma 稳定 3KB+,
+    // mask 缓存不会再分配失败。
+    lv_obj_set_style_radius(body, 31, 0);
     s_home_body = body;
     lv_obj_t *skirt = box(pet, 5, 54, 62, 10, C_FG);
     lv_obj_set_style_radius(skirt, 4, 0);
     // 眼睛
     pet_eye_l = box(pet, 17, 23, 14, 18, C_BG);
-    lv_obj_set_style_radius(pet_eye_l, 4, 0);  // circle-mask 规避 2026-10-26
+    lv_obj_set_style_radius(pet_eye_l, LV_RADIUS_CIRCLE, 0);
     pet_eye_r = box(pet, 41, 23, 14, 18, C_BG);
-    lv_obj_set_style_radius(pet_eye_r, 4, 0);  // circle-mask 规避 2026-10-26
+    lv_obj_set_style_radius(pet_eye_r, LV_RADIUS_CIRCLE, 0);
     box(pet_eye_l, 4, 4, 5, 5, 0xFFFFFF);
     box(pet_eye_r, 4, 4, 5, 5, 0xFFFFFF);
     // 腮红
@@ -242,7 +242,7 @@ static void codex_badge_build(lv_obj_t *parent, int index, int y, uint32_t color
     s_home_badge[index] = box(parent, 166, y, 64, 20, C_BG);
     lv_obj_set_style_bg_opa(s_home_badge[index], LV_OPA_TRANSP, 0);
     s_home_badge_dot[index] = box(s_home_badge[index], 0, 7, 6, 6, color);
-    lv_obj_set_style_radius(s_home_badge_dot[index], 2, 0);  // circle-mask 规避 2026-10-26
+    lv_obj_set_style_radius(s_home_badge_dot[index], LV_RADIUS_CIRCLE, 0);
     s_home_badge_num[index] = label(s_home_badge[index], "0", 16, color);
     lv_obj_set_pos(s_home_badge_num[index], 12, 0);
     lv_obj_add_flag(s_home_badge[index], LV_OBJ_FLAG_HIDDEN);
@@ -478,10 +478,9 @@ static void home_build(void) {
     s_home_np_card = box(s_home_scr, 12, 196, 216, 80, C_SURFACE);
     lv_obj_set_style_border_color(s_home_np_card, lv_color_hex(C_BORDER), 0);
     lv_obj_set_style_border_width(s_home_np_card, 1, 0);
-    // 2026-10-26: radius 6 -> 0。圆角边框走 draw_border_complex + circle mask
-    // 缓存路径, 真机两次 Load/Store fault(get_next_line / lv_draw_add_task)
-    // 都在该缓存被踩时发生。直角边框走 draw_border_simple, 与 mask 无关。
-    lv_obj_set_style_radius(s_home_np_card, 0, 0);
+    // 2026-10-26 v1.2.17: 恢复 6px 圆角(v1.2.16 为规避 circle mask 改直角,
+    // 崩溃真因是堆耗尽, 见 pet_build 处注释)。
+    lv_obj_set_style_radius(s_home_np_card, 6, 0);
     // 单行文案: "正在播放 音乐" —— 原来是"正在播放"(标题) + 电台名(第二行)两行,
     // 用户要求合成一行。用前缀 + 动态电台名拼成一条。
     s_home_np_name = label(s_home_np_card, "正在播放", 16, C_FG);

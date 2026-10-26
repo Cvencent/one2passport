@@ -499,34 +499,30 @@ struct CityRegion {
 };
 
 constexpr CityRegion kCityRegions[] = {
-    {"北京", "北京", "Beijing"},        {"上海", "上海", "Shanghai"},
-    {"天津", "天津", "Tientsin"},       {"重庆", "重庆", "Chungking"},
-    {"广州", "广东", "Kwangtung"},      {"深圳", "广东", "Kwangtung"},
-    {"东莞", "广东", "Kwangtung"},      {"佛山", "广东", "Kwangtung"},
-    {"珠海", "广东", "Kwangtung"},      {"汕头", "广东", "Kwangtung"},
-    {"惠州", "广东", "Kwangtung"},      {"中山", "广东", "Kwangtung"},
-    {"杭州", "浙江", "Zhejiang"},       {"宁波", "浙江", "Zhejiang"},
-    {"温州", "浙江", "Chekiang"},       {"嘉兴", "浙江", "Zhejiang"},
-    {"绍兴", "浙江", "Zhejiang"},       {"金华", "浙江", "Zhejiang"},
-    {"南京", "江苏", "Kiangsu"},        {"苏州", "江苏", "Kiangsu"},
-    {"无锡", "江苏", "Kiangsu"},        {"常州", "江苏", "Kiangsu"},
-    {"南通", "江苏", "Kiangsu"},        {"徐州", "江苏", "Kiangsu"},
-    {"成都", "四川", "Szechuan"},       {"绵阳", "四川", "Szechuan"},
-    {"武汉", "湖北", "Hupei"},          {"宜昌", "湖北", "Hupei"},
-    {"长沙", "湖南", "Hunan"},          {"郑州", "河南", "Honan"},
-    {"洛阳", "河南", "Honan"},          {"济南", "山东", "Shantung"},
-    {"青岛", "山东", "Shantung"},       {"烟台", "山东", "Shantung"},
-    {"潍坊", "山东", "Shantung"},       {"沈阳", "辽宁", "Liaoning"},
-    {"大连", "辽宁", "Liaoning"},       {"哈尔滨", "黑龙江", "Amur River"},
-    {"长春", "吉林", "Jilin"},          {"石家庄", "河北", "Hopei"},
-    {"太原", "山西", "Shansi"},         {"西安", "陕西", "Shensi"},
-    {"昆明", "云南", "Yunnan"},         {"贵阳", "贵州", "Kweichow"},
-    {"南宁", "广西", "Kwangsi"},        {"海口", "海南", "Hainan"},
-    {"福州", "福建", "Fukien"},         {"厦门", "福建", "Fukien"},
-    {"南昌", "江西", "Kiangsi"},        {"合肥", "安徽", "Anhwei"},
-    {"兰州", "甘肃", "Kansu"},          {"西宁", "青海", "Tsinghai"},
-    {"银川", "宁夏", "Ningsia"},        {"呼和浩特", "内蒙古", "Inner Mongolia"},
-    {"乌鲁木齐", "新疆", "Sinkiang"},   {"拉萨", "西藏", "Tibet"},
+    // v1.2.17: 设置页城市列表改为省级, 与 kCityPresetGroups
+    // 的组键一同名同序 —— 选任何一项都直接命中实测
+    // 白名单预设(零网络搜索), 在线目录只作为兑底。
+    // state 拼写取自旧表同省条目, 供在线目录的 state 过滤使用。
+    {"内蒙古", "内蒙古", "Inner Mongolia"},
+    {"北京", "北京", "Beijing"},
+    {"吉林", "吉林", "Jilin"},
+    {"四川", "四川", "Szechuan"},
+    {"安徽", "安徽", "Anhwei"},
+    {"山东", "山东", "Shantung"},
+    {"广东", "广东", "Kwangtung"},
+    {"广西", "广西", "Kwangsi"},
+    {"新疆", "新疆", "Sinkiang"},
+    {"江苏", "江苏", "Kiangsu"},
+    {"河南", "河南", "Honan"},
+    {"浙江", "浙江", "Zhejiang"},
+    {"海南", "海南", "Hainan"},
+    {"湖北", "湖北", "Hupei"},
+    {"湖南", "湖南", "Hunan"},
+    {"福建", "福建", "Fukien"},
+    {"辽宁", "辽宁", "Liaoning"},
+    {"重庆", "重庆", "Chungking"},
+    {"陕西", "陕西", "Shensi"},
+    {"青海", "青海", "Tsinghai"},
 };
 
 const CityRegion *region_for_city(const char *city) {

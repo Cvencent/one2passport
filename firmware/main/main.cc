@@ -1173,6 +1173,12 @@ void app_radio_request_city(const char *city, const char *display) {
     // 2026-10-26: 优先走实测白名单预设表(零网络延迟、全部可持续)。
     // 自动定位/预设未覆盖的城市仍走在线目录搜索。
     if (city && city[0] && radio_player_load_city_preset(city)) {
+        // v1.2.17: 预设命中后必须同步记录 catalog_city。否则进收音机
+        // 完整页时 app_radio_request_catalog 发现 "缓存城市 != 选中城市"
+        // 而把预设列表当作失效缓存清掉, 重新走在线目录搜索 ——
+        // 搜索的 8KB 响应缓冲与收音机 UI 争堆, 播放任务起不来
+        // (用户实测: 选内蒙古进收音机直接报"内存不足")。
+        save_catalog_city(city);
         radio_ui_set_location(display && display[0] ? display : city);
         radio_ui_set_station(0, radio_player_station_count(),
                              radio_player_station(0));

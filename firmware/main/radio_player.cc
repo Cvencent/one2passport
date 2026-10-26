@@ -267,12 +267,14 @@ const RadioStation kCityPresetStations[] = {
      "http://lhttp-hw.qtfm.cn/live/15318178/64k.mp3", 0},   //  64kbps  13.2 余量0.60
     {"鼎城人民广播电台", "湖南",
      "http://lhttp.qingting.fm/live/5021860/64k.mp3", 0},   //  64kbps  12.5 余量0.64
+    {"长沙交通广播", "长沙",
+     "http://lhttp.qingting.fm/live/3967/64k.mp3", 0},   //  64kbps  13.0 余量0.62
+    {"长沙音乐广播", "长沙",
+     "http://lhttp.qtfm.cn/live/20847/64k.mp3", 0},   //  64kbps  13.0 余量0.62
     {"福建海峡之声", "福建",
      "http://lhttp-hw.qtfm.cn/live/1744/64k.mp3", 0},   //  64kbps  13.0 余量0.62
     {"厦门音乐广播", "福建",
      "http://lhttp.qtfm.cn/live/1739/64k.mp3", 0},   //  64kbps  12.7 余量0.63
-    {"西宁交通文艺广播", "西宁",
-     "http://lhttp.qingting.fm/live/5022283/64k.mp3", 0},   //  64kbps  12.8 余量0.62
     {"大连音乐广播", "辽宁",
      "http://lhttp.qingting.fm/live/1084/64k.mp3", 0},   //  64kbps  13.0 余量0.62
     {"沈阳新闻广播", "辽宁",
@@ -287,10 +289,6 @@ const RadioStation kCityPresetStations[] = {
      "http://lhttp.qtfm.cn/live/20210236/64k.mp3", 0},   //  64kbps  12.4 余量0.64
     {"重庆都市广播", "重庆",
      "http://lhttp.qtfm.cn/live/1502/64k.mp3", 0},   //  64kbps  12.5 余量0.64
-    {"长沙交通广播", "长沙",
-     "http://lhttp.qingting.fm/live/3967/64k.mp3", 0},   //  64kbps  13.0 余量0.62
-    {"长沙音乐广播", "长沙",
-     "http://lhttp.qtfm.cn/live/20847/64k.mp3", 0},   //  64kbps  13.0 余量0.62
     {"陕西交通广播", "陕西",
      "http://lhttp.qtfm.cn/live/1601/64k.mp3", 0},   //  64kbps  12.7 余量0.63
     {"陕西音乐广播", "陕西",
@@ -299,6 +297,8 @@ const RadioStation kCityPresetStations[] = {
      "http://lhttp.qtfm.cn/live/5009/64k.mp3", 0},   //  64kbps  13.0 余量0.62
     {"青海经济生活广播 FM90.3", "青海",
      "http://lhttp.qtfm.cn/live/5008/64k.mp3", 0},   //  64kbps  12.8 余量0.63
+    {"西宁交通文艺广播", "西宁",
+     "http://lhttp.qingting.fm/live/5022283/64k.mp3", 0},   //  64kbps  12.8 余量0.62
 };
 
 // 组键 -> [起始, 数量] 索引(线性查找, 组数少)
@@ -310,7 +310,6 @@ struct CityPresetGroup {
 const CityPresetGroup kCityPresetGroups[] = {
     {"内蒙古", 0, 2},
     {"北京", 2, 1},
-
     {"吉林", 3, 2},
     {"四川", 5, 2},
     {"安徽", 7, 1},
@@ -321,16 +320,14 @@ const CityPresetGroup kCityPresetGroups[] = {
     {"江苏", 27, 2},
     {"河南", 29, 1},
     {"浙江", 30, 1},
-    {"海口", 31, 1},
+    {"海南", 31, 1},
     {"湖北", 32, 1},
-    {"湖南", 33, 1},
-    {"福建", 34, 2},
-    {"西宁", 36, 1},
-    {"辽宁", 37, 2},
-    {"重庆", 39, 5},
-    {"长沙", 44, 2},
-    {"陕西", 46, 2},
-    {"青海", 48, 2},
+    {"湖南", 33, 3},
+    {"福建", 36, 2},
+    {"辽宁", 38, 2},
+    {"重庆", 40, 5},
+    {"陕西", 45, 2},
+    {"青海", 47, 3},
 };
 
 // 选城市时把预设组拷入 s_stations(见 radio_player_load_city_preset)。

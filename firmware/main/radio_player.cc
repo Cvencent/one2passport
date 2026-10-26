@@ -1194,7 +1194,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
         const std::size_t dma_line = heap_caps_get_free_size(MALLOC_CAP_DMA);
         const std::size_t largest_line =
             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-        if (free_line < 7000 || dma_line < 2600 || largest_line < 4096) {
+        if (free_line < 5000 || dma_line < 1000 || largest_line < 2500) {
             ESP_LOGW(kTag,
                      "http_open skipped, heap below safety line: free=%u dma=%u largest=%u",
                      (unsigned)free_line, (unsigned)dma_line,
@@ -1548,9 +1548,13 @@ bool stream_station(std::size_t station, uint32_t generation) {
         // 却去等 12KB, 永远等不满(表现为一直停在"正在缓冲")。
         const std::size_t wait_limit = std::min(
             kMaxResumePrebuffer, (block_count * kInputSize) * 3 / 4);
-        // 本次等待的预缓冲阈值: 慢源从 12KB 起, 每次欠载仍可翻倍(但已顶到上限)。
-        std::size_t wait_bytes = std::min(
-            prebuffer_bytes ? prebuffer_bytes : kPrebufferTarget, wait_limit);
+        // 本次等待的预缓冲阈值: 欠载恢复固定 3KB(~0.4s@64kbps)起步。
+        // 此前从 prebuffer_bytes(12KB)起步 —— 慢源(区县台 4-6KB/s)每次欠载
+        // 要静默 2-2.5s 攒满才出声, 用户听到的"卡卡的"就是这个周期性
+        // 静默。3KB 起步让恢复在 0.5s 内完成, 慢源变成轻徦断续;
+        // 连环欠载时仍翻倍退避(封顶 kMaxResumePrebuffer)兜底。
+        std::size_t wait_bytes = std::min<std::size_t>(3 * 1024, wait_limit);
+        (void)prebuffer_bytes;
         bool playback_announced = false;
         uint32_t rebuffers = 0;
         int decode_fail_streak = 0;   // 连续解码失败计数(内存不足/坏流): 达限放弃本电台, 防3ms风暴

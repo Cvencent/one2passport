@@ -605,8 +605,13 @@ bool matches_state(const char *entry_state, const char *wanted) {
 }
 
 void normalize_stream_url(const char *source, char *target, std::size_t capacity) {
+    // v1.2.17: https 流在 13KB 堆上必然挤压 LVGL(mbedtls 上下文 5-6KB),
+    // 目录来源一律降级为 http。以下域名均已在 PC 端逐台实测 http 200:
+    // 蜻蜓(qtfm/qingting)、听云(tyradio)、infomaniak、dribbcast。
     if (starts_with(source, "https://") &&
-        (contains(source, ".qtfm.cn/") || contains(source, ".qingting.fm/"))) {
+        (contains(source, ".qtfm.cn/") || contains(source, ".qingting.fm/") ||
+         contains(source, "tyradio.uk") || contains(source, ".ice.infomaniak.ch") ||
+         contains(source, "dribbcast.com"))) {
         std::snprintf(target, capacity, "http://%s", source + 8);
     } else {
         copy_text(target, capacity, source);

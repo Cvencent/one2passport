@@ -2230,17 +2230,17 @@ bool radio_player_init() {
     nvs_handle_t catalog_handle;
     if (nvs_open("radio", NVS_READONLY, &catalog_handle) == ESP_OK) {
         std::size_t bytes = sizeof(s_stations);
-        // catalog_v3: 2026-10-18 又一次改名。目录请求从 esp_http_client 换成裸 socket 之后
+        // catalog_v4: 2026-10-26 v1.2.17 all-http sources; v3 blobs may hold https entries, invalidate. History(2026-10-18): 又一次改名。目录请求从 esp_http_client 换成裸 socket 之后
         // 才真正搜得到本地台, 而此前存进 NVS 的是"只剩全国兜底台"的列表; 不清掉的话
         // app_radio_request_catalog 会因为"已有缓存"永远不再搜索, 用户看到的仍然是外地台。
-        if (nvs_get_blob(catalog_handle, "catalog_v3", s_stations, &bytes) == ESP_OK &&
+        if (nvs_get_blob(catalog_handle, "catalog_v4", s_stations, &bytes) == ESP_OK &&
             bytes > 0 && bytes % sizeof(RadioStation) == 0 && bytes <= sizeof(s_stations)) {
             const std::size_t cached_count = bytes / sizeof(RadioStation);
             bool valid = true;
             for (std::size_t i = 0; i < cached_count; ++i) {
                 valid = valid && std::memchr(s_stations[i].name, 0, sizeof(s_stations[i].name)) &&
                         std::memchr(s_stations[i].url, 0, sizeof(s_stations[i].url)) &&
-                        std::strncmp(s_stations[i].url, "http", 4) == 0;
+                        std::strncmp(s_stations[i].url, "http://", 7) == 0;
             }
             if (valid) {
                 s_station_count.store(cached_count);
@@ -2382,7 +2382,7 @@ void radio_player_invalidate_catalog_cache() {
     s_catalog_cached = false;
     nvs_handle_t handle;
     if (nvs_open("radio", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_key(handle, "catalog_v3");
+        nvs_erase_key(handle, "catalog_v4");
         nvs_commit(handle);
         nvs_close(handle);
     }
@@ -2492,11 +2492,11 @@ bool radio_player_replace_stations_resuming(const RadioStation *stations,
         // fail with ESP_ERR_NVS_NOT_ENOUGH_SPACE while the old entry still
         // occupies its slot, which then left the previous city's catalog in
         // place across a reboot. Releasing the old blob makes room.
-        const esp_err_t erased = nvs_erase_key(catalog_handle, "catalog_v3");
+        const esp_err_t erased = nvs_erase_key(catalog_handle, "catalog_v4");
         if (erased != ESP_OK && erased != ESP_ERR_NVS_NOT_FOUND) {
             ESP_LOGW(kTag, "catalog cache erase failed: %s", esp_err_to_name(erased));
         }
-        esp_err_t saved = nvs_set_blob(catalog_handle, "catalog_v3", merged,
+        esp_err_t saved = nvs_set_blob(catalog_handle, "catalog_v4", merged,
                                       merged_count * sizeof(RadioStation));
         if (saved == ESP_OK) saved = nvs_commit(catalog_handle);
         if (saved != ESP_OK) ESP_LOGW(kTag, "catalog cache save failed: %s", esp_err_to_name(saved));

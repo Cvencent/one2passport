@@ -1959,6 +1959,25 @@ bool stream_station(std::size_t station, uint32_t generation) {
     return played_audio;
 }
 
+// v1.2.17: 把实测不稳的台沉到列表尾部(用户要求"不稳定的都去掉",
+// 但台源是时变的 —— 静态删名单不如设备端动态沘降。用户手动仍
+// 可选到尾部台。)成功返回 true(index 处已变为原"下一台")。
+static bool demote_station_to_tail(std::size_t index) {
+    if (xSemaphoreTake(s_station_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return false;
+    const std::size_t count = s_station_count.load(std::memory_order_acquire);
+    bool moved = false;
+    if (index + 1 < count && count <= kMaxStations) {
+        RadioStation moving = s_stations[index];
+        std::memmove(&s_stations[index], &s_stations[index + 1],
+                     (count - 1 - index) * sizeof(RadioStation));
+        s_stations[count - 1] = moving;
+        s_station_index.store(index, std::memory_order_release);
+        moved = true;
+    }
+    xSemaphoreGive(s_station_mutex);
+    return moved;
+}
+
 void player_task(void *) {
     std::size_t last_attempted_station = SIZE_MAX;
     uint8_t failed_attempts = 0;
@@ -2034,11 +2053,17 @@ void player_task(void *) {
                 // 白等 40~60s, 不如快跳。
                 if (starved_sessions >= 1 && live_count > 1) {
                     ESP_LOGW(kTag, "station %u starved (source feeds too "
-                                   "slow); skipping",
+                                   "slow); demoting to list tail",
                              static_cast<unsigned>(station));
                     radio_ui_set_playback(RadioPlaybackState::Error,
                                           "信号太弱 已换台");
                     starved_sessions = 0;
+                    if (demote_station_to_tail(station)) {
+                        // 当前 index 处已是原"下一台", 直接继续播它
+                        interruptible_delay_ms(skip_cooldown_ms, generation, station);
+                        if (skip_cooldown_ms < 4500) skip_cooldown_ms += 1500;
+                        continue;
+                    }
                     radio_player_select_relative(1);
                     interruptible_delay_ms(skip_cooldown_ms, generation, station);
                     if (skip_cooldown_ms < 4500) skip_cooldown_ms += 1500;
@@ -2079,6 +2104,7 @@ void player_task(void *) {
         ++failed_attempts;
         const std::size_t count = radio_player_station_count();
         if (failed_attempts >= kMaxFailedAttempts && count > 1) {
+            demote_station_to_tail(station);
             ESP_LOGW(kTag, "Station %u unreachable, skipping to the next one "
                            "(cooldown %ums)",
                      static_cast<unsigned>(station),

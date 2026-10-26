@@ -19,7 +19,18 @@ import serial
 
 
 def open_port(port, baud):
-    return serial.Serial(port, baud, timeout=0.2, write_timeout=2.0)
+    # 同 fap_device.py: 预置 DTR/RTS=False 再 open, 避免 USB-JTAG 复位设备。
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = baud
+    ser.timeout = 0.2
+    ser.write_timeout = 2.0
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    ser.dtr = False
+    ser.rts = False
+    return ser
 
 
 def main():

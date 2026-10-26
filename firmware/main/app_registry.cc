@@ -493,7 +493,11 @@ static void home_build(void) {
     // 对象, 崩溃根因见 home_eq_draw 注释)。底边基准卡片内 y=76。
     for (int i = 0; i < 20; ++i) {
         s_eq_bars[i] = lv_obj_create(s_home_np_card);
+        if (!s_eq_bars[i]) continue;  // 2026-10-26: 堆紧张时 lv_malloc 可返回 NULL
         lv_obj_remove_style_all(s_eq_bars[i]);
+        // v1.2.17: remove_style_all 后背景透明度默认 0 —— 只设 bg_color
+        // 柱子一直在画但全透明, 这就是"音乐条消失"的另一半真因。
+        lv_obj_set_style_bg_opa(s_eq_bars[i], LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(s_eq_bars[i], lv_color_hex(C_MUTED), 0);
         lv_obj_set_style_radius(s_eq_bars[i], 0, 0);
         lv_obj_set_style_border_width(s_eq_bars[i], 0, 0);

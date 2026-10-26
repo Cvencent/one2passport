@@ -1219,7 +1219,10 @@ bool radio_ui_init() {
     // 与首页同时驻留曾把 LVGL 静态池(48KiB)吃满,导致启动即崩溃重启。
     // LEO 界面延迟到 radio_ui_show_leo_main() 首次调用时才构建。
     s_page_visible = false;
-    lv_screen_load(s_screen);
+    // v1.2.17 黑屏根因: 这里曾经 lv_screen_load(s_screen) 把收音机空屏
+    // 激活, 把 app_framework_init 刚建好的宠物首页顶掉 —— 实测开机后
+    // active screen 变成 0 子对象的空屏, 用户看到"首页黑屏、音乐条消失"。
+    // s_screen 只在 radio_app_enter -> build_main 路径中激活, 启动时不抢。
     // 刷新周期 50ms -> 100ms: 10Hz 对频谱/时钟/电池这类慢变化显示已足够,
     // 减半 LVGL 忙度, 少抢播放任务 CPU(用户反馈"闪烁条频率太高")。
     lv_timer_create(timer_callback, 100, nullptr);

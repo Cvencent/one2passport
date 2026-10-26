@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import binascii
+import re
 import struct
 import sys
 import time
@@ -24,10 +25,18 @@ CMD = "FAP_SCREENSHOT_V1"
 
 
 def open_port(port: str, baud: int = 115200) -> serial.Serial:
-    ser = serial.Serial(port, baud, timeout=0.2)
-    # 不要拉 DTR/RTS: 否则会复位设备。
-    ser.setDTR(False)
-    ser.setRTS(False)
+    # ESP32-C3 USB-JTAG: 打开串口时若 DTR/RTS 拉高会直接复位芯片。
+    # 先构造未打开的对象并预置 DTR/RTS=False, 再 open —— 打开瞬间
+    # 信号就已是安全电平, 不会把设备复位。
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = baud
+    ser.timeout = 0.2
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    ser.dtr = False
+    ser.rts = False
     return ser
 
 
@@ -57,6 +66,9 @@ def take_screenshot(port: str, out_path: str, timeout: float = 20.0) -> tuple[in
         ser.write((CMD + "\n").encode("ascii"))
         ser.flush()
         head = _await_header(ser, time.time() + timeout)
+        m_diag = re.search(rb"DIAG[^\n]*", head)
+        if m_diag:
+            print(m_diag.group(0).decode("ascii", "replace"))
         line_end = head.find(b"\n")
         header = head[:line_end].decode("ascii", "replace").strip()
         parts = header.split()

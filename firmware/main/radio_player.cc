@@ -162,8 +162,6 @@ const RadioStation kFallbackStations[] = {
      "http://lhttp.qtfm.cn/live/20500172/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.63
     {"故事广播", "全国",
      "http://lhttp.qtfm.cn/live/20500182/64k.mp3", 0},   //  64kbps  12.7KB/s 余量0.63
-    {"动听音乐台", "全国",
-     "http://lhttp-hw.qtfm.cn/live/5022107/64k.mp3", 0},   //  64kbps  12.6KB/s 余量0.64
     {"健康电台", "全国",
      "http://lhttp-hw.qtfm.cn/live/20500232/64k.mp3", 0},   //  64kbps  12.9KB/s 余量0.62
     {"听梦想FM", "全国",
@@ -176,6 +174,7 @@ const RadioStation kFallbackStations[] = {
 //    任何 WiFi 波动就饿死(用户:播一下立马切走); 且均为海外源 RTT 高。
 //  听云三台: 美国 VPS 源 RTT 200ms+, 设备 200ms 读超时下 eagain 风暴。
 //  保留 8 台 64kbps 稳定源(PC 实测 11.6-15.6KB/s 零停滞)。
+// 动听音乐台 亦删(设备端两连饥餗, 动态沘降实证)。兑底 7 台。
 // (128k/96k 源 PC 实测吐流正常, 是设备端压力问题, 非源死。)
 
 // v1.2.17 变更说明:
@@ -1392,9 +1391,14 @@ bool stream_station(std::size_t station, uint32_t generation) {
             // 分配不出来 -> 流饿死 -> 切台风暴 -> 进收音机建 UI 直接冻结。
             // 安全线: 内部堆空闲 >20KB 且最大连续块 >4KB(WiFi 收包 1.6KB 的
             // 2.5 倍)才继续补; 达线即停, 环有多少用多少。
+            // v1.2.17: 门槛 20000/4096 -> 12000/5000。原条件在首页常态
+            // (free 12-14KB)下一块都不补, 13KB 环只有 1.6s 缓冲 ——
+            // WiFi RSSI 波动 2-3s(实测 -55 -> -62)就把环抽空(rebuffer)。
+            // 12000/5000 让环在首页扩到 18-20 块(2.2-2.5s), 扛过信号
+            // 低谷; 收音机完整页堆更宽裕, 本就是 20 块。
             while (block_count < kNetworkBlocks &&
-                   heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 20000 &&
-                   heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > 4096) {
+                   heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 12000 &&
+                   heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > 5000) {
                 uint8_t *heap_block =
                     static_cast<uint8_t *>(malloc(kInputSize));
                 if (heap_block == nullptr) break;

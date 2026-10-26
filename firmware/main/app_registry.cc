@@ -65,7 +65,7 @@ const app_entry_t APPS[APP_ID_COUNT] = {
     [APP_ID_RADIO]    = {"收音机",  radio_app_enter,    radio_app_exit,    radio_app_key,    nullptr,           nullptr},
     [APP_ID_CODEX]    = {"Codex",   codex_app_enter,    codex_app_exit,    codex_app_key,    radio_app_pause, nullptr},
     [APP_ID_XIAOZHI]  = {"小智AI",  xiaozhi_app_enter,  xiaozhi_app_exit,  xiaozhi_app_key,  radio_app_pause, nullptr},
-    [APP_ID_SETTINGS] = {"设置",    settings_app_enter, settings_app_exit, settings_app_key, nullptr,           nullptr},
+    [APP_ID_SETTINGS] = {"设置",    settings_app_enter, settings_app_exit, settings_app_key, radio_app_pause,   nullptr},
 };
 
 
@@ -759,9 +759,14 @@ static void go_menu(void) {
     destroy_home();
     ensure_menu();
     bsp_lvgl_unlock();
+    // v1.2.17 用户规则: 收音机只在首页播。进菜单就停(含流任务与
+    // 收包突发), 给城市加载/WiFi 扫描让出 6-8KB; 回首页时
+    // minimize_services(true) 按 s_minimized_radio_should_play 恢复。
+    radio_player_set_playing(false);
+    radio_player_set_network(false);
     // The ordered restore may synchronously reclaim a 20KB decoder block,
     // which must not hold up the LVGL/input path.
-    if (s_level == APP_LEVEL_MENU) app_framework_minimize_services(true);
+    if (s_level == APP_LEVEL_MENU) app_framework_minimize_services(false);
     xz_heap_report("go_menu_out");
 }
 
@@ -945,7 +950,10 @@ void app_framework_minimize_services(bool restore_radio) {
     // 首页的 Codex 计数/完成提醒在收音机播放期间照常更新(首页小 Codex + 小
     // 收音机并存)。解码子块进尾巴后堆多 ~8.8KB, WiFi 收包(需 ~1600B 连续
     // DMA)不再被挤死 —— 旧方案 A(停桥)的离线代价取消。
-    if (restore_radio && s_minimized_radio_should_play) {
+    // v1.2.17: 自动恢复播放仅限首首页层(用户规则: 进菜单/设置就停,
+    // 给城市加载/WiFi 扫描让堆; 回首页再自动恢复。)
+    if (restore_radio && s_minimized_radio_should_play &&
+        s_level == APP_LEVEL_HOME) {
         // 2026-10-25: 小智/完整 Codex 退出时停过桥 —— 首页恢复播放前必须
         // 补启, 否则计数/提醒死掉、电脑端看到设备离线(实测漏了这步)。
         if (!coding_bridge_wireless_started()) {
@@ -988,7 +996,7 @@ void app_framework_restore_minimized_services_ordered(void) {
     // Rebuild the MP3 decoder first: the decoder's big sub-blocks go to the
     // static mic tail (bridge task stack in the FRONT 12KB does not overlap),
     // so the resident bridge keeps counters/alerts alive on home.
-    if (s_minimized_radio_should_play) {
+    if (s_minimized_radio_should_play && s_level == APP_LEVEL_HOME) {
         if (!coding_bridge_wireless_started()) {
             if (coding_bridge_start_wireless() != ESP_OK) {
                 ESP_LOGW(kTag, "minimized Codex bridge could not start");

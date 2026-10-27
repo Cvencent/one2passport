@@ -457,10 +457,39 @@ bool install_stations(const RadioStation *stations, std::size_t count,
     if (!stations || count == 0 || !s_station_mutex) return false;
     count = std::min(count, kMaxStations);
 
-    // Stop the current request before replacing its backing catalog. The
-    // streaming task uses a value snapshot, so the swap is atomic to users.
-    s_generation.fetch_add(1, std::memory_order_acq_rel);
     if (xSemaphoreTake(s_station_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+
+    // v1.2.18 无缝换表: 若当前正在播的 URL 在新表里依然存在,
+    // 保持当前 station 与 URL 不动 generation —— 播放循环不会
+    // 退出当前连接, 首页<->收音机切换声音不断。
+    // (原实现无条件 bump generation, 装载预设表也会重连
+    // 同一个 URL, 听感一下断流。)
+    const std::size_t current = s_station_index.load(std::memory_order_acquire);
+    const char *current_url = s_stations[current].url;
+    std::size_t keep_index = SIZE_MAX;
+    if (current_url[0]) {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (std::strcmp(stations[i].url, current_url) == 0) {
+                keep_index = i;
+                break;
+            }
+        }
+    }
+    if (keep_index != SIZE_MAX) {
+        std::memcpy(s_stations, stations, count * sizeof(RadioStation));
+        if (count < kMaxStations) {
+            std::memset(s_stations + count, 0,
+                        (kMaxStations - count) * sizeof(RadioStation));
+        }
+        s_station_count.store(count, std::memory_order_release);
+        s_station_index.store(keep_index, std::memory_order_release);
+        xSemaphoreGive(s_station_mutex);
+        if (selected) *selected = keep_index;
+        return true;
+    }
+
+    // 当前台不在新表里: 停掉旧请求再换表(原行为)。
+    s_generation.fetch_add(1, std::memory_order_acq_rel);
     std::memcpy(s_stations, stations, count * sizeof(RadioStation));
     if (count < kMaxStations) {
         std::memset(s_stations + count, 0,

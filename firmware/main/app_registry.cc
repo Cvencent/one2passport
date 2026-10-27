@@ -332,7 +332,7 @@ static void home_eq_tick(lv_timer_t *timer) {
         if (changed && s_eq_bars[0]) {
             for (int i = 0; i < 20; ++i) {
                 if (!s_eq_bars[i]) continue;
-                lv_obj_set_pos(s_eq_bars[i], 4 + i * 10, 70);
+                lv_obj_set_pos(s_eq_bars[i], 4 + (int)(i * 10.63f), 70);
                 lv_obj_set_size(s_eq_bars[i], 6, 6);
             }
         }
@@ -346,7 +346,7 @@ static void home_eq_tick(lv_timer_t *timer) {
         if (h == s_eq_last_h[i]) continue;   // ⚠ 只在变化时才动 LVGL 对象
         s_eq_last_h[i] = h;
         if (s_eq_bars[i]) {
-            lv_obj_set_pos(s_eq_bars[i], 4 + i * 10, 76 - h);
+            lv_obj_set_pos(s_eq_bars[i], 4 + (int)(i * 10.63f), 76 - h);
             lv_obj_set_size(s_eq_bars[i], 6, h);
         }
     }
@@ -500,7 +500,7 @@ static void home_build(void) {
         lv_obj_set_style_bg_color(s_eq_bars[i], lv_color_hex(C_MUTED), 0);
         lv_obj_set_style_radius(s_eq_bars[i], 0, 0);
         lv_obj_set_style_border_width(s_eq_bars[i], 0, 0);
-        lv_obj_set_pos(s_eq_bars[i], 4 + i * 10, 70);
+        lv_obj_set_pos(s_eq_bars[i], 4 + (int)(i * 10.63f), 70);
         lv_obj_set_size(s_eq_bars[i], 6, 6);
     }
 

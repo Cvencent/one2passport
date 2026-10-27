@@ -125,3 +125,25 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=1024
 # lwIP retries each server on a 1+2+3+4s schedule. A third DHCP-provided server
 # can push one getaddrinfo() to roughly 30s and block the radio worker.
 CONFIG_LWIP_DNS_MAX_SERVERS=2
+
+# ---- v1.2.18 内存优化三件套(borrowed from passport-os) ----
+# SRAM 预算: C3 无 PSRAM, IRAM 与 DRAM 共用 321KB。以下 flash 放置与 -Os
+# 预计释放约 30-40KB 堆(IRAM .text 大幅缩小), 首页播放深谷直接受益。
+# 前提: 工程无 IRAM ISR(无 IRAM_ATTR/ESP_INTR_FLAG_IRAM), ringbuf 仅任务内使用。
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=n
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+CONFIG_ESP_EVENT_POST_FROM_IRAM_ISR=n
+CONFIG_LIBC_LOCKS_PLACE_IN_IRAM=n
+# WiFi IRAM 优化关闭(收包路径走 flash, 省堆; 代价是中断底半部稍慢)
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+# 量产颗粒走 generic 驱动(实测 boot: detected chip: generic), 厂商专用驱动
+# 全部裁掉, 每个驱动省 5-8KB flash 与关联 RAM。
+CONFIG_SPI_FLASH_SUPPORT_ISSI_CHIP=n
+CONFIG_SPI_FLASH_SUPPORT_MXIC_CHIP=n
+CONFIG_SPI_FLASH_SUPPORT_WINBOND_CHIP=n
+CONFIG_SPI_FLASH_SUPPORT_BOYA_CHIP=n
+CONFIG_SPI_FLASH_SUPPORT_TH_CHIP=n

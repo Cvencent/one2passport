@@ -252,7 +252,7 @@ static void thread_cache_add(uint32_t thread_ref, uint32_t topic_id, const char 
     for (int i = 0; i < s_thread_cache_count; ++i) {
         if (s_thread_cache[i].thread_ref == thread_ref) {
             s_thread_cache[i].topic_id = topic_id;
-            snprintf(s_thread_cache[i].title, THREAD_CACHE_TITLE_MAX, "%s",
+            snprintf(s_thread_cache[i].title, THREAD_CACHE_TITLE_MAX, "%.95s",
                      title != NULL ? title : "");
             return;
         }
@@ -260,8 +260,8 @@ static void thread_cache_add(uint32_t thread_ref, uint32_t topic_id, const char 
     if (s_thread_cache_count >= THREAD_CACHE_MAX) return;
     s_thread_cache[s_thread_cache_count].thread_ref = thread_ref;
     s_thread_cache[s_thread_cache_count].topic_id = topic_id;
-    snprintf(s_thread_cache[s_thread_cache_count].title, THREAD_CACHE_TITLE_MAX, "%s",
-             title != NULL ? title : "");
+    snprintf(s_thread_cache[s_thread_cache_count].title, THREAD_CACHE_TITLE_MAX,
+             "%.95s", title != NULL ? title : "");
     ++s_thread_cache_count;
 }
 

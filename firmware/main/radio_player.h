@@ -50,6 +50,8 @@ void radio_wifi_set_streaming(bool streaming);
 void radio_player_toggle();
 void radio_player_set_playing(bool playing);
 bool radio_player_is_playing();
+// 首页频谱条的实时音量级 0-1000(播放循环每块发布)。
+uint16_t radio_player_eq_level();
 bool radio_player_wait_idle(uint32_t timeout_ms);
 // 播放任务当前是否正在 stream_station 内(持有 input/output 缓冲)。
 // 释放内存池前必须确认为 false, 否则 stream_station 会 use-after-free。

@@ -1399,7 +1399,7 @@ bool stream_station(std::size_t station, uint32_t generation) {
             // WiFi RSSI 波动 2-3s(实测 -55 -> -62)就把环抽空(rebuffer)。
             // 12000/5000 让环在首页扩到 18-20 块(2.2-2.5s), 扛过信号
             // 低谷; 收音机完整页堆更宽裕, 本就是 20 块。
-            while (block_count < 16 &&  // 首页上限 16 块: 20 块会挤掉 http_open(实测内存不足循环)
+            while (block_count < kNetworkBlocks &&  // v1.2.18: 堆 75KB, 满配 20 块
                    heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 12000 &&
                    heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > 5000) {
                 uint8_t *heap_block =

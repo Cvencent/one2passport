@@ -2299,6 +2299,7 @@ bool radio_player_init() {
     }
     s_station_index.store(saved_station % radio_player_station_count());
     s_volume.store(std::clamp<uint8_t>(saved_volume, 10, 100));
+    ESP_LOGI(kTag, "boot volume=%u station=%u", saved_volume, saved_station);
 
     if (bsp_audio_init() != ESP_OK) return false;
     if (esp_audio_dec_register_default() != ESP_AUDIO_ERR_OK) return false;

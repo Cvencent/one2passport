@@ -759,14 +759,12 @@ static void go_menu(void) {
     destroy_home();
     ensure_menu();
     bsp_lvgl_unlock();
-    // v1.2.17 用户规则: 收音机只在首页播。进菜单就停(含流任务与
-    // 收包突发), 给城市加载/WiFi 扫描让出 6-8KB; 回首页时
-    // minimize_services(true) 按 s_minimized_radio_should_play 恢复。
-    radio_player_set_playing(false);
-    radio_player_set_network(false);
+    // v1.2.18 用户规则修订: 菜单页也播(堆 75KB 后菜单搜索
+    // 不再与音频流抢内存); 设置页仍停(设置 app 本身有
+    // radio_app_pause)。回首页时 minimize_services(true) 按原意恢复。
     // The ordered restore may synchronously reclaim a 20KB decoder block,
     // which must not hold up the LVGL/input path.
-    if (s_level == APP_LEVEL_MENU) app_framework_minimize_services(false);
+    if (s_level == APP_LEVEL_MENU) app_framework_minimize_services(true);
     xz_heap_report("go_menu_out");
 }
 
@@ -953,7 +951,7 @@ void app_framework_minimize_services(bool restore_radio) {
     // v1.2.17: 自动恢复播放仅限首首页层(用户规则: 进菜单/设置就停,
     // 给城市加载/WiFi 扫描让堆; 回首页再自动恢复。)
     if (restore_radio && s_minimized_radio_should_play &&
-        s_level == APP_LEVEL_HOME) {
+        (s_level == APP_LEVEL_HOME || s_level == APP_LEVEL_MENU)) {
         // 2026-10-25: 小智/完整 Codex 退出时停过桥 —— 首页恢复播放前必须
         // 补启, 否则计数/提醒死掉、电脑端看到设备离线(实测漏了这步)。
         if (!coding_bridge_wireless_started()) {
@@ -996,7 +994,8 @@ void app_framework_restore_minimized_services_ordered(void) {
     // Rebuild the MP3 decoder first: the decoder's big sub-blocks go to the
     // static mic tail (bridge task stack in the FRONT 12KB does not overlap),
     // so the resident bridge keeps counters/alerts alive on home.
-    if (s_minimized_radio_should_play && s_level == APP_LEVEL_HOME) {
+    if (s_minimized_radio_should_play &&
+        (s_level == APP_LEVEL_HOME || s_level == APP_LEVEL_MENU)) {
         if (!coding_bridge_wireless_started()) {
             if (coding_bridge_start_wireless() != ESP_OK) {
                 ESP_LOGW(kTag, "minimized Codex bridge could not start");

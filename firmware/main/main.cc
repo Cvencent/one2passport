@@ -285,6 +285,17 @@ bool load_catalog_city(char *out, std::size_t size) {
 // automatic detection the first time the radio is used.
 void start_remembered_catalog_search() {
     const char *query = city_query_for(load_selected_city());
+    if (query && radio_player_load_city_preset(query)) {
+        // v1.2.18: 记忆的省份命中实测预设表 —— 零网络等待,
+        // 直接装载(原来这里总是走在线搜索, 进收音机等 10s+)。
+        save_catalog_city(query);
+        radio_ui_set_location(query);
+        radio_ui_set_station(0, radio_player_station_count(),
+                             radio_player_station(0));
+        radio_ui_set_playback(RadioPlaybackState::Stopped,
+                              "已加载实测电台列表");
+        return;
+    }
     if (query) {
         start_city_catalog_search(query, query);
     } else {

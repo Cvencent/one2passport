@@ -66,8 +66,9 @@ class StationSkipPacingTest(unittest.TestCase):
                       "the played branch must consult the starvation marker")
         self.assertIn("starved_sessions >= 1", window,
                       "one starved session = broken source")
-        self.assertIn("radio_player_select_relative(1)", window,
-                      "a starved station must be skipped like a dead one")
+        self.assertIn("demote_station_to_tail(station)", window,
+                      "a starved station must be demoted to the list tail "
+                      "(v1.2.17 dynamic demotion replaces the blind +1 skip)")
         self.assertIn("starved_sessions = 0;", window,
                       "a healthy session must reset the starvation counter")
 

@@ -171,13 +171,26 @@ const RadioStation kFallbackStations[] = {
      "http://lhttp.qtfm.cn/live/4917/64k.mp3", 0},   //  64kbps  12.8KB/s 余量0.62
     {"城市音乐台", "全国",
      "http://lhttp.qtfm.cn/live/20500153/64k.mp3", 0},   //  64kbps  12.7KB/s 余量0.63
+    {"动听音乐台", "全国",
+     "http://lhttp-hw.qtfm.cn/live/5022107/64k.mp3", 0},   //  64kbps  12.6KB/s 余量0.64
+    {"听云戏曲台", "全国",
+     "http://m.tyradio.uk/tyxq.mp3", 0},   //  96kbps  16.7KB/s 余量0.72
+    {"听云相声台", "全国",
+     "http://m.tyradio.uk/tyxs.mp3", 0},   //  96kbps  16.5KB/s 余量0.73
+    {"听云评书台", "全国",
+     "http://m.tyradio.uk/typs.mp3", 0},   //  96kbps  16.2KB/s 余量0.74
+    {"亚洲音乐台", "全国",
+     "http://antares.dribbcast.com/proxy/apop?mp=/s", 0},   // 128kbps 32KB/s 余量2.0 (Big B Radio, 高音质)
+    {"5分钟新闻", "全国",
+     "http://replaynewszh.ice.infomaniak.ch/replaynewszh-128.mp3", 0},   // 128kbps 23.8KB/s 余量1.5 (REPLAY NEWS, 高音质)
 };
 // v1.2.17 台源沘水: 删 5 个设备端不稳台 ——
 //  亚洲音乐台 / 5分钟新闻: 128kbps 在 C3 上解码+收包接近满载,
 //    任何 WiFi 波动就饿死(用户:播一下立马切走); 且均为海外源 RTT 高。
 //  听云三台: 美国 VPS 源 RTT 200ms+, 设备 200ms 读超时下 eagain 风暴。
 //  保留 8 台 64kbps 稳定源(PC 实测 11.6-15.6KB/s 零停滞)。
-// 动听音乐台 亦删(设备端两连饥餗, 动态沘降实证)。兑底 7 台。
+// v1.2.18 内存优化后堆 65-75KB: 上述 5 台全部恢复(128k/海外源也扛得住),
+// 动听音乐台一并回归 —— 兑底 12 台, 不稳台仍由动态沘降兜底。
 // (128k/96k 源 PC 实测吐流正常, 是设备端压力问题, 非源死。)
 
 // v1.2.17 变更说明:
